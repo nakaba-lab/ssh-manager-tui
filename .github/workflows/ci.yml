@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Edition 2024 needs a recent toolchain; stable on GitHub runners is well
+      # ahead of the minimum, and Cargo.toml pins no rust-version/MSRV.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      # The test suite is pure: every #[cfg(test)] module exercises parsing /
+      # arg-building only (parse_fingerprint_line, build_ssh_args, parse_line,
+      # config round-trip), so no test spawns ssh / ssh-keygen / wt at runtime.
+      # OpenSSH is preinstalled on both runners anyway (ubuntu: openssh-client;
+      # windows: bundled OpenSSH client) if that ever changes.
+      - name: Test
+        run: cargo test --all

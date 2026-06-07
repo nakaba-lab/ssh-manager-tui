@@ -1,0 +1,6 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Local Claude Code / editor settings
+/.claude

@@ -1,0 +1,327 @@
+//! Rendering, atomic save, and surgical (line-granularity) editing of the
+//! lossless config model.
+
+use std::fs;
+use std::path::Path;
+
+use crate::error::ConfigError;
+
+use super::model::{BodyLine, HostBlock, Item, OptionLine, RawLine, SshConfig};
+use super::tokens::{detok_value, quote_if_needed};
+
+impl SshConfig {
+    /// Flatten the document into physical lines (without endings).
+    fn lines(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for item in &self.items {
+            match item {
+                Item::Host(b) => {
+                    for c in &b.pre {
+                        out.push(c.text.clone());
+                    }
+                    out.push(b.header.render());
+                    for l in &b.body {
+                        out.push(l.text());
+                    }
+                }
+                Item::Match(b) => {
+                    for c in &b.pre {
+                        out.push(c.text.clone());
+                    }
+                    out.push(b.header.render());
+                    for l in &b.body {
+                        out.push(l.text());
+                    }
+                }
+                Item::Global(o) => out.push(o.render()),
+                Item::Include(i) => out.push(i.option.render()),
+                Item::Comment(r) | Item::Blank(r) => out.push(r.text.clone()),
+            }
+        }
+        out
+    }
+
+    /// Render the whole document back to text, byte-for-byte for unedited input.
+    pub fn render(&self) -> String {
+        if self.items.is_empty() {
+            return String::new();
+        }
+        let nl = self.newline.as_str();
+        let mut s = self.lines().join(nl);
+        if self.trailing_newline {
+            s.push_str(nl);
+        }
+        s
+    }
+
+    /// Write the document back to disk atomically, creating a one-time session
+    /// backup (`config.bak`) before the first overwrite.
+    pub fn save(&mut self) -> Result<(), ConfigError> {
+        let rendered = self.render();
+        let path = self.path.clone();
+
+        // One-time session backup.
+        if !self.bak_done && path.exists() {
+            let bak = path.with_extension("bak");
+            fs::copy(&path, &bak).map_err(|source| ConfigError::Io { path: bak, source })?;
+            self.bak_done = true;
+        }
+
+        let dir = path.parent().unwrap_or_else(|| Path::new("."));
+        if !dir.exists() {
+            fs::create_dir_all(dir).map_err(|source| ConfigError::Io {
+                path: dir.to_path_buf(),
+                source,
+            })?;
+        }
+        let tmp = dir.join(".ssh_manager_config.tmp");
+
+        fs::write(&tmp, rendered.as_bytes()).map_err(|source| ConfigError::Io {
+            path: tmp.clone(),
+            source,
+        })?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
+        }
+
+        // Windows rename fails if the destination exists; remove it first.
+        #[cfg(windows)]
+        if path.exists() {
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(source) => return Err(ConfigError::Io { path, source }),
+            }
+        }
+
+        fs::rename(&tmp, &path).map_err(|source| ConfigError::Io { path, source })?;
+        self.dirty = false;
+        Ok(())
+    }
+}
+
+/// Detect the indentation new body lines should use for a block: reuse the first
+/// existing option line's indent, else default to four spaces.
+pub fn block_indent(block: &HostBlock) -> String {
+    for line in &block.body {
+        if let BodyLine::Option(o) = line {
+            return o.indent.clone();
+        }
+    }
+    "    ".to_string()
+}
+
+/// Index just past the last non-blank body line (so new options insert before
+/// any trailing blank lines).
+fn insert_pos(body: &[BodyLine]) -> usize {
+    let mut pos = body.len();
+    while pos > 0 && matches!(body[pos - 1], BodyLine::Blank(_)) {
+        pos -= 1;
+    }
+    pos
+}
+
+/// Surgically set a single-valued option. `value == None` removes every
+/// occurrence. Unchanged values are left byte-for-byte intact.
+pub fn set_single(block: &mut HostBlock, keyword: &str, value: Option<&str>, quote: bool) {
+    let indent = block_indent(block);
+    match value {
+        None => {
+            block
+                .body
+                .retain(|l| !matches!(l, BodyLine::Option(o) if o.is(keyword)));
+        }
+        Some(v) => {
+            // Update the first existing occurrence; remove any later duplicates.
+            let mut found = false;
+            let mut to_remove = Vec::new();
+            for (idx, line) in block.body.iter_mut().enumerate() {
+                if let BodyLine::Option(o) = line {
+                    if !o.is(keyword) {
+                        continue;
+                    }
+                    if !found {
+                        found = true;
+                        if detok_value(&o.args) != v {
+                            o.args = if quote {
+                                quote_if_needed(v)
+                            } else {
+                                v.to_string()
+                            };
+                        }
+                    } else {
+                        to_remove.push(idx);
+                    }
+                }
+            }
+            for idx in to_remove.into_iter().rev() {
+                block.body.remove(idx);
+            }
+            if !found {
+                let args = if quote {
+                    quote_if_needed(v)
+                } else {
+                    v.to_string()
+                };
+                let opt = OptionLine::new(&indent, keyword, args);
+                let pos = insert_pos(&block.body);
+                block.body.insert(pos, BodyLine::Option(opt));
+            }
+        }
+    }
+}
+
+/// Surgically reconcile a repeated option (IdentityFile / *Forward) to `values`.
+/// Shared-prefix entries that already match are left intact; surplus lines are
+/// removed; extra values are appended.
+pub fn set_multi(block: &mut HostBlock, keyword: &str, values: &[String], quote: bool) {
+    let indent = block_indent(block);
+    // Indices of existing option lines for this keyword, in order.
+    let existing: Vec<usize> = block
+        .body
+        .iter()
+        .enumerate()
+        .filter_map(|(i, l)| match l {
+            BodyLine::Option(o) if o.is(keyword) => Some(i),
+            _ => None,
+        })
+        .collect();
+
+    // Overwrite in place where values differ.
+    for (slot, &idx) in existing.iter().enumerate() {
+        if slot >= values.len() {
+            break;
+        }
+        if let BodyLine::Option(o) = &mut block.body[idx] {
+            let v = &values[slot];
+            if detok_value(&o.args) != *v {
+                o.args = if quote { quote_if_needed(v) } else { v.clone() };
+            }
+        }
+    }
+
+    // Remove surplus existing lines (back to front to keep indices valid).
+    if values.len() < existing.len() {
+        for &idx in existing[values.len()..].iter().rev() {
+            block.body.remove(idx);
+        }
+    }
+
+    // Append any extra values after the last existing slot (or before trailing
+    // blanks if there were none).
+    if values.len() > existing.len() {
+        let base = match existing.last() {
+            Some(&last) => last + 1,
+            None => insert_pos(&block.body),
+        };
+        for (offset, v) in values[existing.len()..].iter().enumerate() {
+            let args = if quote { quote_if_needed(v) } else { v.clone() };
+            block.body.insert(
+                base + offset,
+                BodyLine::Option(OptionLine::new(&indent, keyword, args)),
+            );
+        }
+    }
+}
+
+/// Keywords managed by dedicated edit-form fields; everything else is an "extra".
+pub const MANAGED_KEYWORDS: [&str; 8] = [
+    "HostName",
+    "User",
+    "Port",
+    "IdentityFile",
+    "ProxyJump",
+    "LocalForward",
+    "RemoteForward",
+    "DynamicForward",
+];
+
+fn is_managed(keyword: &str) -> bool {
+    MANAGED_KEYWORDS
+        .iter()
+        .any(|m| keyword.eq_ignore_ascii_case(m))
+}
+
+/// Surgically reconcile the host's "extra" (non-managed) options to `extras`,
+/// preserving the formatting of unchanged lines. Values are written verbatim
+/// (the extras field is a raw escape hatch, like forward specs).
+pub fn set_extras(block: &mut HostBlock, extras: &[(String, String)]) {
+    // Distinct desired keywords (case-insensitive), first-seen order & casing,
+    // skipping any that belong to a dedicated field.
+    let mut desired: Vec<String> = Vec::new();
+    for (k, _) in extras {
+        if !is_managed(k) && !desired.iter().any(|d| d.eq_ignore_ascii_case(k)) {
+            desired.push(k.clone());
+        }
+    }
+    // Apply each desired keyword's values.
+    for kw in &desired {
+        let vals: Vec<String> = extras
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case(kw))
+            .map(|(_, v)| v.clone())
+            .collect();
+        set_multi(block, kw, &vals, false);
+    }
+    // Remove any existing non-managed option no longer present in `desired`.
+    let mut to_clear: Vec<String> = Vec::new();
+    for line in &block.body {
+        if let BodyLine::Option(o) = line
+            && !is_managed(&o.keyword)
+            && !desired.iter().any(|d| d.eq_ignore_ascii_case(&o.keyword))
+            && !to_clear.iter().any(|c| c.eq_ignore_ascii_case(&o.keyword))
+        {
+            to_clear.push(o.keyword.clone());
+        }
+    }
+    for kw in to_clear {
+        set_multi(block, &kw, &[], false);
+    }
+}
+
+/// Replace the header patterns, preserving the header's indent and separator.
+pub fn set_patterns(block: &mut HostBlock, patterns: &[String]) {
+    block.patterns = patterns.to_vec();
+    block.header.args = patterns
+        .iter()
+        .map(|p| quote_if_needed(p))
+        .collect::<Vec<_>>()
+        .join(" ");
+}
+
+/// Build a fresh, well-formatted host block from a primary alias.
+pub fn new_host_block(patterns: &[String]) -> HostBlock {
+    let header = OptionLine {
+        indent: String::new(),
+        keyword: "Host".to_string(),
+        sep: " ".to_string(),
+        args: patterns
+            .iter()
+            .map(|p| quote_if_needed(p))
+            .collect::<Vec<_>>()
+            .join(" "),
+        src_line: None,
+    };
+    HostBlock {
+        pre: Vec::new(),
+        header,
+        patterns: patterns.to_vec(),
+        body: Vec::new(),
+    }
+}
+
+/// Append a top-level blank line item if the document doesn't already end with
+/// a blank (keeps exactly one blank between blocks).
+pub fn ensure_trailing_separator(config: &mut SshConfig) {
+    let needs = match config.items.last() {
+        None => false,
+        Some(Item::Blank(_)) => false,
+        Some(_) => true,
+    };
+    if needs {
+        config.items.push(Item::Blank(RawLine::new(String::new())));
+    }
+}
