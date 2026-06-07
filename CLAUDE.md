@@ -23,11 +23,17 @@ cargo clippy
 cargo fmt
 ```
 
-Rust edition 2024 (toolchain 1.94+). OpenSSH (`ssh`, `ssh-keygen`) must be on
-`PATH`; new-tab connect additionally needs `wt.exe`.
+Rust edition 2024; the MSRV is pinned via `rust-version = "1.94"` in `Cargo.toml`.
+OpenSSH (`ssh`, `ssh-keygen`) must be on `PATH`; new-tab connect additionally
+needs `wt.exe`.
 
 When manually testing edit/save behavior, always point `--config` at a throwaway
 file — the app writes to whatever path it is given.
+
+Releases are cut with the user-invoked `/release` runbook
+(`.claude/skills/release/SKILL.md`): version bump → quality gates → release build
+→ git tag → GitHub release. It has side effects and is **user-only** — never run
+it unprompted.
 
 ## Architecture
 
@@ -61,6 +67,23 @@ them. Keep it that way — do not reach into ratatui from `config/` or `os/`.
 If you add a screen/mode, you touch all three: the `Screen` enum (`app.rs`), a
 dispatch arm (`update.rs`), and a draw arm (`ui/mod.rs`). Modal overlays are
 implemented via `App::prev_screen` + the `open_overlay`/`close_overlay` helpers.
+
+### UI rendering (theme + responsive layout)
+
+All rendering lives in `ui/` — one module per screen plus two shared foundations:
+
+- **`ui/theme.rs`** — the single source of every color (a Tokyo Night palette)
+  and small `Style` helpers (`selection()`, `border()`, `SELECT_SYMBOL`). Route
+  every color choice through here; never hardcode a `Color` in a screen module.
+- **`ui/widgets.rs`** — shared building blocks: `panel` / `modal_block` (rounded
+  borders, accent when focused), `footer_hints`, `kv_line`, `section_header`,
+  `input_line`, and `responsive_split`. `responsive_split` lays two panes
+  side-by-side at or above `WIDE_MIN_WIDTH` (90 cols) and stacks them vertically
+  below it; each call site passes its own side/stack split percentages.
+
+`ui/mod.rs` `draw()` paints a fixed three-row frame (breadcrumb title · body ·
+footer hints), then overlays the active modal; `base_screen()` decides which
+non-modal screen renders underneath an overlay.
 
 ### The lossless round-trip invariant (config layer)
 
