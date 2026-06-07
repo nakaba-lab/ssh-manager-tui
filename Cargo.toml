@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.94"
 description = "A TUI SSH host manager for ~/.ssh/config"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/nakata5577/ssh-manager-tui"
+repository = "https://github.com/nakaba-lab/ssh-manager-tui"
 readme = "README.md"
 
 [dependencies]

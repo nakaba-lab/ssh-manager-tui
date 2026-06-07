@@ -8,8 +8,8 @@ Windows-first, cross-platform, and careful: it reads **and writes the real confi
 so every edit is surgical and lossless — your comments, blank lines, indentation, and
 keyword casing survive untouched.
 
-[![CI](https://github.com/nakata5577/ssh-manager-tui/actions/workflows/ci.yml/badge.svg)](https://github.com/nakata5577/ssh-manager-tui/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/nakata5577/ssh-manager-tui?sort=semver)](https://github.com/nakata5577/ssh-manager-tui/releases)
+[![CI](https://github.com/nakaba-lab/ssh-manager-tui/actions/workflows/ci.yml/badge.svg)](https://github.com/nakaba-lab/ssh-manager-tui/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/nakaba-lab/ssh-manager-tui?sort=semver)](https://github.com/nakaba-lab/ssh-manager-tui/releases)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![Rust](https://img.shields.io/badge/rust-2024%20edition-orange.svg)](https://www.rust-lang.org)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)](#platform-support)
@@ -84,7 +84,7 @@ layout that stacks the panes on narrow terminals.
 ### Download a binary
 
 Grab the latest `sshm.exe` (Windows x64) from the
-[**Releases**](https://github.com/nakata5577/ssh-manager-tui/releases) page.
+[**Releases**](https://github.com/nakaba-lab/ssh-manager-tui/releases) page.
 
 > The published Windows binary is currently **self-signed**, so SmartScreen may show a
 > "Windows protected your PC" warning. Choose **More info → Run anyway**, or build from
@@ -96,10 +96,10 @@ Requires a Rust toolchain (**1.94+**, edition 2024).
 
 ```sh
 # install straight from git into ~/.cargo/bin
-cargo install --git https://github.com/nakata5577/ssh-manager-tui
+cargo install --git https://github.com/nakaba-lab/ssh-manager-tui
 
 # …or clone and build
-git clone https://github.com/nakata5577/ssh-manager-tui
+git clone https://github.com/nakaba-lab/ssh-manager-tui
 cd ssh-manager-tui
 cargo build --release      # binary at target/release/sshm(.exe)
 ```
@@ -277,6 +277,13 @@ cargo fmt
 The test suite is headless and pure — no test spawns `ssh`, `ssh-keygen`, or `wt`. When
 manually testing save behavior, always point `--config` at a throwaway file: the app
 writes to whatever path it is given.
+
+## Support
+
+`sshm` is free and open source, built in spare time. If it saves you time, you
+can optionally sponsor its development via
+[**GitHub Sponsors**](https://github.com/sponsors/nakata5577) — entirely
+optional and genuinely appreciated. Starring the repo helps just as much. ⭐
 
 ## Contributing
 
