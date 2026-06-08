@@ -12,7 +12,9 @@ use std::process::{Command, Stdio};
 
 use super::binaries::{ssh_dir, tools};
 
-/// How deep below `~/.ssh` to recurse when discovering keys.
+/// How many directory levels to descend when discovering keys. The root
+/// (`~/.ssh`) is level 0, so the deepest files found live `MAX_DEPTH - 1`
+/// subdirectories down.
 const MAX_DEPTH: usize = 8;
 
 #[derive(Debug, Clone)]
@@ -121,7 +123,7 @@ fn list_keys_in(dir: &Path) -> Vec<KeyInfo> {
 
 /// Recursively collect `.pub` files and private-key files under `dir`. Symlinked
 /// directories are not followed (loop-safe); symlinked *files* are resolved and
-/// classified. Depth is capped at `MAX_DEPTH` levels below the root.
+/// classified. Recursion stops once `depth` reaches `MAX_DEPTH`.
 fn walk_keys(dir: &Path, depth: usize, pubs: &mut Vec<PathBuf>, privs: &mut Vec<PathBuf>) {
     if depth >= MAX_DEPTH {
         return;
@@ -157,13 +159,15 @@ fn walk_keys(dir: &Path, depth: usize, pubs: &mut Vec<PathBuf>, privs: &mut Vec<
 /// guards against a private key mis-named `*.pub` (which would otherwise leak
 /// its body via `read_public_key` / copy).
 fn classify_file(path: PathBuf, pubs: &mut Vec<PathBuf>, privs: &mut Vec<PathBuf>) {
+    // Sniff once: a private-key header wins over the `.pub` extension.
+    let is_priv = looks_like_private_key(&path);
     let is_pub_ext = path
         .extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case("pub"));
-    if is_pub_ext && !looks_like_private_key(&path) {
+    if is_pub_ext && !is_priv {
         pubs.push(path);
-    } else if looks_like_private_key(&path) {
+    } else if is_priv {
         privs.push(path);
     }
 }
@@ -427,25 +431,33 @@ mod tests {
     #[test]
     fn walk_respects_max_depth() {
         let dir = tmp_dir("depth");
-        // Build dir/d1/d2/.../ and drop a key one level past MAX_DEPTH.
-        let mut deep = dir.clone();
-        for i in 0..=MAX_DEPTH {
-            deep = deep.join(format!("d{i}"));
+        // Build d0/d1/.../d(MAX_DEPTH-1). The deepest scannable directory is
+        // d(MAX_DEPTH-2) (visited at recursion depth MAX_DEPTH-1); the next one
+        // down, d(MAX_DEPTH-1), is entered at depth MAX_DEPTH and returns before
+        // listing. Placing a key on each side tightly pins the boundary.
+        let mut path = dir.clone();
+        let mut at_limit = dir.clone();
+        for i in 0..MAX_DEPTH {
+            path = path.join(format!("d{i}"));
+            if i == MAX_DEPTH - 2 {
+                at_limit = path.clone();
+            }
         }
-        fs::create_dir_all(&deep).unwrap();
-        fs::write(deep.join("too_deep"), OPENSSH_HEADER).unwrap();
-        // And one that sits just inside the limit.
-        let shallow = dir.join("d0");
-        fs::write(shallow.join("reachable"), OPENSSH_HEADER).unwrap();
+        fs::create_dir_all(&path).unwrap(); // through d(MAX_DEPTH-1)
+        fs::write(at_limit.join("at_limit"), OPENSSH_HEADER).unwrap();
+        fs::write(path.join("too_deep"), OPENSSH_HEADER).unwrap();
 
         let mut pubs = Vec::new();
         let mut privs = Vec::new();
         walk_keys(&dir, 0, &mut pubs, &mut privs);
 
-        assert!(privs.iter().any(|p| p.ends_with("d0/reachable")));
+        assert!(
+            privs.iter().any(|p| p.ends_with("at_limit")),
+            "key at the deepest scannable level must be discovered"
+        );
         assert!(
             !privs.iter().any(|p| p.ends_with("too_deep")),
-            "key beyond MAX_DEPTH must not be discovered"
+            "key one level past the cap must not be discovered"
         );
 
         fs::remove_dir_all(&dir).ok();
