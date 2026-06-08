@@ -11,7 +11,7 @@ use ratatui::widgets::{ListState, TableState};
 
 use crate::config::SshConfig;
 use crate::config::model::HostView;
-use crate::os::keys::PublicKeyInfo;
+use crate::os::keys::KeyInfo;
 use crate::os::known_hosts::KnownHostEntry;
 use crate::os::liveness::{Liveness, LivenessProbe, ProbeTarget};
 use crate::os::{self, keys, known_hosts};
@@ -211,7 +211,7 @@ pub struct App {
     pub form: EditForm,
 
     // --- S3 keys ---
-    pub keys: Vec<PublicKeyInfo>,
+    pub keys: Vec<KeyInfo>,
     pub keys_state: ListState,
     pub key_host_ctx: Option<usize>,
     pub gen_wizard: GenWizard,
@@ -239,7 +239,7 @@ impl App {
     pub fn new(config_path: std::path::PathBuf) -> anyhow::Result<Self> {
         let config = SshConfig::load(config_path).context("loading ssh config")?;
 
-        let keys = keys::list_public_keys();
+        let keys = keys::list_keys();
         let known = known_hosts::parse_known_hosts();
 
         let mut app = App {
@@ -486,7 +486,7 @@ impl App {
 
     /// Reload keys / known_hosts from disk (after generate / delete).
     pub fn reload_keys(&mut self) {
-        self.keys = keys::list_public_keys();
+        self.keys = keys::list_keys();
         if self.keys.is_empty() {
             self.keys_state.select(None);
         } else {

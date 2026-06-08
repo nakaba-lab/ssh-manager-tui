@@ -583,6 +583,10 @@ fn set_identity_for_host(app: &mut App) {
     let Some(k) = app.keys_state.selected().and_then(|i| app.keys.get(i)) else {
         return;
     };
+    if !k.has_private {
+        app.toast("no private key file for this entry", true);
+        return;
+    }
     let id_path = tildify(&k.private_path());
     let Some(&item) = app.host_items.get(host_idx) else {
         return;
@@ -917,13 +921,17 @@ fn remove_key_files(app: &mut App, sel: usize) {
     let Some(k) = app.keys.get(sel) else {
         return;
     };
-    let pub_path = k.path.clone();
+    let pub_path = k.pub_path.clone();
     let priv_path = k.private_path();
     let mut errors = Vec::new();
-    if let Err(e) = std::fs::remove_file(&pub_path) {
+    if let Some(pub_path) = pub_path
+        && let Err(e) = std::fs::remove_file(&pub_path)
+    {
         errors.push(format!("pub: {e}"));
     }
-    if priv_path.exists()
+    // `symlink_metadata` (unlike `exists`) does not follow the link, so a
+    // broken-symlink private key is still detected and removed.
+    if priv_path.symlink_metadata().is_ok()
         && let Err(e) = std::fs::remove_file(&priv_path)
     {
         errors.push(format!("priv: {e}"));
