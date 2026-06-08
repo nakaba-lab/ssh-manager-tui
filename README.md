@@ -81,10 +81,35 @@ layout that stacks the panes on narrow terminals.
 
 ## Installation
 
-### Download a binary
+### Package managers
 
-Grab the latest `sshm.exe` (Windows x64) from the
-[**Releases**](https://github.com/nakaba-lab/ssh-manager-tui/releases) page.
+**Cargo** — any platform with a Rust toolchain (**1.94+**, edition 2024):
+
+```sh
+cargo install sshm-tui          # installs the `sshm` binary into ~/.cargo/bin
+```
+
+> Published on crates.io as **`sshm-tui`** (the bare `sshm` name was already taken),
+> but the installed command is still **`sshm`**.
+
+**Scoop** — Windows:
+
+```powershell
+scoop install https://raw.githubusercontent.com/nakaba-lab/ssh-manager-tui/main/packaging/scoop/sshm.json
+```
+
+**winget** — Windows:
+
+```powershell
+winget install NakabaLab.sshm
+```
+
+### Download a prebuilt binary
+
+Each [**Release**](https://github.com/nakaba-lab/ssh-manager-tui/releases) attaches
+archives for Windows (`.zip`), Linux, and macOS (`.tar.gz`), each with a matching
+`.sha256` checksum. Download the one for your platform, extract `sshm`/`sshm.exe`, and
+put it on your `PATH`.
 
 > The published Windows binary is currently **self-signed**, so SmartScreen may show a
 > "Windows protected your PC" warning. Choose **More info → Run anyway**, or build from
@@ -92,10 +117,8 @@ Grab the latest `sshm.exe` (Windows x64) from the
 
 ### From source
 
-Requires a Rust toolchain (**1.94+**, edition 2024).
-
 ```sh
-# install straight from git into ~/.cargo/bin
+# install straight from git into ~/.cargo/bin (binary: sshm)
 cargo install --git https://github.com/nakaba-lab/ssh-manager-tui
 
 # …or clone and build
