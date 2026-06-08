@@ -583,6 +583,10 @@ fn set_identity_for_host(app: &mut App) {
     let Some(k) = app.keys_state.selected().and_then(|i| app.keys.get(i)) else {
         return;
     };
+    if !k.has_private {
+        app.toast("no private key file for this entry", true);
+        return;
+    }
     let id_path = tildify(&k.private_path());
     let Some(&item) = app.host_items.get(host_idx) else {
         return;
