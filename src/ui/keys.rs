@@ -103,7 +103,13 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
             "MISSING".into()
         },
     );
-    kv("public file", k.path.display().to_string());
+    kv(
+        "public file",
+        match &k.pub_path {
+            Some(p) => p.display().to_string(),
+            None => "MISSING".into(),
+        },
+    );
 
     if let Some(ctx) = app.key_host_ctx.and_then(|i| app.hosts.get(i)) {
         lines.push(Line::from(""));

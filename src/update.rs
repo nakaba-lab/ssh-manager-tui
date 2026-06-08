@@ -917,10 +917,12 @@ fn remove_key_files(app: &mut App, sel: usize) {
     let Some(k) = app.keys.get(sel) else {
         return;
     };
-    let pub_path = k.path.clone();
+    let pub_path = k.pub_path.clone();
     let priv_path = k.private_path();
     let mut errors = Vec::new();
-    if let Err(e) = std::fs::remove_file(&pub_path) {
+    if let Some(pub_path) = pub_path
+        && let Err(e) = std::fs::remove_file(&pub_path)
+    {
         errors.push(format!("pub: {e}"));
     }
     if priv_path.exists()
