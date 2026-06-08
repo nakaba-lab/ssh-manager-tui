@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Clear, List, ListItem, Paragraph, Wrap};
 
 use crate::app::App;
-use crate::os::keys::KeyType;
+use crate::os::keys::{KeyType, PairStatus};
 
 use super::theme;
 use super::widgets::{centered, input_line, modal_block, panel, responsive_split};
@@ -43,7 +43,7 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
             } else {
                 ("○ ", Style::default().fg(theme::FAINT))
             };
-            ListItem::new(Line::from(vec![
+            let mut spans = vec![
                 Span::styled(mark, mark_style),
                 Span::styled(
                     k.name(),
@@ -55,7 +55,16 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
                     format!("  {} {}", k.key_type, k.bits),
                     Style::default().fg(theme::DIM),
                 ),
-            ]))
+            ];
+            if k.pair == PairStatus::Mismatched {
+                spans.push(Span::styled(
+                    "  mismatch",
+                    Style::default()
+                        .fg(theme::DOWN)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+            ListItem::new(Line::from(spans))
         })
         .collect();
 
@@ -110,6 +119,24 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
             None => "MISSING".into(),
         },
     );
+    // Pair verification result — only shown when both halves exist.
+    if let Some((text, color)) = match k.pair {
+        PairStatus::Matched => Some(("verified — public key matches private key", theme::UP)),
+        PairStatus::Mismatched => Some((
+            "MISMATCH — public key is not this private key's pair",
+            theme::DOWN,
+        )),
+        PairStatus::Unverified => Some((
+            "unverified — could not fingerprint both halves",
+            theme::WARN,
+        )),
+        PairStatus::NotApplicable => None,
+    } {
+        lines.push(Line::from(vec![
+            Span::styled(format!("{:>14}  ", "pair"), Style::default().fg(theme::DIM)),
+            Span::styled(text, Style::default().fg(color)),
+        ]));
+    }
 
     if let Some(ctx) = app.key_host_ctx.and_then(|i| app.hosts.get(i)) {
         lines.push(Line::from(""));

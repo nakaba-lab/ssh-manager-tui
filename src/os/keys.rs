@@ -17,6 +17,28 @@ use super::binaries::{ssh_dir, tools};
 /// subdirectories down.
 const MAX_DEPTH: usize = 8;
 
+/// Whether a key's two halves were proven to belong to the same keypair.
+///
+/// We never load private key bodies to check this — instead each half is
+/// fingerprinted independently (`ssh-keygen -l -f`) and the SHA256 public
+/// fingerprints are compared. A matching fingerprint means the `.pub` really is
+/// the public half of this private key, i.e. they sign/verify (and so
+/// encrypt/decrypt) as a pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PairStatus {
+    /// Only one half exists (private-only or public-only) — nothing to match.
+    NotApplicable,
+    /// Both halves present and their public fingerprints agree.
+    Matched,
+    /// Both halves present but their fingerprints differ — the `.pub` does not
+    /// belong to this private key.
+    Mismatched,
+    /// Both halves present but a fingerprint could not be read (e.g. a legacy
+    /// encrypted PEM private key whose public half ssh-keygen won't surface
+    /// without the passphrase), so the pairing can't be confirmed.
+    Unverified,
+}
+
 #[derive(Debug, Clone)]
 pub struct KeyInfo {
     /// Private key path (the base). The public key, when present, is at
@@ -30,6 +52,9 @@ pub struct KeyInfo {
     pub key_type: String,
     /// True if the private key file itself exists on disk.
     pub has_private: bool,
+    /// Whether the private and public halves were verified to be the same
+    /// keypair (only meaningful when both halves exist).
+    pub pair: PairStatus,
 }
 
 impl KeyInfo {
@@ -198,25 +223,23 @@ fn looks_like_private_key(path: &Path) -> bool {
 /// may still try the console directly for legacy encrypted PEM, in which case it
 /// simply fails and the fields stay empty — never a hang here).
 fn fingerprint_of(base: PathBuf, pub_path: Option<PathBuf>, has_priv: bool) -> KeyInfo {
+    // Display metadata comes from the public file when present (it carries the
+    // comment), else from the private key.
     let fp_source = pub_path.clone().unwrap_or_else(|| base.clone());
-    let output = Command::new(&tools().ssh_keygen)
-        .arg("-l")
-        .arg("-f")
-        .arg(&fp_source)
-        .stdin(Stdio::null())
-        .output();
+    let (bits, fingerprint, comment, key_type) = read_fingerprint(&fp_source).unwrap_or_default();
 
-    let (bits, fingerprint, comment, key_type) = match output {
-        Ok(out) if out.status.success() => {
-            let text = String::from_utf8_lossy(&out.stdout);
-            parse_fingerprint_line(text.lines().next().unwrap_or("")).unwrap_or((
-                0,
-                String::new(),
-                String::new(),
-                String::new(),
-            ))
+    // Verify the two halves are genuinely the same keypair. Only meaningful when
+    // both exist. We must derive the public key from the private key's *secret
+    // material* (`ssh-keygen -y`) — comparing fingerprints would be circular,
+    // because `ssh-keygen -l -f <priv>` just reads the sibling `.pub` and so
+    // never disagrees with it.
+    let pair = match (&pub_path, has_priv) {
+        (Some(pub_path), true) => {
+            let derived = derive_public_key(&base);
+            let stored = read_pub_body(pub_path);
+            classify_pair(derived.as_deref(), stored.as_deref())
         }
-        _ => (0, String::new(), String::new(), String::new()),
+        _ => PairStatus::NotApplicable,
     };
 
     KeyInfo {
@@ -227,6 +250,86 @@ fn fingerprint_of(base: PathBuf, pub_path: Option<PathBuf>, has_priv: bool) -> K
         comment,
         key_type,
         has_private: has_priv,
+        pair,
+    }
+}
+
+/// Run `ssh-keygen -l -f <path>` and parse its first line. `None` on spawn
+/// failure, a non-zero exit, or an unparseable line. `stdin` is nulled so an
+/// encrypted PEM that would otherwise prompt fails fast instead of hanging.
+fn read_fingerprint(path: &Path) -> Option<(u32, String, String, String)> {
+    let output = Command::new(&tools().ssh_keygen)
+        .arg("-l")
+        .arg("-f")
+        .arg(path)
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    parse_fingerprint_line(text.lines().next().unwrap_or(""))
+}
+
+/// Derive the public key from a private key via `ssh-keygen -y -f`. Unlike
+/// `-l -f`, this reads the private key's *actual* secret material (not a sibling
+/// `.pub`), so it is the source of truth for which public key the private key
+/// corresponds to. Returns the normalized `<algo> <blob>` body, or `None` on
+/// failure — e.g. an encrypted key whose passphrase we don't have.
+///
+/// `-P ""` is essential: `-y` on an *encrypted* key prompts for the passphrase
+/// straight on the console, which nulling `stdin` does **not** suppress, so it
+/// would hang the UI thread. Supplying an (empty, wrong) passphrase makes it
+/// fail fast instead; unencrypted keys ignore it and derive normally.
+fn derive_public_key(priv_path: &Path) -> Option<String> {
+    let output = Command::new(&tools().ssh_keygen)
+        .arg("-y")
+        .arg("-P")
+        .arg("")
+        .arg("-f")
+        .arg(priv_path)
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    pub_body(text.lines().next().unwrap_or(""))
+}
+
+/// Read a `.pub` file and return its normalized `<algo> <blob>` body.
+fn read_pub_body(pub_path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(pub_path).ok()?;
+    pub_body(text.lines().next().unwrap_or(""))
+}
+
+/// Normalize a public-key line to its identity: `<algorithm> <base64-blob>`,
+/// dropping any trailing comment (which differs freely between a stored `.pub`
+/// and a freshly derived key). `None` if the line lacks the two required fields.
+fn pub_body(line: &str) -> Option<String> {
+    let mut it = line.split_whitespace();
+    let algo = it.next()?;
+    let blob = it.next()?;
+    Some(format!("{algo} {blob}"))
+}
+
+/// Decide a [`PairStatus`] from the private key's derived public-key body and
+/// the stored `.pub` body. A readable, non-empty body on both sides lets us
+/// compare; anything missing means we couldn't confirm and report
+/// [`PairStatus::Unverified`] rather than a false mismatch. Pure (no I/O) so the
+/// matching rule is unit-testable.
+fn classify_pair(derived: Option<&str>, stored: Option<&str>) -> PairStatus {
+    match (derived, stored) {
+        (Some(a), Some(b)) if !a.is_empty() && !b.is_empty() => {
+            if a == b {
+                PairStatus::Matched
+            } else {
+                PairStatus::Mismatched
+            }
+        }
+        _ => PairStatus::Unverified,
     }
 }
 
@@ -307,6 +410,56 @@ mod tests {
         let (_b, _f, comment, ktype) = parse_fingerprint_line(line).unwrap();
         assert_eq!(comment, "");
         assert_eq!(ktype, "ED25519");
+    }
+
+    #[test]
+    fn classify_pair_rules() {
+        // Same fingerprint on both halves -> a confirmed pair.
+        assert_eq!(
+            classify_pair(Some("SHA256:abc"), Some("SHA256:abc")),
+            PairStatus::Matched
+        );
+        // Different fingerprints -> the `.pub` is not this key's pair.
+        assert_eq!(
+            classify_pair(Some("SHA256:abc"), Some("SHA256:zzz")),
+            PairStatus::Mismatched
+        );
+        // A missing or blank half -> unverifiable, never a false mismatch.
+        assert_eq!(
+            classify_pair(Some("SHA256:abc"), None),
+            PairStatus::Unverified
+        );
+        assert_eq!(
+            classify_pair(None, Some("SHA256:abc")),
+            PairStatus::Unverified
+        );
+        assert_eq!(classify_pair(Some(""), Some("")), PairStatus::Unverified);
+        assert_eq!(
+            classify_pair(Some("SHA256:abc"), Some("")),
+            PairStatus::Unverified
+        );
+    }
+
+    #[test]
+    fn pub_body_drops_comment_and_keeps_algo_blob() {
+        // The comment must be ignored so a derived key (often comment-less)
+        // still matches the stored `.pub` of the same key.
+        assert_eq!(
+            pub_body("ssh-ed25519 AAAAC3Nz user@host"),
+            Some("ssh-ed25519 AAAAC3Nz".to_string())
+        );
+        assert_eq!(
+            pub_body("ssh-ed25519 AAAAC3Nz"),
+            Some("ssh-ed25519 AAAAC3Nz".to_string())
+        );
+        // A comment-only difference must compare equal.
+        assert_eq!(
+            pub_body("ssh-rsa AAAAB3 a@a"),
+            pub_body("ssh-rsa AAAAB3 b@b")
+        );
+        // Malformed lines (no blob) yield None.
+        assert_eq!(pub_body("ssh-ed25519"), None);
+        assert_eq!(pub_body(""), None);
     }
 
     use std::fs;
