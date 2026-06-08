@@ -929,7 +929,9 @@ fn remove_key_files(app: &mut App, sel: usize) {
     {
         errors.push(format!("pub: {e}"));
     }
-    if priv_path.exists()
+    // `symlink_metadata` (unlike `exists`) does not follow the link, so a
+    // broken-symlink private key is still detected and removed.
+    if priv_path.symlink_metadata().is_ok()
         && let Err(e) = std::fs::remove_file(&priv_path)
     {
         errors.push(format!("priv: {e}"));

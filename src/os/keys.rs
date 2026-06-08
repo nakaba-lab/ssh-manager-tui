@@ -113,12 +113,13 @@ fn list_keys_in(dir: &Path) -> Vec<KeyInfo> {
         bases.entry(p).or_default().1 = true;
     }
 
-    let mut keys: Vec<KeyInfo> = bases
+    // `bases` is a BTreeMap keyed by the base path, and each KeyInfo's `path`
+    // is exactly that key, so iterating it already yields entries sorted by
+    // path — no explicit sort needed.
+    bases
         .into_iter()
         .map(|(base, (pub_path, has_priv))| fingerprint_of(base, pub_path, has_priv))
-        .collect();
-    keys.sort_by(|a, b| a.path.cmp(&b.path));
-    keys
+        .collect()
 }
 
 /// Recursively collect `.pub` files and private-key files under `dir`. Symlinked
