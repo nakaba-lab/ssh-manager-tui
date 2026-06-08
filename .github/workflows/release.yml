@@ -1,0 +1,101 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: release (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            archive: zip
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            archive: tar.gz
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            archive: tar.gz
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+            archive: tar.gz
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Install via the matrix target so cross-target builds (e.g.
+      # x86_64-apple-darwin on the arm64 macos runner) get the right std.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      # The download filename uses VERSION with no leading 'v'; the tag
+      # (github.ref_name) carries it, so strip exactly one leading 'v'.
+      # Asset base name = sshm-<VERSION>-<target>.
+      - name: Package archive (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}" -replace '^v', ''
+          $base = "sshm-$version-${{ matrix.target }}"
+          $asset = "$base.zip"
+          $stage = New-Item -ItemType Directory -Path "$env:RUNNER_TEMP/stage" -Force
+          Copy-Item "target/${{ matrix.target }}/release/sshm.exe" -Destination $stage
+          Copy-Item "LICENSE-MIT","LICENSE-APACHE","README.md" -Destination $stage
+          # Compress the staged contents so sshm.exe + docs sit at the archive ROOT.
+          Compress-Archive -Path "$($stage.FullName)/*" -DestinationPath $asset -Force
+          $hash = (Get-FileHash -Algorithm SHA256 $asset).Hash.ToLower()
+          # Exact format for Scoop: <hash><two spaces><filename>, no trailing newline games.
+          Set-Content -Path "$asset.sha256" -Value "$hash  $asset" -NoNewline
+          "ASSET=$asset" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Package archive (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          base="sshm-${version}-${{ matrix.target }}"
+          asset="${base}.tar.gz"
+          # -C into the release dir for the binary, and into the repo root for the
+          # docs, so everything lands at the archive ROOT (no nested dirs).
+          tar -czf "$asset" \
+            -C "target/${{ matrix.target }}/release" sshm \
+            -C "$GITHUB_WORKSPACE" LICENSE-MIT LICENSE-APACHE README.md
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            hash="$(shasum -a 256 "$asset" | awk '{print $1}')"
+          else
+            hash="$(sha256sum "$asset" | awk '{print $1}')"
+          fi
+          # Exact format for Scoop: hash, two spaces, filename.
+          printf '%s  %s' "$hash" "$asset" > "${asset}.sha256"
+          echo "ASSET=$asset" >> "$GITHUB_ENV"
+
+      - name: Attach assets to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: |
+            ${{ env.ASSET }}
+            ${{ env.ASSET }}.sha256

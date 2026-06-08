@@ -1,12 +1,20 @@
 [package]
-name = "sshm"
-version = "1.0.0"
+name = "sshm-tui"
+version = "1.0.1"
 edition = "2024"
 rust-version = "1.94"
 description = "A TUI SSH host manager for ~/.ssh/config"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/nakaba-lab/ssh-manager-tui"
+homepage = "https://github.com/nakaba-lab/ssh-manager-tui"
 readme = "README.md"
+keywords = ["ssh", "tui", "ssh-config", "terminal", "ratatui"]
+categories = ["command-line-utilities"]
+exclude = [".github/", "docs/", "CLAUDE.md", "packaging/"]
+
+[[bin]]
+name = "sshm"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.102"
