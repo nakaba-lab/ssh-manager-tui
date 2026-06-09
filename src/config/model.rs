@@ -197,11 +197,15 @@ impl HostView {
             let v = v.trim();
             !v.is_empty() && !v.eq_ignore_ascii_case("none")
         }
-        self.proxy_jump.as_deref().is_some_and(is_active)
-            || self
-                .extras
-                .iter()
-                .any(|(k, v)| k.eq_ignore_ascii_case("ProxyCommand") && is_active(v))
+        // OpenSSH uses the FIRST value of a duplicated directive ("first match
+        // wins"), so only the first ProxyCommand counts: a later override can't
+        // re-enable a proxy that an earlier `none` already disabled.
+        let proxy_command = self
+            .extras
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("ProxyCommand"))
+            .map(|(_, v)| v.as_str());
+        self.proxy_jump.as_deref().is_some_and(is_active) || proxy_command.is_some_and(is_active)
     }
 
     /// Project a parsed [`HostBlock`] into an editable view.
@@ -286,5 +290,35 @@ mod proxied_tests {
     #[test]
     fn unrelated_extras_do_not_count() {
         assert!(!view_with_extra("ForwardAgent", "yes").is_proxied());
+    }
+
+    #[test]
+    fn multiple_proxy_commands_first_wins() {
+        // OpenSSH "first match wins": a leading `none` disables the proxy even
+        // when a later ProxyCommand defines one.
+        let v = HostView {
+            extras: vec![
+                ("ProxyCommand".to_string(), "none".to_string()),
+                (
+                    "ProxyCommand".to_string(),
+                    "ssh -W %h:%p bastion".to_string(),
+                ),
+            ],
+            ..Default::default()
+        };
+        assert!(!v.is_proxied());
+
+        // ...and a leading active command stays proxied despite a later `none`.
+        let v2 = HostView {
+            extras: vec![
+                (
+                    "ProxyCommand".to_string(),
+                    "ssh -W %h:%p bastion".to_string(),
+                ),
+                ("ProxyCommand".to_string(), "none".to_string()),
+            ],
+            ..Default::default()
+        };
+        assert!(v2.is_proxied());
     }
 }
