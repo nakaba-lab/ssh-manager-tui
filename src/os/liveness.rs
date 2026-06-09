@@ -18,7 +18,8 @@ pub enum Liveness {
     Checking,
     Up,
     Down,
-    /// Behind a ProxyJump — a direct TCP probe is meaningless, so we skip it.
+    /// Behind a proxy (ProxyJump/ProxyCommand) — a direct TCP probe is
+    /// meaningless, so we skip it.
     Skipped,
 }
 

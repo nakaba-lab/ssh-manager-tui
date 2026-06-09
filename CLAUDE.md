@@ -121,8 +121,9 @@ ad-hoc `ConnectOverrides`, never for saved values.
 reporting over an `mpsc` channel. The UI thread never blocks: it calls
 `App::drain_liveness()` once per tick. Results are keyed by **host index in
 `App::hosts`**, which shifts when hosts are added/removed — `rebuild_hosts()`
-clears the liveness maps and callers re-probe. Hosts behind a `ProxyJump` are
-`Skipped` (a direct TCP probe would be meaningless).
+clears the liveness maps and callers re-probe. Hosts behind a proxy
+(`ProxyJump` or `ProxyCommand` — see `HostView::is_proxied`) are `Skipped` (a
+direct TCP probe would be meaningless).
 
 ## Windows-first specifics (don't regress these)
 

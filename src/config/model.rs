@@ -186,6 +186,24 @@ impl HostView {
         self.patterns.first().map(String::as_str).unwrap_or("")
     }
 
+    /// True when reaching this host goes through a proxy — either `ProxyJump`
+    /// or a `ProxyCommand` (which lives in [`extras`](Self::extras), having no
+    /// dedicated form field). A direct TCP probe to `HostName` is meaningless in
+    /// that case, so liveness skips it instead of reporting a false "down".
+    ///
+    /// `none` disables either directive, so it does not count as proxied.
+    pub fn is_proxied(&self) -> bool {
+        fn is_active(v: &str) -> bool {
+            let v = v.trim();
+            !v.is_empty() && !v.eq_ignore_ascii_case("none")
+        }
+        self.proxy_jump.as_deref().is_some_and(is_active)
+            || self
+                .extras
+                .iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case("ProxyCommand") && is_active(v))
+    }
+
     /// Project a parsed [`HostBlock`] into an editable view.
     pub fn from_block(block: &HostBlock) -> HostView {
         let mut v = HostView {
@@ -218,5 +236,55 @@ impl HostView {
             }
         }
         v
+    }
+}
+
+#[cfg(test)]
+mod proxied_tests {
+    use super::HostView;
+
+    fn view_with_extra(keyword: &str, value: &str) -> HostView {
+        HostView {
+            extras: vec![(keyword.to_string(), value.to_string())],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn plain_host_is_not_proxied() {
+        assert!(!HostView::default().is_proxied());
+    }
+
+    #[test]
+    fn proxy_jump_counts_as_proxied() {
+        let v = HostView {
+            proxy_jump: Some("bastion".into()),
+            ..Default::default()
+        };
+        assert!(v.is_proxied());
+    }
+
+    #[test]
+    fn proxy_command_in_extras_counts_as_proxied() {
+        // ProxyCommand has no dedicated field, so it round-trips through extras.
+        assert!(view_with_extra("ProxyCommand", "ssh -W %h:%p bastion").is_proxied());
+        // Keyword casing must not matter.
+        assert!(view_with_extra("proxycommand", "cloudflared access ssh").is_proxied());
+    }
+
+    #[test]
+    fn none_disables_either_directive() {
+        let jump_none = HostView {
+            proxy_jump: Some("none".into()),
+            ..Default::default()
+        };
+        assert!(!jump_none.is_proxied());
+        assert!(!view_with_extra("ProxyCommand", "none").is_proxied());
+        assert!(!view_with_extra("ProxyCommand", "  None  ").is_proxied());
+    }
+
+    #[test]
+    fn unrelated_extras_do_not_count() {
+        assert!(!view_with_extra("ForwardAgent", "yes").is_proxied());
     }
 }
