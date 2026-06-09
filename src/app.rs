@@ -420,7 +420,6 @@ impl App {
                         id: i,
                         target: t,
                         port,
-                        has_jump: false,
                     });
                 }
                 _ => {

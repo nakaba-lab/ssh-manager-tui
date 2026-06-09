@@ -49,7 +49,6 @@ pub struct ProbeTarget {
     pub id: usize,
     pub target: String,
     pub port: u16,
-    pub has_jump: bool,
 }
 
 /// A live probing session. Dropping it lets the workers finish and exit (the
@@ -77,15 +76,6 @@ impl LivenessProbe {
                         q.pop_front()
                     };
                     let Some(job) = job else { break };
-
-                    if job.has_jump {
-                        let _ = tx.send(LivenessResult {
-                            id: job.id,
-                            state: Liveness::Skipped,
-                            rtt: None,
-                        });
-                        continue;
-                    }
 
                     let _ = tx.send(LivenessResult {
                         id: job.id,
