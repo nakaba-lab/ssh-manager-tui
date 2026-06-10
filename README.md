@@ -95,7 +95,8 @@ cargo install sshm-tui          # installs the `sshm` binary into ~/.cargo/bin
 **Scoop** — Windows:
 
 ```powershell
-scoop install https://raw.githubusercontent.com/nakaba-lab/ssh-manager-tui/main/packaging/scoop/sshm.json
+scoop bucket add nakaba-lab https://github.com/nakaba-lab/scoop-bucket
+scoop install sshm-tui
 ```
 
 **winget** — Windows:
