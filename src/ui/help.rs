@@ -63,6 +63,7 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
             lines.push(key("/", "search (alias / hostname / user)"));
             lines.push(key("Enter", "connect inline (same console)"));
             lines.push(key("t", "connect in new Windows Terminal tab"));
+            lines.push(key("s / S", "sftp inline / in new tab"));
             lines.push(key("o", "action menu"));
             lines.push(key("c", "copy ssh command"));
             lines.push(key("e / a", "edit / add host"));

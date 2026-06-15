@@ -11,6 +11,8 @@ use std::sync::OnceLock;
 #[derive(Debug, Clone)]
 pub struct SshTools {
     pub ssh: PathBuf,
+    /// Resolved `sftp` client, used for the SFTP launch actions.
+    pub sftp: PathBuf,
     pub ssh_keygen: PathBuf,
     /// Resolved `ssh-keyscan` (retained for a future "scan host key" action).
     #[allow(dead_code)]
@@ -35,6 +37,7 @@ fn resolve() -> SshTools {
     if ssh.is_file() {
         return SshTools {
             ssh,
+            sftp: base.join("sftp.exe"),
             ssh_keygen: base.join("ssh-keygen.exe"),
             ssh_keyscan: base.join("ssh-keyscan.exe"),
             is_system32: true,
@@ -42,6 +45,7 @@ fn resolve() -> SshTools {
     }
     SshTools {
         ssh: PathBuf::from("ssh"),
+        sftp: PathBuf::from("sftp"),
         ssh_keygen: PathBuf::from("ssh-keygen"),
         ssh_keyscan: PathBuf::from("ssh-keyscan"),
         is_system32: false,
@@ -52,6 +56,7 @@ fn resolve() -> SshTools {
 fn resolve() -> SshTools {
     SshTools {
         ssh: PathBuf::from("ssh"),
+        sftp: PathBuf::from("sftp"),
         ssh_keygen: PathBuf::from("ssh-keygen"),
         ssh_keyscan: PathBuf::from("ssh-keyscan"),
         is_system32: true,

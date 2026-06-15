@@ -19,7 +19,8 @@ use crate::app::{
 };
 use crate::config::model::HostView;
 use crate::os::connect::{
-    ConnectOverrides, build_ssh_args, command_line, connect_new_tab, describe_exit, run_ssh_inline,
+    ConnectOverrides, build_sftp_args, build_ssh_args, command_line, connect_new_tab,
+    describe_exit, run_sftp_inline, run_ssh_inline, sftp_new_tab,
 };
 use crate::os::keys::{generate_key, read_public_key};
 use crate::os::known_hosts::remove_entry;
@@ -142,6 +143,8 @@ fn handle_list(app: &mut App, key: KeyEvent, terminal: &mut DefaultTerminal) -> 
         KeyCode::Char('G') => select_index(app, app.filtered.len().saturating_sub(1)),
         KeyCode::Enter => connect_selected(app, terminal, ConnectMode::Inline)?,
         KeyCode::Char('t') => connect_selected(app, terminal, ConnectMode::NewWtTab)?,
+        KeyCode::Char('s') => sftp_selected(app, terminal, ConnectMode::Inline)?,
+        KeyCode::Char('S') => sftp_selected(app, terminal, ConnectMode::NewWtTab)?,
         KeyCode::Char('o') => {
             if let Some(h) = app.selected_host() {
                 app.menu_sel = 0;
@@ -249,7 +252,7 @@ fn connect_selected(
             restore_tui(terminal)?;
             match status {
                 Ok(s) => {
-                    if let Some((msg, is_err)) = describe_exit(&s) {
+                    if let Some((msg, is_err)) = describe_exit(&s, "ssh") {
                         app.toast(msg, is_err);
                     }
                 }
@@ -258,6 +261,38 @@ fn connect_selected(
         }
         ConnectMode::NewWtTab => match connect_new_tab(host.alias(), &args) {
             Ok(()) => app.toast(format!("opened new tab: ssh {}", host.alias()), false),
+            Err(e) => app.toast(format!("{e}"), true),
+        },
+    }
+    Ok(())
+}
+
+/// Launch an interactive `sftp` session for the selected host. Mirrors
+/// [`connect_selected`]: saved hosts use a bare `sftp <alias>`, so `sftp` reads
+/// the very `~/.ssh/config` we wrote (ProxyJump, IdentityFile, Port all apply).
+fn sftp_selected(app: &mut App, terminal: &mut DefaultTerminal, mode: ConnectMode) -> Result<()> {
+    let Some(idx) = app.selected_host() else {
+        return Ok(());
+    };
+    let host = app.hosts[idx].clone();
+    let args = build_sftp_args(&host, &ConnectOverrides::default());
+
+    match mode {
+        ConnectMode::Inline => {
+            suspend_tui(terminal)?;
+            let status = run_sftp_inline(&args);
+            restore_tui(terminal)?;
+            match status {
+                Ok(s) => {
+                    if let Some((msg, is_err)) = describe_exit(&s, "sftp") {
+                        app.toast(msg, is_err);
+                    }
+                }
+                Err(e) => app.toast(format!("failed to launch sftp: {e}"), true),
+            }
+        }
+        ConnectMode::NewWtTab => match sftp_new_tab(host.alias(), &args) {
+            Ok(()) => app.toast(format!("opened new tab: sftp {}", host.alias()), false),
             Err(e) => app.toast(format!("{e}"), true),
         },
     }
@@ -967,7 +1002,7 @@ fn handle_action_menu(
             match sel {
                 // Delete opens its confirm WHILE the action menu is still the
                 // current screen, so cancelling the confirm returns to the menu.
-                4 => {
+                6 => {
                     let item = app.host_items[host_idx];
                     open_confirm(app, ConfirmAction::DeleteHost(item));
                 }
@@ -976,8 +1011,10 @@ fn handle_action_menu(
                     match sel {
                         0 => connect_selected(app, terminal, ConnectMode::Inline)?,
                         1 => connect_selected(app, terminal, ConnectMode::NewWtTab)?,
-                        2 => copy_command(app),
-                        3 => open_edit(app),
+                        2 => sftp_selected(app, terminal, ConnectMode::Inline)?,
+                        3 => sftp_selected(app, terminal, ConnectMode::NewWtTab)?,
+                        4 => copy_command(app),
+                        5 => open_edit(app),
                         _ => {}
                     }
                 }

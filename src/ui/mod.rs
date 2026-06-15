@@ -129,6 +129,7 @@ fn draw_footer(f: &mut Frame, app: &App, base: &Screen, area: Rect) {
             ("/", "search"),
             ("Enter", "connect"),
             ("t", "new-tab"),
+            ("s/S", "sftp"),
             ("e", "edit"),
             ("a", "add"),
             ("d", "del"),
