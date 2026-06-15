@@ -42,6 +42,11 @@ pub fn draw(f: &mut Frame, action: ConfirmAction, area: Rect) {
             "Discard unsaved changes to this host?".to_string(),
             true,
         ),
+        ConfirmAction::DeleteVaultEntry(_) => (
+            "Delete secret",
+            "Remove this stored secret from the vault?".to_string(),
+            true,
+        ),
         ConfirmAction::Quit => ("Quit", "Quit SSH Manager?".to_string(), false),
     };
 

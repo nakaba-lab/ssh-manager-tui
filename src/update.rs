@@ -14,8 +14,8 @@ use ratatui::crossterm::terminal::{
 };
 
 use crate::app::{
-    App, ConfirmAction, ConnectMode, FormMode, GenOrigin, ListFocus, Screen, form_from_view,
-    form_idx, is_multi, view_from_form,
+    App, ConfirmAction, ConnectMode, FormMode, GenOrigin, ListFocus, Screen, VaultEntryForm,
+    VaultUnlock, form_from_view, form_idx, is_multi, view_from_form,
 };
 use crate::config::model::HostView;
 use crate::os::connect::{
@@ -24,6 +24,7 @@ use crate::os::connect::{
 use crate::os::keys::{generate_key, read_public_key};
 use crate::os::known_hosts::remove_entry;
 use crate::os::ssh_dir;
+use crate::os::vault::{self, Vault, VaultEntry};
 use crate::ui::confirm::ACTION_LABELS;
 
 pub fn handle_key(app: &mut App, key: KeyEvent, terminal: &mut DefaultTerminal) -> Result<()> {
@@ -43,6 +44,9 @@ pub fn handle_key(app: &mut App, key: KeyEvent, terminal: &mut DefaultTerminal) 
         Screen::GenerateKey { origin } => handle_gen_wizard(app, key, origin),
         Screen::PickKey { editing } => handle_pick_key(app, key, editing),
         Screen::PickJump { editing } => handle_pick_jump(app, key, editing),
+        Screen::Vault => handle_vault(app, key),
+        Screen::VaultUnlock => handle_vault_unlock(app, key),
+        Screen::VaultEntry { editing } => handle_vault_entry(app, key, editing),
     }
     Ok(())
 }
@@ -172,6 +176,7 @@ fn handle_list(app: &mut App, key: KeyEvent, terminal: &mut DefaultTerminal) -> 
             app.reload_known_hosts();
             app.screen = Screen::KnownHosts;
         }
+        KeyCode::Char('P') => open_vault(app),
         _ => {}
     }
     Ok(())
@@ -852,6 +857,296 @@ fn handle_known_hosts(app: &mut App, key: KeyEvent) {
 }
 
 // ---------------------------------------------------------------------------
+// Password vault
+// ---------------------------------------------------------------------------
+
+/// Enter the vault. If it's already unlocked this session, go straight to the
+/// list; otherwise open the master-password prompt (in "create" mode when no
+/// vault file exists yet).
+fn open_vault(app: &mut App) {
+    if let Some(v) = &app.vault {
+        app.vault_state.select((!v.entries.is_empty()).then_some(0));
+        app.screen = Screen::Vault;
+        return;
+    }
+    let exists = vault::default_path().map(|p| p.exists()).unwrap_or(false);
+    app.vault_unlock = VaultUnlock {
+        creating: !exists,
+        ..Default::default()
+    };
+    open_overlay(app, Screen::VaultUnlock);
+}
+
+fn handle_vault(app: &mut App, key: KeyEvent) {
+    let len = app.vault.as_ref().map(|v| v.entries.len()).unwrap_or(0);
+    match key.code {
+        KeyCode::Esc => app.screen = Screen::List,
+        KeyCode::Char('?') => open_overlay(app, Screen::Help),
+        KeyCode::Char('j') | KeyCode::Down => move_list(&mut app.vault_state, len, 1),
+        KeyCode::Char('k') | KeyCode::Up => move_list(&mut app.vault_state, len, -1),
+        KeyCode::Char('g') => app.vault_state.select((len > 0).then_some(0)),
+        KeyCode::Char('G') => app.vault_state.select((len > 0).then_some(len - 1)),
+        KeyCode::Char(' ') => app.vault_reveal = !app.vault_reveal,
+        KeyCode::Char('a') => open_vault_entry(app, None),
+        KeyCode::Char('e') | KeyCode::Enter => {
+            if let Some(sel) = app.vault_state.selected().filter(|&s| s < len) {
+                open_vault_entry(app, Some(sel));
+            }
+        }
+        KeyCode::Char('y') | KeyCode::Char('c') => copy_vault_secret(app),
+        KeyCode::Char('d') => {
+            if let Some(sel) = app.vault_state.selected().filter(|&s| s < len) {
+                open_confirm(app, ConfirmAction::DeleteVaultEntry(sel));
+            }
+        }
+        KeyCode::Char('L') => {
+            // Lock: drop the decrypted vault from memory.
+            app.vault = None;
+            app.vault_reveal = false;
+            app.screen = Screen::List;
+            app.toast("vault locked", false);
+        }
+        _ => {}
+    }
+}
+
+fn copy_vault_secret(app: &mut App) {
+    let Some(secret) = app
+        .vault
+        .as_ref()
+        .zip(app.vault_state.selected())
+        .and_then(|(v, sel)| v.entries.get(sel))
+        .map(|e| e.secret.clone())
+    else {
+        return;
+    };
+    match copy_to_clipboard(&secret) {
+        Ok(()) => app.toast("secret copied to clipboard", false),
+        Err(e) => app.toast(format!("clipboard error: {e}"), true),
+    }
+}
+
+fn handle_vault_unlock(app: &mut App, key: KeyEvent) {
+    let creating = app.vault_unlock.creating;
+    match key.code {
+        KeyCode::Esc => {
+            app.vault_unlock = VaultUnlock::default();
+            close_overlay(app);
+        }
+        KeyCode::Tab | KeyCode::Down | KeyCode::Up if creating => {
+            app.vault_unlock.field ^= 1;
+            let u = &mut app.vault_unlock;
+            u.cursor = if u.field == 0 {
+                u.password.len()
+            } else {
+                u.confirm.len()
+            };
+        }
+        KeyCode::Enter => submit_vault_unlock(app),
+        KeyCode::Backspace => {
+            let u = &mut app.vault_unlock;
+            let s = if u.field == 0 {
+                &mut u.password
+            } else {
+                &mut u.confirm
+            };
+            backspace(s, &mut u.cursor);
+        }
+        KeyCode::Char(c) => {
+            let u = &mut app.vault_unlock;
+            let s = if u.field == 0 {
+                &mut u.password
+            } else {
+                &mut u.confirm
+            };
+            insert_char(s, &mut u.cursor, c);
+        }
+        _ => {}
+    }
+}
+
+fn submit_vault_unlock(app: &mut App) {
+    let Some(path) = vault::default_path() else {
+        app.toast("cannot resolve ~/.ssh", true);
+        return;
+    };
+    let u = app.vault_unlock.clone();
+    if u.password.is_empty() {
+        app.toast("master password is required", true);
+        return;
+    }
+
+    let result = if u.creating {
+        if u.password != u.confirm {
+            app.toast("passwords do not match", true);
+            return;
+        }
+        Vault::create(&u.password).and_then(|v| v.save(&path).map(|()| v))
+    } else {
+        Vault::unlock(&path, &u.password)
+    };
+
+    match result {
+        Ok(v) => {
+            let n = v.entries.len();
+            app.vault = Some(v);
+            app.vault_state.select((n > 0).then_some(0));
+            app.vault_unlock = VaultUnlock::default();
+            app.prev_screen = None;
+            app.screen = Screen::Vault;
+            app.toast(
+                if u.creating {
+                    "vault created"
+                } else {
+                    "vault unlocked"
+                },
+                false,
+            );
+        }
+        Err(e) => {
+            // Keep the prompt open; clear the password so the user can retry.
+            app.vault_unlock.password.clear();
+            app.vault_unlock.confirm.clear();
+            app.vault_unlock.cursor = 0;
+            app.vault_unlock.field = 0;
+            app.toast(format!("{e}"), true);
+        }
+    }
+}
+
+/// Open the entry form to add (`None`) or edit (`Some(idx)`) a vault entry.
+fn open_vault_entry(app: &mut App, editing: Option<usize>) {
+    let form = match editing.and_then(|i| app.vault.as_ref().and_then(|v| v.entries.get(i))) {
+        Some(e) => VaultEntryForm {
+            editing,
+            host: e.host.clone(),
+            kind: e.kind,
+            secret: e.secret.clone(),
+            note: e.note.clone(),
+            field: 0,
+            cursor: e.host.len(),
+        },
+        None => {
+            // Pre-fill the host from the current list selection, if any.
+            let host = app
+                .selected_host()
+                .and_then(|i| app.hosts.get(i))
+                .map(|h| h.alias().to_string())
+                .unwrap_or_default();
+            VaultEntryForm {
+                cursor: host.len(),
+                host,
+                ..Default::default()
+            }
+        }
+    };
+    app.vault_entry = form;
+    app.screen = Screen::VaultEntry { editing };
+}
+
+fn handle_vault_entry(app: &mut App, key: KeyEvent, editing: Option<usize>) {
+    const NFIELDS: usize = 4; // host, kind, secret, note
+    match key.code {
+        KeyCode::Esc => {
+            app.vault_entry = VaultEntryForm::default();
+            app.screen = Screen::Vault;
+            return;
+        }
+        KeyCode::Enter => {
+            save_vault_entry(app, editing);
+            return;
+        }
+        KeyCode::Tab | KeyCode::Down => {
+            app.vault_entry.field = (app.vault_entry.field + 1) % NFIELDS;
+            sync_vault_entry_cursor(app);
+            return;
+        }
+        KeyCode::BackTab | KeyCode::Up => {
+            app.vault_entry.field = (app.vault_entry.field + NFIELDS - 1) % NFIELDS;
+            sync_vault_entry_cursor(app);
+            return;
+        }
+        _ => {}
+    }
+
+    // The kind field is a toggle, not a text field.
+    if app.vault_entry.field == 1 {
+        if matches!(
+            key.code,
+            KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right
+        ) {
+            app.vault_entry.kind = app.vault_entry.kind.toggled();
+        }
+        return;
+    }
+
+    let f = &mut app.vault_entry;
+    let s = match f.field {
+        0 => &mut f.host,
+        2 => &mut f.secret,
+        _ => &mut f.note,
+    };
+    match key.code {
+        KeyCode::Left => f.cursor = prev_boundary(s, f.cursor),
+        KeyCode::Right => f.cursor = next_boundary(s, f.cursor),
+        KeyCode::Home => f.cursor = 0,
+        KeyCode::End => f.cursor = s.len(),
+        KeyCode::Backspace => backspace(s, &mut f.cursor),
+        KeyCode::Delete => delete_forward(s, &mut f.cursor),
+        KeyCode::Char(c) => insert_char(s, &mut f.cursor, c),
+        _ => {}
+    }
+}
+
+/// Re-anchor the cursor to the end of the newly focused text field.
+fn sync_vault_entry_cursor(app: &mut App) {
+    let f = &mut app.vault_entry;
+    f.cursor = match f.field {
+        0 => f.host.len(),
+        2 => f.secret.len(),
+        3 => f.note.len(),
+        _ => f.cursor,
+    };
+}
+
+fn save_vault_entry(app: &mut App, editing: Option<usize>) {
+    let Some(path) = vault::default_path() else {
+        app.toast("cannot resolve ~/.ssh", true);
+        return;
+    };
+    let host = app.vault_entry.host.trim().to_string();
+    if host.is_empty() {
+        app.toast("host is required", true);
+        return;
+    }
+    if app.vault_entry.secret.is_empty() {
+        app.toast("secret is required", true);
+        return;
+    }
+    let entry = VaultEntry {
+        host,
+        kind: app.vault_entry.kind,
+        secret: app.vault_entry.secret.clone(),
+        note: app.vault_entry.note.trim().to_string(),
+    };
+    let Some(v) = app.vault.as_mut() else {
+        app.toast("vault is locked", true);
+        return;
+    };
+    v.upsert(editing, entry);
+    if let Err(e) = v.save(&path) {
+        app.toast(format!("save failed: {e}"), true);
+        return;
+    }
+    let n = v.entries.len();
+    app.vault_entry = VaultEntryForm::default();
+    app.vault_state
+        .select(Some(editing.unwrap_or(n - 1).min(n - 1)));
+    app.screen = Screen::Vault;
+    app.toast("secret saved", false);
+}
+
+// ---------------------------------------------------------------------------
 // Overlays: help, confirm, action menu
 // ---------------------------------------------------------------------------
 
@@ -914,7 +1209,35 @@ fn perform_confirm(app: &mut App, action: ConfirmAction) {
             app.screen = Screen::KnownHosts;
             app.prev_screen = None;
         }
+        ConfirmAction::DeleteVaultEntry(idx) => {
+            delete_vault_entry(app, idx);
+            app.screen = Screen::Vault;
+            app.prev_screen = None;
+        }
     }
+}
+
+fn delete_vault_entry(app: &mut App, idx: usize) {
+    let Some(path) = vault::default_path() else {
+        app.toast("cannot resolve ~/.ssh", true);
+        return;
+    };
+    let Some(v) = app.vault.as_mut() else {
+        return;
+    };
+    v.remove(idx);
+    let n = v.entries.len();
+    if let Err(e) = v.save(&path) {
+        app.toast(format!("save failed: {e}"), true);
+        return;
+    }
+    if n == 0 {
+        app.vault_state.select(None);
+    } else {
+        let sel = app.vault_state.selected().unwrap_or(0).min(n - 1);
+        app.vault_state.select(Some(sel));
+    }
+    app.toast("secret deleted", false);
 }
 
 fn remove_key_files(app: &mut App, sel: usize) {

@@ -14,6 +14,7 @@ use crate::config::model::HostView;
 use crate::os::keys::KeyInfo;
 use crate::os::known_hosts::KnownHostEntry;
 use crate::os::liveness::{Liveness, LivenessProbe, ProbeTarget};
+use crate::os::vault::{SecretKind, Vault};
 use crate::os::{self, keys, known_hosts};
 
 /// Ordered labels of the edit-form fields. Indices are referenced by name in
@@ -84,6 +85,14 @@ pub enum Screen {
     PickJump {
         editing: Option<usize>,
     },
+    /// Password vault: list of stored secrets (login passwords / passphrases).
+    Vault,
+    /// Master-password prompt modal — unlock an existing vault, or create one.
+    VaultUnlock,
+    /// Add / edit a vault entry. `editing = Some(idx)` edits in place.
+    VaultEntry {
+        editing: Option<usize>,
+    },
 }
 
 /// Where the generate-key wizard was opened from — drives where it returns and
@@ -106,6 +115,8 @@ pub enum ConfirmAction {
         raw: String,
     },
     DiscardEdit,
+    /// Delete the vault entry at this index.
+    DeleteVaultEntry(usize),
     Quit,
 }
 
@@ -182,6 +193,33 @@ impl Default for GenWizard {
     }
 }
 
+/// Master-password prompt state (modal). Doubles as the "create vault" form,
+/// in which case the confirm field is also shown.
+#[derive(Debug, Default, Clone)]
+pub struct VaultUnlock {
+    /// True when no vault file exists yet — collect + confirm a new password.
+    pub creating: bool,
+    pub password: String,
+    pub confirm: String,
+    /// 0 = password, 1 = confirm (only reachable while `creating`).
+    pub field: usize,
+    pub cursor: usize,
+}
+
+/// Add/edit form for a single vault entry (modal over the vault list).
+#[derive(Debug, Default, Clone)]
+pub struct VaultEntryForm {
+    /// Index into the vault being edited, or `None` when adding.
+    pub editing: Option<usize>,
+    pub host: String,
+    pub kind: SecretKind,
+    pub secret: String,
+    pub note: String,
+    /// 0 = host, 1 = kind, 2 = secret, 3 = note.
+    pub field: usize,
+    pub cursor: usize,
+}
+
 pub struct App {
     pub should_quit: bool,
     pub screen: Screen,
@@ -229,6 +267,15 @@ pub struct App {
     // --- O3 action menu ---
     pub menu_sel: usize,
 
+    // --- vault (password manager) ---
+    /// The unlocked vault, held in memory for the session (`None` when locked).
+    pub vault: Option<Vault>,
+    pub vault_state: ListState,
+    pub vault_unlock: VaultUnlock,
+    pub vault_entry: VaultEntryForm,
+    /// When true, secrets are shown in the clear instead of masked.
+    pub vault_reveal: bool,
+
     // --- chrome ---
     pub toast: Toast,
     pub ssh_path_warning: bool,
@@ -271,6 +318,11 @@ impl App {
             kh_search: String::new(),
             kh_searching: false,
             menu_sel: 0,
+            vault: None,
+            vault_state: ListState::default(),
+            vault_unlock: VaultUnlock::default(),
+            vault_entry: VaultEntryForm::default(),
+            vault_reveal: false,
             toast: Toast::default(),
             ssh_path_warning: !os::tools().is_system32,
             include_note: false,
