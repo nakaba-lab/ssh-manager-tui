@@ -10,7 +10,7 @@ use ratatui::widgets::{Clear, List, ListItem, Paragraph};
 use crate::app::App;
 
 use super::theme;
-use super::widgets::{centered, input_line, modal_block, panel};
+use super::widgets::{centered, input_line, input_line_borrowed, modal_block, panel};
 
 /// Mask a secret as a row of bullets, capped so very long secrets don't blow out
 /// the layout.
@@ -71,10 +71,13 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
         .entries
         .iter()
         .map(|e| {
-            let secret = if app.vault_reveal {
-                e.secret.as_str().to_string()
+            // Reveal borrows the stored (already-scrubbed) secret directly;
+            // never copy the plaintext onto the heap — a per-frame `to_string`
+            // would be freed un-zeroized on every tick.
+            let secret_span = if app.vault_reveal {
+                Span::styled(e.secret.as_str(), Style::default().fg(theme::DIM))
             } else {
-                masked(&e.secret)
+                Span::styled(masked(&e.secret), Style::default().fg(theme::DIM))
             };
             let mut spans = vec![
                 Span::styled(
@@ -87,7 +90,7 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
                     format!("{:<11}", e.kind.label()),
                     Style::default().fg(theme::ACCENT2),
                 ),
-                Span::styled(secret, Style::default().fg(theme::DIM)),
+                secret_span,
             ];
             if !e.note.is_empty() {
                 spans.push(Span::styled(
@@ -221,7 +224,9 @@ pub fn draw_entry(f: &mut Frame, app: &App, area: Rect) {
     let secret_line = Line::from({
         let mut s = vec![label("Secret", e.field == 2)];
         if app.vault_reveal {
-            s.extend(input_line(&e.secret, e.cursor, e.field == 2).spans);
+            // Borrow the form's (scrubbed-on-drop) secret rather than cloning it
+            // into per-frame spans that would leak plaintext onto the heap.
+            s.extend(input_line_borrowed(&e.secret, e.cursor, e.field == 2).spans);
         } else {
             s.extend(masked_input(&e.secret, e.cursor, e.field == 2).spans);
         }

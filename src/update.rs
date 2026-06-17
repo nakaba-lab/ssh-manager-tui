@@ -96,6 +96,58 @@ fn delete_forward(s: &mut String, cursor: &mut usize) {
     }
 }
 
+// --- Secret-field editing -------------------------------------------------
+//
+// The plain `insert_char` / `backspace` / `delete_forward` mutate a `String`
+// in place. For a *secret* field (master password, passphrase) that leaks
+// plaintext on the heap: `String::insert` reallocates when it outgrows its
+// capacity and frees the old buffer **without** scrubbing it, and `replace_range`
+// only shifts bytes left, leaving the deleted tail readable past `len`. The
+// variants below grow/shrink through a fresh allocation and zeroize the old
+// buffer before it is dropped, so no intermediate copy of the secret survives.
+
+/// Insert `c` at `cursor`, growing via a zeroizing reallocation so the old
+/// backing buffer is wiped (not just freed) when the value outgrows its
+/// capacity. Use only for secret fields.
+fn insert_char_secret(s: &mut String, cursor: &mut usize, c: char) {
+    if s.len() + c.len_utf8() > s.capacity() {
+        let mut grown = String::with_capacity(((s.len() + c.len_utf8()) * 2).max(64));
+        grown.push_str(s);
+        s.zeroize();
+        *s = grown;
+    }
+    s.insert(*cursor, c);
+    *cursor += c.len_utf8();
+}
+
+/// Remove `range` from a secret `String` by rebuilding into a fresh buffer and
+/// zeroizing the old one — so the removed bytes never linger past `len` on the
+/// heap the way an in-place `replace_range` would leave them.
+fn remove_range_secret(s: &mut String, range: std::ops::Range<usize>) {
+    let mut rebuilt = String::with_capacity(s.capacity());
+    rebuilt.push_str(&s[..range.start]);
+    rebuilt.push_str(&s[range.end..]);
+    s.zeroize();
+    *s = rebuilt;
+}
+
+/// `backspace` for a secret field — see [`remove_range_secret`].
+fn backspace_secret(s: &mut String, cursor: &mut usize) {
+    if *cursor > 0 {
+        let p = prev_boundary(s, *cursor);
+        remove_range_secret(s, p..*cursor);
+        *cursor = p;
+    }
+}
+
+/// `delete_forward` for a secret field — see [`remove_range_secret`].
+fn delete_forward_secret(s: &mut String, cursor: &mut usize) {
+    if *cursor < s.len() {
+        let n = next_boundary(s, *cursor);
+        remove_range_secret(s, *cursor..n);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // S1 — host list
 // ---------------------------------------------------------------------------
@@ -1030,7 +1082,7 @@ fn handle_vault_unlock(app: &mut App, key: KeyEvent) {
             } else {
                 &mut u.confirm
             };
-            backspace(s, &mut u.cursor);
+            backspace_secret(s, &mut u.cursor);
         }
         KeyCode::Char(c) => {
             let u = &mut app.vault_unlock;
@@ -1039,7 +1091,7 @@ fn handle_vault_unlock(app: &mut App, key: KeyEvent) {
             } else {
                 &mut u.confirm
             };
-            insert_char(s, &mut u.cursor, c);
+            insert_char_secret(s, &mut u.cursor, c);
         }
         _ => {}
     }
@@ -1163,6 +1215,9 @@ fn handle_vault_entry(app: &mut App, key: KeyEvent, editing: Option<usize>) {
     }
 
     let f = &mut app.vault_entry;
+    // Field 2 is the secret; its edits go through the zeroizing variants so a
+    // typed passphrase never leaves an un-scrubbed copy on the heap.
+    let secret_field = f.field == 2;
     let s = match f.field {
         0 => &mut f.host,
         2 => &mut f.secret,
@@ -1173,8 +1228,11 @@ fn handle_vault_entry(app: &mut App, key: KeyEvent, editing: Option<usize>) {
         KeyCode::Right => f.cursor = next_boundary(s, f.cursor),
         KeyCode::Home => f.cursor = 0,
         KeyCode::End => f.cursor = s.len(),
+        KeyCode::Backspace if secret_field => backspace_secret(s, &mut f.cursor),
         KeyCode::Backspace => backspace(s, &mut f.cursor),
+        KeyCode::Delete if secret_field => delete_forward_secret(s, &mut f.cursor),
         KeyCode::Delete => delete_forward(s, &mut f.cursor),
+        KeyCode::Char(c) if secret_field => insert_char_secret(s, &mut f.cursor, c),
         KeyCode::Char(c) => insert_char(s, &mut f.cursor, c),
         _ => {}
     }
@@ -1431,5 +1489,81 @@ fn close_overlay(app: &mut App) {
         app.screen = prev;
     } else {
         app.screen = Screen::List;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The secret-field editing helpers must behave identically to the plain
+    // ones — they only differ in scrubbing the freed heap buffer, which must not
+    // change what the user sees. These guard that the zeroizing rebuild keeps the
+    // value (and cursor) correct, including across capacity growth and on
+    // multibyte boundaries.
+
+    fn type_str(insert: impl Fn(&mut String, &mut usize, char), text: &str) -> (String, usize) {
+        let mut s = String::new();
+        let mut cur = 0;
+        for c in text.chars() {
+            insert(&mut s, &mut cur, c);
+        }
+        (s, cur)
+    }
+
+    #[test]
+    fn insert_char_secret_matches_plain_across_reallocs() {
+        // 300 chars forces several growth reallocations through the zeroizing path.
+        let long: String = "passwörd-🔐-".chars().cycle().take(300).collect();
+        let (plain, pc) = type_str(insert_char, &long);
+        let (secret, sc) = type_str(insert_char_secret, &long);
+        assert_eq!(plain, long);
+        assert_eq!(secret, plain);
+        assert_eq!(sc, pc);
+        assert_eq!(sc, long.len());
+    }
+
+    #[test]
+    fn insert_char_secret_inserts_at_cursor() {
+        let mut s = "abef".to_string();
+        let mut cur = 2; // between 'b' and 'e'
+        insert_char_secret(&mut s, &mut cur, 'c');
+        insert_char_secret(&mut s, &mut cur, 'd');
+        assert_eq!(s, "abcdef");
+        assert_eq!(cur, 4);
+    }
+
+    #[test]
+    fn backspace_and_delete_secret_match_plain() {
+        let start = "héllo🔐wörld";
+        // Walk a cursor backwards deleting, comparing both variants step by step.
+        for cut in [3usize, 6, 10] {
+            let cut = (0..=start.len())
+                .rev()
+                .find(|&i| i <= cut && start.is_char_boundary(i))
+                .unwrap();
+            let (mut a, mut ca) = (start.to_string(), cut);
+            let (mut b, mut cb) = (start.to_string(), cut);
+            backspace(&mut a, &mut ca);
+            backspace_secret(&mut b, &mut cb);
+            assert_eq!(a, b, "backspace mismatch at {cut}");
+            assert_eq!(ca, cb);
+
+            let (mut c, mut cc) = (start.to_string(), cut);
+            let (mut d, mut cd) = (start.to_string(), cut);
+            delete_forward(&mut c, &mut cc);
+            delete_forward_secret(&mut d, &mut cd);
+            assert_eq!(c, d, "delete mismatch at {cut}");
+            assert_eq!(cc, cd);
+        }
+    }
+
+    #[test]
+    fn remove_range_secret_keeps_remaining_value() {
+        let mut s = "secret-value".to_string();
+        remove_range_secret(&mut s, 0..7); // drop "secret-"
+        assert_eq!(s, "value");
+        // Capacity preserved so subsequent edits do not immediately realloc.
+        assert!(s.capacity() >= "secret-value".len());
     }
 }
