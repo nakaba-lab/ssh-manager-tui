@@ -242,6 +242,7 @@ impl Vault {
     /// Decrypt the vault at `path` with `password`. A wrong password — or a
     /// tampered header — is reported as a clear "incorrect master password".
     pub fn unlock(path: &Path, password: &str) -> Result<Vault> {
+        recover_backup(path);
         let data = fs::read_to_string(path).map_err(|e| anyhow!("cannot read vault file: {e}"))?;
         let file: VaultFile =
             serde_json::from_str(&data).map_err(|e| anyhow!("vault file is corrupt: {e}"))?;
@@ -381,6 +382,17 @@ fn sidecar(path: &Path, ext: &str) -> PathBuf {
     s.push(".");
     s.push(ext);
     PathBuf::from(s)
+}
+
+/// Recover from a save that crashed mid-swap: if the vault file is missing but
+/// its `.bak` backup survived, restore the backup. Best-effort — call it before
+/// deciding whether a vault exists (so the backup isn't mistaken for "no vault"
+/// and clobbered by a fresh create) and before reading the vault.
+pub fn recover_backup(path: &Path) {
+    let bak = sidecar(path, "bak");
+    if !path.exists() && bak.exists() {
+        let _ = fs::rename(&bak, path);
+    }
 }
 
 /// A unique, unpredictable temp filename in the vault directory, so two
@@ -629,6 +641,23 @@ mod tests {
     fn unlock_missing_file_errors() {
         let path = temp_vault_path("missing");
         assert!(Vault::unlock(&path, "x").is_err());
+    }
+
+    #[test]
+    fn recovers_from_orphaned_backup() {
+        let path = temp_vault_path("recover");
+        let mut v = Vault::create("m").unwrap();
+        v.upsert(None, entry("h", SecretKind::Password, "s"));
+        v.save(&path).unwrap();
+        // Simulate a save that crashed mid-swap: main file gone, only .bak left.
+        let bak = sidecar(&path, "bak");
+        fs::rename(&path, &bak).unwrap();
+        assert!(!path.exists() && bak.exists());
+        // unlock transparently restores the backup and opens it.
+        let opened = Vault::unlock(&path, "m").unwrap();
+        assert_eq!(opened.entries[0].secret.as_str(), "s");
+        assert!(path.exists() && !bak.exists());
+        let _ = fs::remove_file(&path);
     }
 
     #[test]

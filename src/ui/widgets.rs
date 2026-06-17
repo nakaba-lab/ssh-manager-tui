@@ -92,7 +92,11 @@ pub fn input_line(value: &str, cursor: usize, editing: bool) -> Line<'static> {
     if !editing {
         return Line::from(Span::styled(value.to_string(), text));
     }
-    let cursor = cursor.min(value.len());
+    // Clamp to a real char boundary so a stray cursor never panics the split.
+    let mut cursor = cursor.min(value.len());
+    while cursor > 0 && !value.is_char_boundary(cursor) {
+        cursor -= 1;
+    }
     let (before, after) = value.split_at(cursor);
     let (cur_ch, rest) = match after.chars().next() {
         Some(c) => (c.to_string(), after[c.len_utf8()..].to_string()),

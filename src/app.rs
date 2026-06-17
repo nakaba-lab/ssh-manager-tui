@@ -322,6 +322,9 @@ pub struct App {
     /// if the clipboard still holds it — never the plaintext, which stays sealed.
     pub clipboard_clear_at: Option<Instant>,
     pub clipboard_hash: u64,
+    /// Per-session key mixed into `clipboard_hash`, so the value held in memory is
+    /// not a stand-alone, precomputable digest of the secret.
+    pub clipboard_hash_key: u64,
 
     // --- chrome ---
     pub toast: Toast,
@@ -372,6 +375,11 @@ impl App {
             vault_reveal: false,
             clipboard_clear_at: None,
             clipboard_hash: 0,
+            clipboard_hash_key: {
+                let mut b = [0u8; 8];
+                let _ = getrandom::getrandom(&mut b);
+                u64::from_le_bytes(b)
+            },
             toast: Toast::default(),
             ssh_path_warning: !os::tools().is_system32,
             include_note: false,

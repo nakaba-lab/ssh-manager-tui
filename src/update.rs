@@ -306,21 +306,25 @@ fn copy_to_clipboard(text: &str) -> Result<()> {
 /// How long a copied vault secret lingers in the clipboard before auto-clear.
 const CLIPBOARD_CLEAR_AFTER: Duration = Duration::from_secs(20);
 
-/// Called each tick: once the auto-clear deadline passes, wipe the clipboard —
-/// but only if it still holds the secret we copied, so whatever the user copied
-/// afterwards is left alone. Every step is best-effort.
+/// Called each tick: once the auto-clear deadline passes, wipe the clipboard
+/// (only if it still holds the copied secret). Every step is best-effort.
 pub fn tick_clipboard(app: &mut App) {
-    let Some(at) = app.clipboard_clear_at else {
-        return;
-    };
-    if Instant::now() < at {
-        return;
+    if let Some(at) = app.clipboard_clear_at
+        && Instant::now() >= at
+    {
+        force_clear_clipboard(app);
     }
-    app.clipboard_clear_at = None;
+}
+
+/// Wipe the clipboard now if it still holds the secret we copied, and forget the
+/// pending clear. Used at the tick deadline and on quit (which stops the tick).
+pub fn force_clear_clipboard(app: &mut App) {
     let target = app.clipboard_hash;
+    let key = app.clipboard_hash_key;
+    app.clipboard_clear_at = None;
     app.clipboard_hash = 0;
     // Clear if the clipboard is unchanged, or if we couldn't read it back.
-    if clipboard_hash().map(|h| h == target).unwrap_or(true) {
+    if clipboard_hash(key).map(|h| h == target).unwrap_or(true) {
         let _ = clear_clipboard();
     }
 }
@@ -330,15 +334,18 @@ fn clear_clipboard() -> Result<()> {
     Ok(())
 }
 
-/// Hash of the current clipboard contents, without retaining the plaintext.
-fn clipboard_hash() -> Option<u64> {
+/// Keyed hash of the current clipboard contents, without retaining the plaintext.
+fn clipboard_hash(key: u64) -> Option<u64> {
     let txt = Zeroizing::new(arboard::Clipboard::new().ok()?.get_text().ok()?);
-    Some(hash_secret(&txt))
+    Some(hash_secret(key, &txt))
 }
 
-fn hash_secret(s: &str) -> u64 {
+/// A per-session **keyed** hash, so the value held in memory is not a
+/// stand-alone, precomputable digest of the secret on its own.
+fn hash_secret(key: u64, s: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut h);
     s.hash(&mut h);
     h.finish()
 }
@@ -584,9 +591,7 @@ fn handle_keys(app: &mut App, key: KeyEvent) -> Result<()> {
         KeyCode::Char('j') | KeyCode::Down => move_list(&mut app.keys_state, app.keys.len(), 1),
         KeyCode::Char('k') | KeyCode::Up => move_list(&mut app.keys_state, app.keys.len(), -1),
         KeyCode::Home => app.keys_state.select((!app.keys.is_empty()).then_some(0)),
-        KeyCode::End => app
-            .keys_state
-            .select((!app.keys.is_empty()).then_some(app.keys.len() - 1)),
+        KeyCode::End => app.keys_state.select(app.keys.len().checked_sub(1)),
         KeyCode::Char('g') => {
             app.gen_wizard = crate::app::GenWizard::default();
             app.screen = Screen::GenerateKey {
@@ -875,9 +880,7 @@ fn handle_known_hosts(app: &mut App, key: KeyEvent) {
         KeyCode::Char('j') | KeyCode::Down => move_list(&mut app.kh_state, filtered_len, 1),
         KeyCode::Char('k') | KeyCode::Up => move_list(&mut app.kh_state, filtered_len, -1),
         KeyCode::Char('g') => app.kh_state.select((filtered_len > 0).then_some(0)),
-        KeyCode::Char('G') => app
-            .kh_state
-            .select((filtered_len > 0).then_some(filtered_len - 1)),
+        KeyCode::Char('G') => app.kh_state.select(filtered_len.checked_sub(1)),
         KeyCode::Char('d') => {
             if let Some(sel) = app.kh_state.selected()
                 && let Some(&entry_idx) = app.kh_filtered().get(sel)
@@ -911,7 +914,13 @@ fn open_vault(app: &mut App) {
         app.screen = Screen::Vault;
         return;
     }
-    let exists = vault::default_path().map(|p| p.exists()).unwrap_or(false);
+    let path = vault::default_path();
+    // Recover a crash-orphaned backup before deciding create-vs-unlock, so a
+    // surviving `.bak` isn't treated as "no vault" and overwritten by a create.
+    if let Some(p) = &path {
+        vault::recover_backup(p);
+    }
+    let exists = path.map(|p| p.exists()).unwrap_or(false);
     // Struct-update (`..Default::default()`) can't move out of a Drop type.
     let mut u = VaultUnlock::default();
     u.creating = !exists;
@@ -927,7 +936,7 @@ fn handle_vault(app: &mut App, key: KeyEvent) {
         KeyCode::Char('j') | KeyCode::Down => move_list(&mut app.vault_state, len, 1),
         KeyCode::Char('k') | KeyCode::Up => move_list(&mut app.vault_state, len, -1),
         KeyCode::Char('g') => app.vault_state.select((len > 0).then_some(0)),
-        KeyCode::Char('G') => app.vault_state.select((len > 0).then_some(len - 1)),
+        KeyCode::Char('G') => app.vault_state.select(len.checked_sub(1)),
         KeyCode::Char(' ') => app.vault_reveal = !app.vault_reveal,
         KeyCode::Char('a') => open_vault_entry(app, None),
         KeyCode::Char('e') | KeyCode::Enter => {
@@ -964,7 +973,7 @@ fn copy_vault_secret(app: &mut App) {
     };
     match copy_to_clipboard(secret.as_str()) {
         Ok(()) => {
-            app.clipboard_hash = hash_secret(secret.as_str());
+            app.clipboard_hash = hash_secret(app.clipboard_hash_key, secret.as_str());
             app.clipboard_clear_at = Some(Instant::now() + CLIPBOARD_CLEAR_AFTER);
             app.toast(
                 format!(
@@ -1226,7 +1235,14 @@ fn handle_confirm(app: &mut App, key: KeyEvent, action: ConfirmAction) -> Result
 
 fn perform_confirm(app: &mut App, action: ConfirmAction) {
     match action {
-        ConfirmAction::Quit => app.should_quit = true,
+        ConfirmAction::Quit => {
+            // Quitting stops the tick that auto-clears the clipboard, so wipe any
+            // still-pending copied secret now rather than leaving it behind.
+            if app.clipboard_clear_at.is_some() {
+                force_clear_clipboard(app);
+            }
+            app.should_quit = true;
+        }
         ConfirmAction::DiscardEdit => {
             app.screen = Screen::List;
             app.prev_screen = None;
