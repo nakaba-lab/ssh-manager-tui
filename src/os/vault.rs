@@ -9,13 +9,20 @@
 //! Layout: a master password is stretched with **Argon2id** into a 32-byte key,
 //! which encrypts the serialized entries with **XChaCha20-Poly1305** (AEAD). The
 //! salt, nonce and KDF parameters are stored in the clear alongside the
-//! ciphertext; the master password itself is never persisted. A wrong password
-//! fails the AEAD tag check, surfacing as "incorrect master password" rather
-//! than garbage.
+//! ciphertext, but they are bound into the AEAD as **associated data**, so a
+//! tampered header (version / KDF cost / salt) fails the tag rather than silently
+//! changing the key. The KDF parameters read from disk are also **range-checked**
+//! before use, so a hostile file cannot force an unbounded Argon2 allocation
+//! (DoS) or weaken the KDF below a safe floor. The master password itself is
+//! never persisted; a wrong password fails the AEAD tag and surfaces as
+//! "incorrect master password".
 //!
-//! Like the rest of `os/`, this module has **zero ratatui dependency** and is
-//! exercised directly by the unit tests at the bottom of the file.
+//! Secret material is wrapped in [`Secret`] (scrubbed on drop, redacted in
+//! `Debug`) and the derived key / decrypted plaintext live in `Zeroizing`
+//! buffers. Like the rest of `os/`, this module has **zero ratatui dependency**
+//! and is exercised by the unit tests at the bottom of the file.
 
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -23,7 +30,7 @@ use anyhow::{Result, anyhow, bail};
 use argon2::{Algorithm, Argon2, Params, Version};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
-use chacha20poly1305::aead::Aead;
+use chacha20poly1305::aead::{Aead, Payload as AeadPayload};
 use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce};
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
@@ -33,6 +40,73 @@ const VERSION: u32 = 1;
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 24; // XChaCha20-Poly1305 uses a 192-bit nonce.
 const KEY_LEN: usize = 32;
+
+// KDF parameter bounds, enforced on unlock against the untrusted file: a tampered
+// file can neither force an unbounded memory allocation (DoS) nor weaken the KDF
+// below a safe floor (downgrade). The defaults below sit inside this window.
+const MIN_M_COST: u32 = 8 * 1024; // 8 MiB floor
+const MAX_M_COST: u32 = 1024 * 1024; // 1 GiB cap
+const MIN_T_COST: u32 = 1;
+const MAX_T_COST: u32 = 16;
+const MIN_P_COST: u32 = 1;
+const MAX_P_COST: u32 = 16;
+
+/// A secret string that scrubs its backing buffer on drop and never reveals
+/// itself in `Debug`. Serializes transparently as a plain string, so it is the
+/// *ciphertext* — never this — that reaches disk. Clones (and the buffers freed
+/// as one is edited) zeroize themselves, so plaintext does not accumulate on the
+/// heap the way a bare `String` would.
+#[derive(Clone, Default)]
+pub struct Secret(String);
+
+impl Secret {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for Secret {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for Secret {
+    fn from(s: String) -> Self {
+        Secret(s)
+    }
+}
+
+impl From<&str> for Secret {
+    fn from(s: &str) -> Self {
+        Secret(s.to_owned())
+    }
+}
+
+impl Drop for Secret {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+impl fmt::Debug for Secret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("\"***\"")
+    }
+}
+
+impl Serialize for Secret {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for Secret {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(Secret(String::deserialize(d)?))
+    }
+}
 
 /// Which kind of secret an entry holds. A host can have one of each.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -66,7 +140,7 @@ impl SecretKind {
 pub struct VaultEntry {
     pub host: String,
     pub kind: SecretKind,
-    pub secret: String,
+    pub secret: Secret,
     #[serde(default)]
     pub note: String,
 }
@@ -91,6 +165,20 @@ impl Default for KdfParams {
     }
 }
 
+impl KdfParams {
+    /// Reject parameters from an untrusted file that are unreasonably large
+    /// (allocation DoS) or below the safe floor (KDF downgrade).
+    fn validate(&self) -> Result<()> {
+        if !(MIN_M_COST..=MAX_M_COST).contains(&self.m_cost)
+            || !(MIN_T_COST..=MAX_T_COST).contains(&self.t_cost)
+            || !(MIN_P_COST..=MAX_P_COST).contains(&self.p_cost)
+        {
+            bail!("vault file is corrupt: unreasonable KDF parameters");
+        }
+        Ok(())
+    }
+}
+
 /// The serialized on-disk file (all binary fields base64-encoded).
 #[derive(Serialize, Deserialize)]
 struct VaultFile {
@@ -101,15 +189,22 @@ struct VaultFile {
     ciphertext: String,
 }
 
-/// The decrypted plaintext payload (what the ciphertext protects).
-#[derive(Default, Serialize, Deserialize)]
+/// The decrypted plaintext payload, owned (used when deserializing).
+#[derive(Default, Deserialize)]
 struct Payload {
     entries: Vec<VaultEntry>,
 }
 
+/// A borrowing view of the payload used when serializing, so `save` never clones
+/// the plaintext secrets into a second heap allocation.
+#[derive(Serialize)]
+struct PayloadRef<'a> {
+    entries: &'a [VaultEntry],
+}
+
 /// An unlocked vault held in memory for the session. Holds the derived key so
-/// edits can be re-saved without re-prompting; the key and secrets are zeroized
-/// on drop.
+/// edits can be re-saved without re-prompting; the key (Zeroizing) and entry
+/// secrets (Secret) scrub themselves on drop, and the salt is zeroized here.
 pub struct Vault {
     pub entries: Vec<VaultEntry>,
     key: Zeroizing<Vec<u8>>,
@@ -119,9 +214,7 @@ pub struct Vault {
 
 impl Drop for Vault {
     fn drop(&mut self) {
-        for e in &mut self.entries {
-            e.secret.zeroize();
-        }
+        // Entry secrets scrub themselves (Secret::drop); the key is Zeroizing.
         self.salt.zeroize();
     }
 }
@@ -146,8 +239,8 @@ impl Vault {
         })
     }
 
-    /// Decrypt the vault at `path` with `password`. A wrong password is reported
-    /// as a clear "incorrect master password" error.
+    /// Decrypt the vault at `path` with `password`. A wrong password — or a
+    /// tampered header — is reported as a clear "incorrect master password".
     pub fn unlock(path: &Path, password: &str) -> Result<Vault> {
         let data = fs::read_to_string(path).map_err(|e| anyhow!("cannot read vault file: {e}"))?;
         let file: VaultFile =
@@ -155,15 +248,22 @@ impl Vault {
         if file.version != VERSION {
             bail!("unsupported vault version {}", file.version);
         }
+        // Validate KDF params from the untrusted file BEFORE deriving (stops the
+        // allocation DoS and the downgrade-below-floor attack).
+        file.kdf.validate()?;
         let salt = b64_decode(&file.salt)?;
+        if salt.len() != SALT_LEN {
+            bail!("vault file is corrupt: bad salt length");
+        }
         let nonce = b64_decode(&file.nonce)?;
-        let ciphertext = b64_decode(&file.ciphertext)?;
         if nonce.len() != NONCE_LEN {
             bail!("vault file is corrupt: bad nonce length");
         }
+        let ciphertext = b64_decode(&file.ciphertext)?;
         let key = derive_key(password, &salt, &file.kdf)?;
-        let plaintext =
-            decrypt(&key, &nonce, &ciphertext).map_err(|_| anyhow!("incorrect master password"))?;
+        let aad = header_aad(file.version, &file.kdf, &salt);
+        let plaintext = decrypt(&key, &nonce, &ciphertext, &aad)
+            .map_err(|_| anyhow!("incorrect master password"))?;
         let payload: Payload = serde_json::from_slice(&plaintext)
             .map_err(|e| anyhow!("vault payload is corrupt: {e}"))?;
         Ok(Vault {
@@ -176,12 +276,13 @@ impl Vault {
 
     /// Encrypt and atomically write the vault to `path`.
     pub fn save(&self, path: &Path) -> Result<()> {
-        let payload = Payload {
-            entries: self.entries.clone(),
-        };
-        let plaintext = Zeroizing::new(serde_json::to_vec(&payload)?);
+        // Serialize a borrowing view so no second plaintext copy is made.
+        let plaintext = Zeroizing::new(serde_json::to_vec(&PayloadRef {
+            entries: &self.entries,
+        })?);
         let nonce = random_bytes(NONCE_LEN)?;
-        let ciphertext = encrypt(&self.key, &nonce, &plaintext)?;
+        let aad = header_aad(VERSION, &self.params, &self.salt);
+        let ciphertext = encrypt(&self.key, &nonce, &plaintext, &aad)?;
         let file = VaultFile {
             version: VERSION,
             kdf: self.params,
@@ -193,7 +294,8 @@ impl Vault {
         atomic_write(path, json.as_bytes())
     }
 
-    /// Replace the entry at `editing` (if any), else append a new one.
+    /// Replace the entry at `editing` (if any), else append a new one. The
+    /// overwritten entry's secret scrubs itself on drop (Secret).
     pub fn upsert(&mut self, editing: Option<usize>, entry: VaultEntry) {
         match editing {
             Some(i) if i < self.entries.len() => self.entries[i] = entry,
@@ -201,11 +303,10 @@ impl Vault {
         }
     }
 
-    /// Remove the entry at `idx`, zeroizing its secret.
+    /// Remove the entry at `idx` (its secret scrubs itself on drop).
     pub fn remove(&mut self, idx: usize) {
         if idx < self.entries.len() {
-            let mut e = self.entries.remove(idx);
-            e.secret.zeroize();
+            self.entries.remove(idx);
         }
     }
 }
@@ -213,6 +314,18 @@ impl Vault {
 // ---------------------------------------------------------------------------
 // Crypto primitives
 // ---------------------------------------------------------------------------
+
+/// The unencrypted header bound into the AEAD as associated data, so version,
+/// KDF cost parameters and salt cannot be tampered with undetected.
+fn header_aad(version: u32, p: &KdfParams, salt: &[u8]) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(16 + salt.len());
+    aad.extend_from_slice(&version.to_be_bytes());
+    aad.extend_from_slice(&p.m_cost.to_be_bytes());
+    aad.extend_from_slice(&p.t_cost.to_be_bytes());
+    aad.extend_from_slice(&p.p_cost.to_be_bytes());
+    aad.extend_from_slice(salt);
+    aad
+}
 
 fn derive_key(password: &str, salt: &[u8], p: &KdfParams) -> Result<Zeroizing<Vec<u8>>> {
     let params = Params::new(p.m_cost, p.t_cost, p.p_cost, Some(KEY_LEN))
@@ -225,17 +338,29 @@ fn derive_key(password: &str, salt: &[u8], p: &KdfParams) -> Result<Zeroizing<Ve
     Ok(key)
 }
 
-fn encrypt(key: &[u8], nonce: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
+fn encrypt(key: &[u8], nonce: &[u8], plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
     let cipher = XChaCha20Poly1305::new_from_slice(key).map_err(|e| anyhow!("cipher init: {e}"))?;
     cipher
-        .encrypt(XNonce::from_slice(nonce), plaintext)
+        .encrypt(
+            XNonce::from_slice(nonce),
+            AeadPayload {
+                msg: plaintext,
+                aad,
+            },
+        )
         .map_err(|e| anyhow!("encryption failed: {e}"))
 }
 
-fn decrypt(key: &[u8], nonce: &[u8], ciphertext: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+fn decrypt(key: &[u8], nonce: &[u8], ciphertext: &[u8], aad: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
     let cipher = XChaCha20Poly1305::new_from_slice(key).map_err(|e| anyhow!("cipher init: {e}"))?;
     let pt = cipher
-        .decrypt(XNonce::from_slice(nonce), ciphertext)
+        .decrypt(
+            XNonce::from_slice(nonce),
+            AeadPayload {
+                msg: ciphertext,
+                aad,
+            },
+        )
         .map_err(|_| anyhow!("decryption failed"))?;
     Ok(Zeroizing::new(pt))
 }
@@ -250,34 +375,95 @@ fn b64_decode(s: &str) -> Result<Vec<u8>> {
     B64.decode(s).map_err(|e| anyhow!("base64 decode: {e}"))
 }
 
-/// Write `bytes` to `path` atomically (temp file + rename), mirroring the config
-/// writer: `0o600` perms on unix, and a remove-before-rename on Windows where
-/// `rename` fails if the destination already exists.
+/// `path` with `.<ext>` appended (e.g. the `.bak` backup sidecar).
+fn sidecar(path: &Path, ext: &str) -> PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(".");
+    s.push(ext);
+    PathBuf::from(s)
+}
+
+/// A unique, unpredictable temp filename in the vault directory, so two
+/// processes can't clobber each other and an attacker can't pre-create the path.
+fn temp_name() -> Result<String> {
+    let r = random_bytes(8)?;
+    let hex: String = r.iter().map(|b| format!("{b:02x}")).collect();
+    Ok(format!(".sshm-vault.{}.{hex}.tmp", std::process::id()))
+}
+
+/// Restrict a file to the current user only (no inheritance) on Windows, where
+/// `0o600` does not apply. Best-effort: an icacls failure must never lose the
+/// vault, so the result is intentionally ignored.
+#[cfg(windows)]
+fn restrict_acl(path: &Path) {
+    let user = std::env::var("USERNAME").unwrap_or_default();
+    if user.is_empty() {
+        return;
+    }
+    let _ = std::process::Command::new("icacls")
+        .arg(path)
+        .arg("/inheritance:r")
+        .arg("/grant:r")
+        .arg(format!("{user}:(F)"))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+/// Write `bytes` to `path` atomically and durably. The temp file is created
+/// exclusively with a unique name, locked down to the owner (0o600 on unix,
+/// owner-only ACL on Windows), then swapped in via a rename — moving the existing
+/// vault to a `.bak` first so a crash mid-swap always leaves a recoverable copy
+/// (the vault holds the only copy of irreplaceable secrets).
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     if !dir.exists() {
         fs::create_dir_all(dir)?;
-    }
-    let tmp = dir.join(".sshm-vault.tmp");
-    fs::write(&tmp, bytes)?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
-    }
-
-    #[cfg(windows)]
-    if path.exists() {
-        match fs::remove_file(path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
         }
     }
 
-    fs::rename(&tmp, path)?;
-    Ok(())
+    let tmp = dir.join(temp_name()?);
+    {
+        use std::io::Write;
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&tmp)?;
+        f.write_all(bytes)?;
+        let _ = f.sync_all();
+    }
+    #[cfg(windows)]
+    restrict_acl(&tmp);
+
+    // Move the existing vault aside (works cross-platform; on Windows a rename
+    // onto an existing destination fails, which is why we clear the path first).
+    let bak = sidecar(path, "bak");
+    let _ = fs::remove_file(&bak);
+    if path.exists() {
+        fs::rename(path, &bak)?;
+    }
+    match fs::rename(&tmp, path) {
+        Ok(()) => {
+            let _ = fs::remove_file(&bak);
+            Ok(())
+        }
+        Err(e) => {
+            // Restore the backup so we never end up with no vault at all.
+            if bak.exists() {
+                let _ = fs::rename(&bak, path);
+            }
+            let _ = fs::remove_file(&tmp);
+            Err(e.into())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -316,10 +502,21 @@ mod tests {
         assert_eq!(opened.entries.len(), 2);
         assert_eq!(opened.entries[0].host, "web");
         assert_eq!(opened.entries[0].kind, SecretKind::Password);
-        assert_eq!(opened.entries[0].secret, "s3cret");
+        assert_eq!(opened.entries[0].secret.as_str(), "s3cret");
         assert_eq!(opened.entries[1].kind, SecretKind::Passphrase);
-        assert_eq!(opened.entries[1].secret, "key-pass");
+        assert_eq!(opened.entries[1].secret.as_str(), "key-pass");
 
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn non_ascii_secret_roundtrips() {
+        let path = temp_vault_path("utf8");
+        let mut v = Vault::create("マスター").unwrap();
+        v.upsert(None, entry("h", SecretKind::Password, "pä55-🔐-é"));
+        v.save(&path).unwrap();
+        let opened = Vault::unlock(&path, "マスター").unwrap();
+        assert_eq!(opened.entries[0].secret.as_str(), "pä55-🔐-é");
         let _ = fs::remove_file(&path);
     }
 
@@ -358,12 +555,70 @@ mod tests {
     }
 
     #[test]
+    fn unreasonable_kdf_params_are_rejected_without_allocating() {
+        let path = temp_vault_path("kdf");
+        let v = Vault::create("m").unwrap();
+        v.save(&path).unwrap();
+
+        // Tamper m_cost to a value that would allocate terabytes if used.
+        let mut file: VaultFile =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        file.kdf.m_cost = u32::MAX;
+        fs::write(&path, serde_json::to_string(&file).unwrap()).unwrap();
+
+        match Vault::unlock(&path, "m") {
+            Ok(_) => panic!("a vault with absurd KDF params should not unlock"),
+            Err(e) => assert!(
+                e.to_string().contains("KDF parameters"),
+                "expected KDF rejection, got: {e}"
+            ),
+        }
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn header_tamper_is_detected() {
+        let path = temp_vault_path("aad");
+        let v = Vault::create("m").unwrap();
+        v.save(&path).unwrap();
+
+        // Flip t_cost within the valid range: it passes validation but no longer
+        // matches the AEAD associated data, so the tag check must fail.
+        let mut file: VaultFile =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        file.kdf.t_cost += 1;
+        fs::write(&path, serde_json::to_string(&file).unwrap()).unwrap();
+
+        assert!(
+            Vault::unlock(&path, "m").is_err(),
+            "tampered header must not unlock"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn bad_salt_length_is_rejected() {
+        let path = temp_vault_path("salt");
+        let v = Vault::create("m").unwrap();
+        v.save(&path).unwrap();
+        let mut file: VaultFile =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        file.salt = B64.encode([0u8; 4]); // too short
+        fs::write(&path, serde_json::to_string(&file).unwrap()).unwrap();
+        match Vault::unlock(&path, "m") {
+            Ok(_) => panic!("short salt should be rejected"),
+            Err(e) => assert!(e.to_string().contains("salt"), "unexpected error: {e}"),
+        }
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
     fn upsert_replaces_in_place_and_remove_drops() {
         let mut v = Vault::create("m").unwrap();
         v.upsert(None, entry("a", SecretKind::Password, "1"));
         v.upsert(None, entry("b", SecretKind::Password, "2"));
         v.upsert(Some(0), entry("a", SecretKind::Password, "updated"));
-        assert_eq!(v.entries[0].secret, "updated");
+        assert_eq!(v.entries[0].secret.as_str(), "updated");
         assert_eq!(v.entries.len(), 2);
         v.remove(0);
         assert_eq!(v.entries.len(), 1);
@@ -374,5 +629,12 @@ mod tests {
     fn unlock_missing_file_errors() {
         let path = temp_vault_path("missing");
         assert!(Vault::unlock(&path, "x").is_err());
+    }
+
+    #[test]
+    fn secret_debug_is_redacted() {
+        let s: Secret = "topsecret".into();
+        assert_eq!(format!("{s:?}"), "\"***\"");
+        assert!(!format!("{s:?}").contains("topsecret"));
     }
 }

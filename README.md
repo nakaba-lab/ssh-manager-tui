@@ -227,6 +227,10 @@ for the session — `L` locks it again).
 In the add/edit form: `Tab` moves between fields, `Space` toggles the secret **kind**
 (login password vs. key passphrase), `Enter` saves, `Esc` cancels.
 
+> **Clipboard note:** `y` / `c` copies the secret to the system clipboard, which is
+> **not auto-cleared** — it stays there (and in any clipboard-history manager) until you
+> copy something else. Clear it yourself when you're done.
+
 ### Modals
 
 The **confirm** dialog takes `y` / `Enter` to confirm and `n` / `Esc` to cancel. The

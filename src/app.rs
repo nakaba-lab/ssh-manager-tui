@@ -8,6 +8,7 @@ use anyhow::Context;
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 use ratatui::widgets::{ListState, TableState};
+use zeroize::Zeroize;
 
 use crate::config::SshConfig;
 use crate::config::model::HostView;
@@ -194,8 +195,9 @@ impl Default for GenWizard {
 }
 
 /// Master-password prompt state (modal). Doubles as the "create vault" form,
-/// in which case the confirm field is also shown.
-#[derive(Debug, Default, Clone)]
+/// in which case the confirm field is also shown. The typed password is scrubbed
+/// on drop and redacted in `Debug` so it never lingers or leaks.
+#[derive(Default, Clone)]
 pub struct VaultUnlock {
     /// True when no vault file exists yet — collect + confirm a new password.
     pub creating: bool,
@@ -206,8 +208,28 @@ pub struct VaultUnlock {
     pub cursor: usize,
 }
 
-/// Add/edit form for a single vault entry (modal over the vault list).
-#[derive(Debug, Default, Clone)]
+impl Drop for VaultUnlock {
+    fn drop(&mut self) {
+        self.password.zeroize();
+        self.confirm.zeroize();
+    }
+}
+
+impl std::fmt::Debug for VaultUnlock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VaultUnlock")
+            .field("creating", &self.creating)
+            .field("password", &"***")
+            .field("confirm", &"***")
+            .field("field", &self.field)
+            .field("cursor", &self.cursor)
+            .finish()
+    }
+}
+
+/// Add/edit form for a single vault entry (modal over the vault list). The typed
+/// secret is scrubbed on drop and redacted in `Debug`.
+#[derive(Default, Clone)]
 pub struct VaultEntryForm {
     /// Index into the vault being edited, or `None` when adding.
     pub editing: Option<usize>,
@@ -218,6 +240,26 @@ pub struct VaultEntryForm {
     /// 0 = host, 1 = kind, 2 = secret, 3 = note.
     pub field: usize,
     pub cursor: usize,
+}
+
+impl Drop for VaultEntryForm {
+    fn drop(&mut self) {
+        self.secret.zeroize();
+    }
+}
+
+impl std::fmt::Debug for VaultEntryForm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VaultEntryForm")
+            .field("editing", &self.editing)
+            .field("host", &self.host)
+            .field("kind", &self.kind)
+            .field("secret", &"***")
+            .field("note", &self.note)
+            .field("field", &self.field)
+            .field("cursor", &self.cursor)
+            .finish()
+    }
 }
 
 pub struct App {

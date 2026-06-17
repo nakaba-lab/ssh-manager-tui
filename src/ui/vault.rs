@@ -22,8 +22,18 @@ fn masked(secret: &str) -> String {
 /// into `value`; it is mapped onto the (multi-byte) bullet string so the caret
 /// lands in the right cell.
 fn masked_input(value: &str, cursor: usize, editing: bool) -> Line<'static> {
-    let chars_before = value[..cursor.min(value.len())].chars().count();
     let dots = "•".repeat(value.chars().count());
+    if !editing {
+        // Unfocused fields are rendered with this field's value but a *foreign*
+        // cursor, so never slice here — just show the bullets.
+        return input_line(&dots, 0, false);
+    }
+    // Clamp to a real char boundary so a multibyte value never panics the slice.
+    let mut cur = cursor.min(value.len());
+    while cur > 0 && !value.is_char_boundary(cur) {
+        cur -= 1;
+    }
+    let chars_before = value[..cur].chars().count();
     input_line(&dots, chars_before * '•'.len_utf8(), editing)
 }
 
@@ -62,7 +72,7 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
         .iter()
         .map(|e| {
             let secret = if app.vault_reveal {
-                e.secret.clone()
+                e.secret.as_str().to_string()
             } else {
                 masked(&e.secret)
             };
@@ -245,4 +255,21 @@ pub fn draw_entry(f: &mut Frame, app: &App, area: Rect) {
         )),
     ];
     f.render_widget(Paragraph::new(Text::from(lines)).block(block), modal);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::masked_input;
+
+    // Regression: the shared cursor is passed to UNFOCUSED fields too, so
+    // masked_input must never slice a multibyte value at a foreign byte offset
+    // (which would panic and crash the TUI). See the password-vault review.
+    #[test]
+    fn masked_input_never_panics_on_non_char_boundary() {
+        let _ = masked_input("éz", 1, false); // unfocused, byte 1 is inside 'é'
+        let _ = masked_input("é", 1, true); // focused, non-boundary cursor
+        let _ = masked_input("🔐ab", 2, true); // cursor inside a 4-byte emoji
+        let _ = masked_input("", 5, true); // cursor past the end of an empty value
+        let _ = masked_input("abc", 99, false); // cursor far past the end
+    }
 }

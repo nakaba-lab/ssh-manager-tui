@@ -12,6 +12,7 @@ use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::app::{
     App, ConfirmAction, ConnectMode, FormMode, GenOrigin, ListFocus, Screen, VaultEntryForm,
@@ -870,10 +871,10 @@ fn open_vault(app: &mut App) {
         return;
     }
     let exists = vault::default_path().map(|p| p.exists()).unwrap_or(false);
-    app.vault_unlock = VaultUnlock {
-        creating: !exists,
-        ..Default::default()
-    };
+    // Struct-update (`..Default::default()`) can't move out of a Drop type.
+    let mut u = VaultUnlock::default();
+    u.creating = !exists;
+    app.vault_unlock = u;
     open_overlay(app, Screen::VaultUnlock);
 }
 
@@ -916,11 +917,11 @@ fn copy_vault_secret(app: &mut App) {
         .as_ref()
         .zip(app.vault_state.selected())
         .and_then(|(v, sel)| v.entries.get(sel))
-        .map(|e| e.secret.clone())
+        .map(|e| Zeroizing::new(e.secret.as_str().to_owned()))
     else {
         return;
     };
-    match copy_to_clipboard(&secret) {
+    match copy_to_clipboard(secret.as_str()) {
         Ok(()) => app.toast("secret copied to clipboard", false),
         Err(e) => app.toast(format!("clipboard error: {e}"), true),
     }
@@ -970,20 +971,22 @@ fn submit_vault_unlock(app: &mut App) {
         app.toast("cannot resolve ~/.ssh", true);
         return;
     };
-    let u = app.vault_unlock.clone();
-    if u.password.is_empty() {
+    let creating = app.vault_unlock.creating;
+    if app.vault_unlock.password.is_empty() {
         app.toast("master password is required", true);
         return;
     }
+    if creating && app.vault_unlock.password != app.vault_unlock.confirm {
+        app.toast("passwords do not match", true);
+        return;
+    }
 
-    let result = if u.creating {
-        if u.password != u.confirm {
-            app.toast("passwords do not match", true);
-            return;
-        }
-        Vault::create(&u.password).and_then(|v| v.save(&path).map(|()| v))
+    // Borrow the password directly — never clone the whole unlock struct (which
+    // would scatter another un-scrubbed copy of the master password on the heap).
+    let result = if creating {
+        Vault::create(&app.vault_unlock.password).and_then(|v| v.save(&path).map(|()| v))
     } else {
-        Vault::unlock(&path, &u.password)
+        Vault::unlock(&path, &app.vault_unlock.password)
     };
 
     match result {
@@ -991,11 +994,12 @@ fn submit_vault_unlock(app: &mut App) {
             let n = v.entries.len();
             app.vault = Some(v);
             app.vault_state.select((n > 0).then_some(0));
+            // Replacing the struct drops the old one, whose Drop scrubs the password.
             app.vault_unlock = VaultUnlock::default();
             app.prev_screen = None;
             app.screen = Screen::Vault;
             app.toast(
-                if u.creating {
+                if creating {
                     "vault created"
                 } else {
                     "vault unlocked"
@@ -1004,9 +1008,9 @@ fn submit_vault_unlock(app: &mut App) {
             );
         }
         Err(e) => {
-            // Keep the prompt open; clear the password so the user can retry.
-            app.vault_unlock.password.clear();
-            app.vault_unlock.confirm.clear();
+            // Keep the prompt open; scrub the typed password so the user can retry.
+            app.vault_unlock.password.zeroize();
+            app.vault_unlock.confirm.zeroize();
             app.vault_unlock.cursor = 0;
             app.vault_unlock.field = 0;
             app.toast(format!("{e}"), true);
@@ -1021,7 +1025,7 @@ fn open_vault_entry(app: &mut App, editing: Option<usize>) {
             editing,
             host: e.host.clone(),
             kind: e.kind,
-            secret: e.secret.clone(),
+            secret: e.secret.as_str().to_string(),
             note: e.note.clone(),
             field: 0,
             cursor: e.host.len(),
@@ -1033,11 +1037,10 @@ fn open_vault_entry(app: &mut App, editing: Option<usize>) {
                 .and_then(|i| app.hosts.get(i))
                 .map(|h| h.alias().to_string())
                 .unwrap_or_default();
-            VaultEntryForm {
-                cursor: host.len(),
-                host,
-                ..Default::default()
-            }
+            let mut form = VaultEntryForm::default();
+            form.cursor = host.len();
+            form.host = host;
+            form
         }
     };
     app.vault_entry = form;
@@ -1126,7 +1129,7 @@ fn save_vault_entry(app: &mut App, editing: Option<usize>) {
     let entry = VaultEntry {
         host,
         kind: app.vault_entry.kind,
-        secret: app.vault_entry.secret.clone(),
+        secret: app.vault_entry.secret.clone().into(),
         note: app.vault_entry.note.trim().to_string(),
     };
     let Some(v) = app.vault.as_mut() else {
