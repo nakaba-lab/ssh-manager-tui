@@ -2,5 +2,6 @@
 **/*.rs.bk
 *.pdb
 
-# Local Claude Code / editor settings
-/.claude
+# Claude Code: track shared config (agents/, skills/, settings.json) so it
+# follows the repo across machines; keep only machine-local overrides out.
+/.claude/settings.local.json

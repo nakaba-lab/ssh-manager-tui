@@ -496,7 +496,9 @@ impl App {
                 .as_deref()
                 .and_then(|p| p.parse::<u16>().ok())
                 .unwrap_or(22);
-            let has_jump = h.proxy_jump.as_deref().is_some_and(|s| !s.is_empty());
+            // Behind a proxy (ProxyJump or ProxyCommand) → a direct TCP probe
+            // can't reach the real host, so skip it rather than report "down".
+            let proxied = h.is_proxied();
 
             // Resolve a probe target: explicit HostName, else a wildcard-free alias.
             let target = match &h.host_name {
@@ -506,13 +508,12 @@ impl App {
             };
 
             match target {
-                Some(t) if !has_jump => {
+                Some(t) if !proxied => {
                     self.liveness.insert(i, Liveness::Checking);
                     targets.push(ProbeTarget {
                         id: i,
                         target: t,
                         port,
-                        has_jump: false,
                     });
                 }
                 _ => {

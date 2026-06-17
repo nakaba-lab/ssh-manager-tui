@@ -19,9 +19,13 @@ cargo run -- --config PATH   # use an alternate config file (great for manual te
 cargo test               # all unit tests (config/ and os/ layers)
 cargo test roundtrip_crlf    # a single test by name
 cargo test config::          # all tests in the config module
-cargo clippy
-cargo fmt
+cargo clippy --all-targets -- -D warnings   # lint — exactly what CI gates on
+cargo fmt                                    # format in place
 ```
+
+The three gates CI runs on Linux *and* Windows — match them before pushing:
+`cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`,
+`cargo test --all`.
 
 Rust edition 2024; the MSRV is pinned via `rust-version = "1.94"` in `Cargo.toml`.
 OpenSSH (`ssh`, `ssh-keygen`) must be on `PATH`; new-tab connect additionally
@@ -45,11 +49,13 @@ Three layers with a strict, enforced dependency direction:
   ratatui dependency**, fully headless-testable. This is the most important and
   most-tested module.
 - **`os/`** — all external-world integration: spawning `ssh`/`ssh-keygen`,
-  TCP liveness probing, `known_hosts` parsing/rewriting, clipboard, binary
-  resolution, and the encrypted password vault (`os/vault.rs`: Argon2id +
-  XChaCha20-Poly1305 over `~/.ssh/sshm-vault.json`, holding per-host login
-  passwords and key passphrases — secrets never touch the SSH config and are
-  zeroized on drop). **Zero ratatui dependency.**
+  TCP liveness probing, SSH key discovery + fingerprint-based pairing,
+  `known_hosts` parsing/rewriting, clipboard, binary resolution, and the
+  encrypted password vault (`os/vault.rs`: Argon2id + XChaCha20-Poly1305 over
+  `~/.ssh/sshm-vault.json`, holding per-host login passwords and key passphrases
+  — secrets never touch the SSH config, are zeroized on drop, and the file
+  header is AEAD-authenticated with range-checked KDF params). **Zero ratatui
+  dependency.**
 - **`ui/`** — pure rendering only. **Never mutates domain state** (only widget
   scroll/selection state).
 
@@ -124,8 +130,19 @@ ad-hoc `ConnectOverrides`, never for saved values.
 reporting over an `mpsc` channel. The UI thread never blocks: it calls
 `App::drain_liveness()` once per tick. Results are keyed by **host index in
 `App::hosts`**, which shifts when hosts are added/removed — `rebuild_hosts()`
-clears the liveness maps and callers re-probe. Hosts behind a `ProxyJump` are
-`Skipped` (a direct TCP probe would be meaningless).
+clears the liveness maps and callers re-probe. Hosts behind a proxy
+(`ProxyJump` or `ProxyCommand` — see `HostView::is_proxied`) are `Skipped` (a
+direct TCP probe would be meaningless).
+
+### Key discovery & pairing
+
+`os/keys.rs` discovers keys by walking `~/.ssh` recursively (`MAX_DEPTH = 8`) and
+classifying files by sniffing **only the first header line** — private key bodies
+are never loaded. Public/private halves are paired by fingerprinting each half
+independently (`ssh-keygen -l -f`) and comparing the SHA256 *public* fingerprints,
+surfaced as `PairStatus` (`Matched` / `Mismatched` / `Unverified` /
+`NotApplicable`) — never by reading the private body. An encrypted PEM whose public
+half ssh-keygen won't surface without the passphrase is `Unverified`, not an error.
 
 ## Windows-first specifics (don't regress these)
 
@@ -140,8 +157,9 @@ clears the liveness maps and callers re-probe. Hosts behind a `ProxyJump` are
   set on unix only.
 - **`wt.exe` escaping** (`escape_wt_arg` in `os/connect.rs`): quote on
   whitespace, escape `;`, double embedded `"`, leave backslashes intact.
-- **Cross-platform clippy**: CI runs `cargo clippy -D warnings` on Linux *and*
-  Windows. A symbol referenced only from `#[cfg(windows)]` code (e.g. `find_wt`,
+- **Cross-platform clippy**: CI runs `cargo clippy --all-targets -- -D warnings`
+  on Linux *and* Windows. A symbol referenced only from `#[cfg(windows)]` code
+  (e.g. `find_wt`,
   `escape_wt_arg`) trips `dead_code` / `unused_imports` on the Linux build,
   which a local Windows-only `clippy` never sees. Gate such helpers to where
   they're used (`#[cfg(windows)]`, or `#[cfg(any(windows, test))]` when only a

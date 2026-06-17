@@ -245,7 +245,7 @@ The dot in the host list (and the `status` line in the detail pane) shows reacha
 | `●` | **up** — TCP connect succeeded (detail pane shows the round-trip time) |
 | `○` | **down** — TCP connect failed (refused, timed out, or the host name didn't resolve) |
 | `…` | **checking** — a probe is in flight |
-| `—` | **skipped** — behind a `ProxyJump`, or no resolvable target (a wildcard-only alias with no `HostName`), so a direct probe is impossible |
+| `—` | **skipped** — behind a `ProxyJump` / `ProxyCommand`, or no resolvable target (a wildcard-only alias with no `HostName`), so a direct probe is impossible |
 | `·` | **unknown** — not probed yet (before the first sweep) |
 
 Probes are direct TCP connects to the host's `HostName` — or the alias itself when no

@@ -222,7 +222,7 @@ fn draw_detail_pane(f: &mut Frame, app: &App, area: Rect) {
         }
         Liveness::Down => Span::styled("down", Style::default().fg(theme::DOWN)),
         Liveness::Checking => Span::styled("checking…", Style::default().fg(theme::CHECKING)),
-        Liveness::Skipped => Span::styled("skipped (jump)", Style::default().fg(theme::FAINT)),
+        Liveness::Skipped => Span::styled("skipped (proxy)", Style::default().fg(theme::FAINT)),
         Liveness::Unknown => Span::styled("unknown", Style::default().fg(theme::FAINT)),
     };
 
