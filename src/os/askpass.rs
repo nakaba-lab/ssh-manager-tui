@@ -80,6 +80,10 @@ pub struct IdentityTokens {
     pub localhost: String,               // %l / %L
 }
 
+use std::collections::HashSet;
+
+use crate::os::vault::{Secret, SecretKind};
+
 /// Expand one raw IdentityFile entry (tilde + `%`-tokens) to an absolute path.
 /// Returns `None` (fail-safe: do not auto-fill) for any unhandled token, an
 /// unresolvable source value, or an unknown `~user`.
@@ -133,6 +137,114 @@ pub fn expand_identity_path(raw: &str, t: &IdentityTokens) -> Option<String> {
         out.push_str(&val);
     }
     Some(out)
+}
+
+/// The `ssh -G`-resolved identity the listener binds secrets to. `host` is the
+/// value OpenSSH's prompt carries: `host_key_alias` verbatim if set, else the
+/// already-ASCII-lowercased resolved hostname.
+#[derive(Debug, Clone)]
+pub struct ResolvedIdentity {
+    pub user: String,
+    pub host: String,
+    pub host_key_alias: Option<String>,
+    /// Expected IdentityFile paths, already expanded+normalized by the caller.
+    pub identity_paths: Vec<String>,
+}
+
+impl ResolvedIdentity {
+    /// The host token OpenSSH puts in the password prompt for this identity.
+    fn prompt_host(&self) -> &str {
+        self.host_key_alias.as_deref().unwrap_or(&self.host)
+    }
+}
+
+/// Listener-side per-connect secret state. Holds the armed secrets, the
+/// identity to bind against, and single-shot served-state. Secrets zeroize on
+/// drop (via `Secret`).
+#[derive(Debug)]
+pub struct ConnectSecrets {
+    identity: ResolvedIdentity,
+    password: Option<Secret>,
+    passphrase: Option<Secret>,
+    password_served: bool,
+    served_paths: HashSet<String>,
+}
+
+impl ConnectSecrets {
+    pub fn new(
+        identity: ResolvedIdentity,
+        password: Option<Secret>,
+        passphrase: Option<Secret>,
+    ) -> Self {
+        ConnectSecrets {
+            identity,
+            password,
+            passphrase,
+            password_served: false,
+            served_paths: HashSet::new(),
+        }
+    }
+
+    /// Decide what to send for `prompt`, recording single-shot state. Returns
+    /// the secret bytes to send (as a `String`), or `None` to send nothing.
+    pub fn decide(&mut self, prompt: &str) -> Option<String> {
+        match classify(prompt) {
+            Classified::Password { user, host } => {
+                let pw = self.password.as_ref()?;
+                if self.password_served {
+                    return None; // per-kind single-shot
+                }
+                // ASCII-only comparison: ssh -G already applied OpenSSH's fold.
+                if user != self.identity.user
+                    || !host.eq_ignore_ascii_case(self.identity.prompt_host())
+                {
+                    return None;
+                }
+                self.password_served = true;
+                Some(pw.as_str().to_string())
+            }
+            Classified::Passphrase { key_path } => {
+                let pp = self.passphrase.as_ref()?;
+                if !self
+                    .identity
+                    .identity_paths
+                    .iter()
+                    .any(|p| paths_equal(p, &key_path))
+                {
+                    return None;
+                }
+                if !self.served_paths.insert(key_path) {
+                    return None; // per-path single-shot
+                }
+                Some(pp.as_str().to_string())
+            }
+            Classified::Other => None,
+        }
+    }
+
+    /// Which kind, if any, a successful `decide` served — for the outcome enum.
+    pub fn last_kind(prompt: &str) -> Option<SecretKind> {
+        match classify(prompt) {
+            Classified::Password { .. } => Some(SecretKind::Password),
+            Classified::Passphrase { .. } => Some(SecretKind::Passphrase),
+            Classified::Other => None,
+        }
+    }
+}
+
+/// Compare two already-expanded key paths. On Windows treat `/`≡`\` and fold
+/// case; on unix compare exactly. Accounts for the prompt's `%.100s` truncation
+/// by comparing the first 100 bytes of each side.
+fn paths_equal(expected: &str, from_prompt: &str) -> bool {
+    fn norm(s: &str) -> String {
+        let truncated: String = s.bytes().take(100).map(|b| b as char).collect();
+        if cfg!(windows) {
+            truncated.replace('\\', "/").to_ascii_lowercase()
+        } else {
+            truncated
+        }
+    }
+    norm(expected) == norm(from_prompt)
 }
 
 #[cfg(test)]
@@ -239,6 +351,79 @@ mod tests {
         assert_eq!(
             expand_identity_path("~/100%%done", &toks()).as_deref(),
             Some("/home/u/100%done")
+        );
+    }
+
+    use super::{ConnectSecrets, ResolvedIdentity};
+    use crate::os::vault::Secret;
+
+    fn ident() -> ResolvedIdentity {
+        ResolvedIdentity {
+            user: "deploy".into(),
+            host: "web1".into(), // already ASCII-lowercased by ssh -G
+            host_key_alias: None,
+            identity_paths: vec!["/home/u/.ssh/id_ed25519".into()],
+        }
+    }
+
+    #[test]
+    fn releases_matching_password_once() {
+        let mut cs = ConnectSecrets::new(ident(), Some(Secret::from("hunter2")), None);
+        // First matching password prompt -> served.
+        let r = cs.decide("deploy@web1's password: ");
+        assert_eq!(r.as_deref(), Some("hunter2"));
+        // Second password prompt on the same connect -> nothing (single-shot).
+        assert_eq!(cs.decide("deploy@web1's password: "), None);
+    }
+
+    #[test]
+    fn withholds_password_for_wrong_host_or_user() {
+        let mut cs = ConnectSecrets::new(ident(), Some(Secret::from("hunter2")), None);
+        assert_eq!(cs.decide("deploy@evil's password: "), None);
+        assert_eq!(cs.decide("root@web1's password: "), None);
+        assert_eq!(cs.decide("(deploy@web1) deploy@web1's password: "), None);
+    }
+
+    #[test]
+    fn passphrase_per_path_single_shot() {
+        let mut cs = ConnectSecrets::new(
+            ResolvedIdentity {
+                identity_paths: vec!["/home/u/.ssh/id_a".into(), "/home/u/.ssh/id_b".into()],
+                ..ident()
+            },
+            None,
+            Some(Secret::from("pp")),
+        );
+        // key A: served, then refused on retry of the SAME path.
+        assert_eq!(
+            cs.decide("Enter passphrase for key '/home/u/.ssh/id_a': ")
+                .as_deref(),
+            Some("pp")
+        );
+        assert_eq!(
+            cs.decide("Enter passphrase for key '/home/u/.ssh/id_a': "),
+            None
+        );
+        // key B: a DIFFERENT expected path is still served (multi-IdentityFile fallback).
+        assert_eq!(
+            cs.decide("Enter passphrase for key '/home/u/.ssh/id_b': ")
+                .as_deref(),
+            Some("pp")
+        );
+        // an unexpected path is never served.
+        assert_eq!(
+            cs.decide("Enter passphrase for key '/home/u/.ssh/id_x': "),
+            None
+        );
+    }
+
+    #[test]
+    fn no_secret_armed_returns_none() {
+        let mut cs = ConnectSecrets::new(ident(), None, None);
+        assert_eq!(cs.decide("deploy@web1's password: "), None);
+        assert_eq!(
+            cs.decide("Enter passphrase for key '/home/u/.ssh/id_ed25519': "),
+            None
         );
     }
 }
