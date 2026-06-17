@@ -3,6 +3,7 @@
 //! terminal through for inline-ssh suspend/restore.
 
 use std::io::stdout;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use ratatui::DefaultTerminal;
@@ -300,6 +301,46 @@ fn copy_to_clipboard(text: &str) -> Result<()> {
     let mut cb = arboard::Clipboard::new()?;
     cb.set_text(text.to_string())?;
     Ok(())
+}
+
+/// How long a copied vault secret lingers in the clipboard before auto-clear.
+const CLIPBOARD_CLEAR_AFTER: Duration = Duration::from_secs(20);
+
+/// Called each tick: once the auto-clear deadline passes, wipe the clipboard —
+/// but only if it still holds the secret we copied, so whatever the user copied
+/// afterwards is left alone. Every step is best-effort.
+pub fn tick_clipboard(app: &mut App) {
+    let Some(at) = app.clipboard_clear_at else {
+        return;
+    };
+    if Instant::now() < at {
+        return;
+    }
+    app.clipboard_clear_at = None;
+    let target = app.clipboard_hash;
+    app.clipboard_hash = 0;
+    // Clear if the clipboard is unchanged, or if we couldn't read it back.
+    if clipboard_hash().map(|h| h == target).unwrap_or(true) {
+        let _ = clear_clipboard();
+    }
+}
+
+fn clear_clipboard() -> Result<()> {
+    arboard::Clipboard::new()?.set_text(String::new())?;
+    Ok(())
+}
+
+/// Hash of the current clipboard contents, without retaining the plaintext.
+fn clipboard_hash() -> Option<u64> {
+    let txt = Zeroizing::new(arboard::Clipboard::new().ok()?.get_text().ok()?);
+    Some(hash_secret(&txt))
+}
+
+fn hash_secret(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
 }
 
 // ---------------------------------------------------------------------------
@@ -922,7 +963,17 @@ fn copy_vault_secret(app: &mut App) {
         return;
     };
     match copy_to_clipboard(secret.as_str()) {
-        Ok(()) => app.toast("secret copied to clipboard", false),
+        Ok(()) => {
+            app.clipboard_hash = hash_secret(secret.as_str());
+            app.clipboard_clear_at = Some(Instant::now() + CLIPBOARD_CLEAR_AFTER);
+            app.toast(
+                format!(
+                    "secret copied — clipboard auto-clears in {}s",
+                    CLIPBOARD_CLEAR_AFTER.as_secs()
+                ),
+                false,
+            );
+        }
         Err(e) => app.toast(format!("clipboard error: {e}"), true),
     }
 }

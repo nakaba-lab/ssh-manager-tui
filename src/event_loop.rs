@@ -32,6 +32,7 @@ pub fn run(mut terminal: DefaultTerminal, mut app: App) -> Result<()> {
         if last_tick.elapsed() >= TICK {
             app.on_tick();
             app.drain_liveness();
+            update::tick_clipboard(&mut app);
             last_tick = Instant::now();
         }
     }

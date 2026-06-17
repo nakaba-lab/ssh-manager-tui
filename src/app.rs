@@ -317,6 +317,11 @@ pub struct App {
     pub vault_entry: VaultEntryForm,
     /// When true, secrets are shown in the clear instead of masked.
     pub vault_reveal: bool,
+    /// When a vault secret was copied, the deadline to auto-clear the clipboard,
+    /// plus a (non-reversible) hash of the copied secret so the clear only fires
+    /// if the clipboard still holds it — never the plaintext, which stays sealed.
+    pub clipboard_clear_at: Option<Instant>,
+    pub clipboard_hash: u64,
 
     // --- chrome ---
     pub toast: Toast,
@@ -365,6 +370,8 @@ impl App {
             vault_unlock: VaultUnlock::default(),
             vault_entry: VaultEntryForm::default(),
             vault_reveal: false,
+            clipboard_clear_at: None,
+            clipboard_hash: 0,
             toast: Toast::default(),
             ssh_path_warning: !os::tools().is_system32,
             include_note: false,
