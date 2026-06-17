@@ -64,9 +64,80 @@ pub fn classify(prompt: &str) -> Classified {
     Classified::Other
 }
 
+/// Resolved token values sourced from one `ssh -G` dump, used to expand
+/// IdentityFile entries the way OpenSSH does.
+#[derive(Debug, Clone)]
+pub struct IdentityTokens {
+    pub home: String,
+    pub hostname: String,                // ssh -G hostname (%h)
+    pub local_user: String,              // OS user (%u)
+    pub remote_user: String,             // ssh -G user (%r)
+    pub host_key_alias: Option<String>,  // %k (else host_arg)
+    pub host_arg: String,                // the alias passed to ssh (%n, %k fallback)
+    pub port: String,                    // ssh -G port (%p)
+    pub proxy_jump_host: Option<String>, // %j
+    pub uid: String,                     // %i
+    pub localhost: String,               // %l / %L
+}
+
+/// Expand one raw IdentityFile entry (tilde + `%`-tokens) to an absolute path.
+/// Returns `None` (fail-safe: do not auto-fill) for any unhandled token, an
+/// unresolvable source value, or an unknown `~user`.
+pub fn expand_identity_path(raw: &str, t: &IdentityTokens) -> Option<String> {
+    // Tilde first (only a leading ~/ or bare ~). ~user is unsupported -> None.
+    let after_tilde = if let Some(rest) = raw.strip_prefix("~/") {
+        format!("{}/{rest}", t.home)
+    } else if raw == "~" {
+        t.home.clone()
+    } else if raw.starts_with('~') {
+        return None; // ~user — unresolvable here
+    } else {
+        raw.to_string()
+    };
+
+    // Percent-token expansion.
+    let mut out = String::with_capacity(after_tilde.len());
+    let mut chars = after_tilde.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        let tok = chars.next()?;
+        let val: String = match tok {
+            '%' => "%".into(),
+            'd' => t.home.clone(),
+            'h' => t.hostname.clone(),
+            'i' => t.uid.clone(),
+            'l' => t.localhost.clone(),
+            'L' => t
+                .localhost
+                .split('.')
+                .next()
+                .unwrap_or(&t.localhost)
+                .to_string(),
+            'u' => t.local_user.clone(),
+            'r' => t.remote_user.clone(),
+            'k' => t
+                .host_key_alias
+                .clone()
+                .unwrap_or_else(|| t.host_arg.clone()),
+            'n' => t.host_arg.clone(),
+            'p' => t.port.clone(),
+            'j' => match &t.proxy_jump_host {
+                Some(h) => h.clone(),
+                None => return None,
+            },
+            _ => return None, // %C and any other token -> fail-safe
+        };
+        out.push_str(&val);
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Classified, classify};
+    use super::{Classified, IdentityTokens, classify, expand_identity_path};
 
     #[test]
     fn module_compiles() {
@@ -112,5 +183,62 @@ mod tests {
         ] {
             assert_eq!(classify(p), Classified::Other, "should reject: {p:?}");
         }
+    }
+
+    fn toks() -> IdentityTokens {
+        IdentityTokens {
+            home: "/home/u".into(),
+            hostname: "web1.example.com".into(),
+            local_user: "u".into(),
+            remote_user: "deploy".into(),
+            host_key_alias: Some("web1ka".into()),
+            host_arg: "web1".into(),
+            port: "22".into(),
+            proxy_jump_host: None,
+            uid: "1000".into(),
+            localhost: "mybox".into(),
+        }
+    }
+
+    #[test]
+    fn expand_tilde_and_percent_d() {
+        assert_eq!(
+            expand_identity_path("~/.ssh/id_ed25519", &toks()).as_deref(),
+            Some("/home/u/.ssh/id_ed25519")
+        );
+        assert_eq!(
+            expand_identity_path("%d/.ssh/k", &toks()).as_deref(),
+            Some("/home/u/.ssh/k")
+        );
+    }
+
+    #[test]
+    fn expand_percent_h_k_n_r() {
+        assert_eq!(
+            expand_identity_path("~/.ssh/id_%h", &toks()).as_deref(),
+            Some("/home/u/.ssh/id_web1.example.com")
+        );
+        assert_eq!(
+            expand_identity_path("~/.ssh/id_%k", &toks()).as_deref(),
+            Some("/home/u/.ssh/id_web1ka")
+        );
+        assert_eq!(
+            expand_identity_path("~/.ssh/id_%r", &toks()).as_deref(),
+            Some("/home/u/.ssh/id_deploy")
+        );
+    }
+
+    #[test]
+    fn unknown_token_is_fail_safe_none() {
+        assert_eq!(expand_identity_path("~/.ssh/id_%C", &toks()), None);
+        assert_eq!(expand_identity_path("~/.ssh/id_%z", &toks()), None);
+    }
+
+    #[test]
+    fn percent_percent_is_literal() {
+        assert_eq!(
+            expand_identity_path("~/100%%done", &toks()).as_deref(),
+            Some("/home/u/100%done")
+        );
     }
 }
