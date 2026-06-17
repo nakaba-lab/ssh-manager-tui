@@ -319,14 +319,17 @@ pub fn tick_clipboard(app: &mut App) {
 /// Wipe the clipboard now if it still holds the secret we copied, and forget the
 /// pending clear. Used at the tick deadline and on quit (which stops the tick).
 pub fn force_clear_clipboard(app: &mut App) {
-    let target = app.clipboard_hash;
     let key = app.clipboard_hash_key;
+    let target = app.clipboard_hash;
+    // Still holds our secret, or we couldn't read it back → try to wipe it.
+    let ours = clipboard_hash(key).map(|h| h == target).unwrap_or(true);
+    if ours && clear_clipboard().is_err() {
+        // Transient failure (clipboard momentarily locked): keep the deadline so
+        // the next tick retries, rather than giving up with the secret still set.
+        return;
+    }
     app.clipboard_clear_at = None;
     app.clipboard_hash = 0;
-    // Clear if the clipboard is unchanged, or if we couldn't read it back.
-    if clipboard_hash(key).map(|h| h == target).unwrap_or(true) {
-        let _ = clear_clipboard();
-    }
 }
 
 fn clear_clipboard() -> Result<()> {
@@ -915,12 +918,20 @@ fn open_vault(app: &mut App) {
         return;
     }
     let path = vault::default_path();
-    // Recover a crash-orphaned backup before deciding create-vs-unlock, so a
-    // surviving `.bak` isn't treated as "no vault" and overwritten by a create.
-    if let Some(p) = &path {
-        vault::recover_backup(p);
-    }
-    let exists = path.map(|p| p.exists()).unwrap_or(false);
+    // Recover a crash-orphaned backup before deciding create-vs-unlock. If a
+    // backup exists but can't be restored, a vault DOES exist — never offer to
+    // create over it (a create would delete the backup); surface the error and
+    // fall into unlock mode instead.
+    let exists = match &path {
+        Some(p) => match vault::recover_backup(p) {
+            Ok(()) => p.exists(),
+            Err(e) => {
+                app.toast(format!("{e}"), true);
+                true
+            }
+        },
+        None => false,
+    };
     // Struct-update (`..Default::default()`) can't move out of a Drop type.
     let mut u = VaultUnlock::default();
     u.creating = !exists;

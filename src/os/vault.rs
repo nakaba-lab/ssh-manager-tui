@@ -242,7 +242,7 @@ impl Vault {
     /// Decrypt the vault at `path` with `password`. A wrong password — or a
     /// tampered header — is reported as a clear "incorrect master password".
     pub fn unlock(path: &Path, password: &str) -> Result<Vault> {
-        recover_backup(path);
+        recover_backup(path)?;
         let data = fs::read_to_string(path).map_err(|e| anyhow!("cannot read vault file: {e}"))?;
         let file: VaultFile =
             serde_json::from_str(&data).map_err(|e| anyhow!("vault file is corrupt: {e}"))?;
@@ -385,14 +385,22 @@ fn sidecar(path: &Path, ext: &str) -> PathBuf {
 }
 
 /// Recover from a save that crashed mid-swap: if the vault file is missing but
-/// its `.bak` backup survived, restore the backup. Best-effort — call it before
-/// deciding whether a vault exists (so the backup isn't mistaken for "no vault"
-/// and clobbered by a fresh create) and before reading the vault.
-pub fn recover_backup(path: &Path) {
+/// its `.bak` backup survived, restore the backup. Call it before deciding
+/// whether a vault exists (so a survivor isn't mistaken for "no vault" and
+/// clobbered by a fresh create) and before reading the vault. A restore failure
+/// is surfaced (NOT swallowed) so the caller never silently treats an existing,
+/// un-restored backup as "no vault".
+pub fn recover_backup(path: &Path) -> Result<()> {
     let bak = sidecar(path, "bak");
     if !path.exists() && bak.exists() {
-        let _ = fs::rename(&bak, path);
+        fs::rename(&bak, path).map_err(|e| {
+            anyhow!(
+                "a vault backup exists but could not be restored ({e}); your secrets are safe in {}",
+                bak.display()
+            )
+        })?;
     }
+    Ok(())
 }
 
 /// A unique, unpredictable temp filename in the vault directory, so two
@@ -455,26 +463,33 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     #[cfg(windows)]
     restrict_acl(&tmp);
 
-    // Move the existing vault aside (works cross-platform; on Windows a rename
-    // onto an existing destination fails, which is why we clear the path first).
     let bak = sidecar(path, "bak");
-    let _ = fs::remove_file(&bak);
     if path.exists() {
+        // A real vault is at `path`, so any leftover `.bak` is stale and safe to
+        // drop. Back it up, swap in the temp, then drop the backup — at every
+        // crash point either `path` or `.bak` holds a complete vault.
+        let _ = fs::remove_file(&bak);
         fs::rename(path, &bak)?;
-    }
-    match fs::rename(&tmp, path) {
-        Ok(()) => {
-            let _ = fs::remove_file(&bak);
-            Ok(())
-        }
-        Err(e) => {
-            // Restore the backup so we never end up with no vault at all.
-            if bak.exists() {
-                let _ = fs::rename(&bak, path);
+        match fs::rename(&tmp, path) {
+            Ok(()) => {
+                let _ = fs::remove_file(&bak);
+                Ok(())
             }
-            let _ = fs::remove_file(&tmp);
-            Err(e.into())
+            Err(e) => {
+                // Restore the backup so we never end up with no vault at all.
+                if !path.exists() && bak.exists() {
+                    let _ = fs::rename(&bak, path);
+                }
+                let _ = fs::remove_file(&tmp);
+                Err(e.into())
+            }
         }
+    } else {
+        // No vault at `path`. NEVER touch a surviving `.bak` here — it may be a
+        // crash-orphaned real vault that recovery (not this create) must restore.
+        // Deleting it would destroy the only copy of the user's secrets.
+        fs::rename(&tmp, path)?;
+        Ok(())
     }
 }
 
@@ -658,6 +673,27 @@ mod tests {
         assert_eq!(opened.entries[0].secret.as_str(), "s");
         assert!(path.exists() && !bak.exists());
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn create_save_never_deletes_a_surviving_backup() {
+        let path = temp_vault_path("guard");
+        let bak = sidecar(&path, "bak");
+        // A real vault survives only as `.bak` (a save crashed mid-swap).
+        let mut real = Vault::create("m").unwrap();
+        real.upsert(None, entry("h", SecretKind::Password, "keepme"));
+        real.save(&path).unwrap();
+        fs::rename(&path, &bak).unwrap(); // path absent, .bak holds the real vault
+
+        // A fresh create save (e.g. if the user were wrongly dropped into create
+        // mode) must NOT delete the surviving backup — the secrets stay safe.
+        Vault::create("other").unwrap().save(&path).unwrap();
+        assert!(
+            bak.exists(),
+            "a surviving .bak must never be deleted by a create-mode save"
+        );
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&bak);
     }
 
     #[test]
