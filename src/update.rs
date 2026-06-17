@@ -913,7 +913,11 @@ fn handle_known_hosts(app: &mut App, key: KeyEvent) {
 /// vault file exists yet).
 fn open_vault(app: &mut App) {
     if let Some(v) = &app.vault {
-        app.vault_state.select((!v.entries.is_empty()).then_some(0));
+        let has_entries = !v.entries.is_empty();
+        app.vault_state.select(has_entries.then_some(0));
+        // Re-entering the vault starts masked: reveal is a per-visit opt-in, so a
+        // reveal left on from an earlier visit never silently shows secrets here.
+        app.vault_reveal = false;
         app.screen = Screen::Vault;
         return;
     }
@@ -942,7 +946,11 @@ fn open_vault(app: &mut App) {
 fn handle_vault(app: &mut App, key: KeyEvent) {
     let len = app.vault.as_ref().map(|v| v.entries.len()).unwrap_or(0);
     match key.code {
-        KeyCode::Esc => app.screen = Screen::List,
+        KeyCode::Esc => {
+            // Leaving the vault clears reveal, so the next visit is masked again.
+            app.vault_reveal = false;
+            app.screen = Screen::List;
+        }
         KeyCode::Char('?') => open_overlay(app, Screen::Help),
         KeyCode::Char('j') | KeyCode::Down => move_list(&mut app.vault_state, len, 1),
         KeyCode::Char('k') | KeyCode::Up => move_list(&mut app.vault_state, len, -1),
@@ -1207,8 +1215,9 @@ fn save_vault_entry(app: &mut App, editing: Option<usize>) {
         app.toast("vault is locked", true);
         return;
     };
-    v.upsert(editing, entry);
-    if let Err(e) = v.save(&path) {
+    // Persist with rollback: on a save failure the in-memory entry is reverted so
+    // the list never shows an add/edit that is not actually on disk.
+    if let Err(e) = v.upsert_and_save(editing, entry, &path) {
         app.toast(format!("save failed: {e}"), true);
         return;
     }
@@ -1306,12 +1315,13 @@ fn delete_vault_entry(app: &mut App, idx: usize) {
     let Some(v) = app.vault.as_mut() else {
         return;
     };
-    v.remove(idx);
-    let n = v.entries.len();
-    if let Err(e) = v.save(&path) {
+    // Persist with rollback: on a save failure the removal is reverted in memory
+    // so the list never shows a deletion that did not actually reach disk.
+    if let Err(e) = v.remove_and_save(idx, &path) {
         app.toast(format!("save failed: {e}"), true);
         return;
     }
+    let n = v.entries.len();
     if n == 0 {
         app.vault_state.select(None);
     } else {

@@ -304,11 +304,55 @@ impl Vault {
         }
     }
 
-    /// Remove the entry at `idx` (its secret scrubs itself on drop).
-    pub fn remove(&mut self, idx: usize) {
-        if idx < self.entries.len() {
-            self.entries.remove(idx);
+    /// Remove the entry at `idx`, returning it so the caller can roll the removal
+    /// back if a later step fails. Out-of-range is a no-op returning `None`. A
+    /// discarded entry scrubs its secret on drop (Secret).
+    pub fn remove(&mut self, idx: usize) -> Option<VaultEntry> {
+        (idx < self.entries.len()).then(|| self.entries.remove(idx))
+    }
+
+    /// Upsert an entry **and persist**, keeping the in-memory vault in lock-step
+    /// with disk: if the save fails the in-memory change is rolled back, so the
+    /// list the user sees never diverges from what is stored. (A failed save
+    /// leaves the previous file intact — see [`atomic_write`] — so rolling memory
+    /// back to match is exactly right.) On the edit path the prior entry is briefly
+    /// cloned, retained only to restore it on failure; it zeroizes on drop like
+    /// every other [`Secret`].
+    pub fn upsert_and_save(
+        &mut self,
+        editing: Option<usize>,
+        entry: VaultEntry,
+        path: &Path,
+    ) -> Result<()> {
+        let prev = match editing {
+            Some(i) if i < self.entries.len() => Some((i, self.entries[i].clone())),
+            _ => None,
+        };
+        self.upsert(editing, entry);
+        if let Err(e) = self.save(path) {
+            match prev {
+                Some((i, old)) => self.entries[i] = old, // restore the replaced entry
+                None => {
+                    self.entries.pop(); // undo the append
+                }
+            }
+            return Err(e);
         }
+        Ok(())
+    }
+
+    /// Remove an entry **and persist**, rolling the removal back into memory if
+    /// the save fails (the failed save left the file intact), so memory matches
+    /// disk. A no-op for an out-of-range index.
+    pub fn remove_and_save(&mut self, idx: usize, path: &Path) -> Result<()> {
+        let Some(removed) = self.remove(idx) else {
+            return Ok(()); // nothing removed; disk already matches memory
+        };
+        if let Err(e) = self.save(path) {
+            self.entries.insert(idx, removed); // roll the removal back
+            return Err(e);
+        }
+        Ok(())
     }
 }
 
@@ -694,6 +738,76 @@ mod tests {
         );
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(&bak);
+    }
+
+    #[test]
+    fn txn_save_keeps_memory_and_disk_in_sync() {
+        let path = temp_vault_path("txn");
+        let mut v = Vault::create("m").unwrap();
+        v.upsert_and_save(None, entry("a", SecretKind::Password, "1"), &path)
+            .unwrap();
+        v.upsert_and_save(None, entry("b", SecretKind::Password, "2"), &path)
+            .unwrap();
+        v.upsert_and_save(Some(0), entry("a", SecretKind::Password, "1b"), &path)
+            .unwrap();
+        v.remove_and_save(1, &path).unwrap();
+        // In memory: a single edited entry remains.
+        assert_eq!(v.entries.len(), 1);
+        assert_eq!(v.entries[0].host, "a");
+        assert_eq!(v.entries[0].secret.as_str(), "1b");
+        // On disk: exactly what is in memory.
+        let disk = Vault::unlock(&path, "m").unwrap();
+        assert_eq!(disk.entries.len(), 1);
+        assert_eq!(disk.entries[0].host, "a");
+        assert_eq!(disk.entries[0].secret.as_str(), "1b");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_failed_save_rolls_back_the_in_memory_mutation() {
+        // A vault path whose parent is a regular FILE makes every save fail
+        // deterministically and cross-platform (you cannot create the temp file
+        // inside a file), so we can prove the rollback without mocking I/O.
+        let blocker = temp_vault_path("rollback-blocker");
+        fs::write(&blocker, b"x").unwrap();
+        let bad_path = blocker.join("vault.json");
+
+        let mut v = Vault::create("m").unwrap();
+        v.upsert(None, entry("a", SecretKind::Password, "1"));
+        v.upsert(None, entry("b", SecretKind::Password, "2"));
+        let baseline = 2;
+
+        // A failed ADD must not leave the appended entry behind.
+        assert!(
+            v.upsert_and_save(None, entry("c", SecretKind::Password, "3"), &bad_path)
+                .is_err()
+        );
+        assert_eq!(v.entries.len(), baseline, "failed add must roll back");
+        assert!(v.entries.iter().all(|e| e.host != "c"));
+
+        // A failed EDIT must restore the prior entry value.
+        assert!(
+            v.upsert_and_save(
+                Some(0),
+                entry("a", SecretKind::Password, "EDITED"),
+                &bad_path
+            )
+            .is_err()
+        );
+        assert_eq!(v.entries.len(), baseline);
+        assert_eq!(
+            v.entries[0].secret.as_str(),
+            "1",
+            "failed edit must roll back to the old value"
+        );
+
+        // A failed REMOVE must restore the entry at its original index.
+        assert!(v.remove_and_save(0, &bad_path).is_err());
+        assert_eq!(v.entries.len(), baseline, "failed remove must roll back");
+        assert_eq!(v.entries[0].host, "a");
+        assert_eq!(v.entries[1].host, "b");
+
+        let _ = fs::remove_file(&blocker);
     }
 
     #[test]
