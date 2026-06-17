@@ -410,7 +410,7 @@ fn decrypt(key: &[u8], nonce: &[u8], ciphertext: &[u8], aad: &[u8]) -> Result<Ze
     Ok(Zeroizing::new(pt))
 }
 
-fn random_bytes(n: usize) -> Result<Vec<u8>> {
+pub(crate) fn random_bytes(n: usize) -> Result<Vec<u8>> {
     let mut buf = vec![0u8; n];
     getrandom::getrandom(&mut buf).map_err(|e| anyhow!("rng error: {e}"))?;
     Ok(buf)
