@@ -7,6 +7,7 @@ pub mod connect;
 pub mod keys;
 pub mod known_hosts;
 pub mod liveness;
+pub mod resolve;
 pub mod vault;
 
 pub use binaries::{ssh_dir, tools};
