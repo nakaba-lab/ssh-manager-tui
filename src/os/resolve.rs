@@ -208,10 +208,11 @@ pub fn tofu_lookup_key(rc: &ResolvedConfig) -> Option<String> {
     }
 }
 
-/// True iff `lookup_key` has a PLAIN (no marker, no wildcard/negation)
-/// `known_hosts` entry in any of `files`. Uses `ssh-keygen -F` (hashed-aware).
-/// A `@revoked` / `@cert-authority` / wildcard match does NOT count — auto-fill
-/// must only arm for a host that is genuinely TOFU-pinned.
+/// True iff `lookup_key` has a genuine TOFU pin — a marker-free, non-wildcard
+/// `known_hosts` entry (plain OR HMAC-hashed) — in any of `files`. Uses
+/// `ssh-keygen -F`, so hashed entries (`HashKnownHosts yes`, the Debian/Ubuntu
+/// default) match too. A `@revoked` / `@cert-authority` / wildcard / negation
+/// match does NOT count — auto-fill must only arm for a host the user pinned.
 pub fn is_host_known(lookup_key: &str, files: &[String]) -> bool {
     files.iter().any(|file| known_in_file(lookup_key, file))
 }
@@ -234,11 +235,20 @@ fn known_in_file(lookup_key: &str, file: &str) -> bool {
         return false; // exit 1 = not found / file missing
     }
     // ssh-keygen -F prints `# Host <key> found: line N` comments plus the
-    // matching line(s). Accept only a plain, marker-free, non-wildcard entry.
+    // matching line(s). Accept only a marker-free, non-wildcard entry — but a
+    // HASHED match (the line printed as `|1|…`) is a legitimate single-host pin
+    // and MUST count, otherwise `HashKnownHosts yes` (the Debian/Ubuntu default)
+    // would silently defeat the whole gate.
     let text = String::from_utf8_lossy(&output.stdout);
     text.lines().filter_map(|l| parse_line(l, 0)).any(|e| {
         e.marker.is_none()
-            && matches!(e.host, HostSpec::Plain(ref h) if !h.contains(['*', '?', '!']))
+            && match &e.host {
+                // ssh-keygen never hashes wildcards/negations or markers (those
+                // survive in plaintext and are excluded above/here), so a
+                // marker-free hashed hit is always a genuine per-host pin.
+                HostSpec::Hashed(_) => true,
+                HostSpec::Plain(h) => !h.contains(['*', '?', '!']),
+            }
     })
 }
 
@@ -400,8 +410,10 @@ identityfile ~/.ssh/id_rsa
         std::fs::create_dir_all(&dir).unwrap();
         let kh = dir.join("known_hosts");
         let mut f = std::fs::File::create(&kh).unwrap();
-        // plain entry for good.example, a @revoked entry for bad.example,
-        // a @cert-authority wildcard for *.ca.example.
+        // A plain entry, a @revoked marker, a @cert-authority wildcard, and a
+        // plain (markerless) wildcard. The marker/wildcard lookups below use a
+        // name that actually MATCHES the pattern so `ssh-keygen -F` exits 0 and
+        // the entry reaches the marker/wildcard re-parse rejection we assert on.
         writeln!(f, "good.example ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAA").unwrap();
         writeln!(
             f,
@@ -413,6 +425,7 @@ identityfile ~/.ssh/id_rsa
             "@cert-authority *.ca.example ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICCC"
         )
         .unwrap();
+        writeln!(f, "*.wild.example ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIWWW").unwrap();
         drop(f);
         let khs = vec![kh.to_string_lossy().to_string()];
 
@@ -425,12 +438,53 @@ identityfile ~/.ssh/id_rsa
             "@revoked must not count as known"
         );
         assert!(
-            !is_host_known("ca.example", &khs),
-            "@cert-authority wildcard must not count"
+            !is_host_known("host.ca.example", &khs),
+            "@cert-authority wildcard match must not count"
+        );
+        assert!(
+            !is_host_known("host.wild.example", &khs),
+            "a plain wildcard match must not count"
         );
         assert!(
             !is_host_known("absent.example", &khs),
             "absent host is not known"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn is_known_accepts_hashed_entry() {
+        // The spec's headline workflow: on `HashKnownHosts yes` (the Debian/
+        // Ubuntu default) the pin is stored hashed. `ssh-keygen -F` still finds
+        // it and prints a `|1|…` line; the gate MUST accept that as known.
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("sshm-tofu-hashed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let kh = dir.join("known_hosts");
+        let mut f = std::fs::File::create(&kh).unwrap();
+        writeln!(f, "hashme.example ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHHH").unwrap();
+        drop(f);
+        // Hash the file in place (equivalent to HashKnownHosts yes).
+        let st = Command::new(&tools().ssh_keygen)
+            .arg("-H")
+            .arg("-f")
+            .arg(&kh)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(st.success(), "ssh-keygen -H should hash the fixture");
+        let khs = vec![kh.to_string_lossy().to_string()];
+
+        assert!(
+            is_host_known("hashme.example", &khs),
+            "a hashed but genuine pin must count as known"
+        );
+        assert!(
+            !is_host_known("absent.example", &khs),
+            "absent host is not known even in a hashed file"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
