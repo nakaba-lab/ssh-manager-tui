@@ -14,8 +14,75 @@
 // TODO(phase3): remove this once the connect path references this module.
 #![allow(dead_code)]
 
+use std::collections::HashSet;
+use std::io::{self, Read, Write};
+
+use crate::os::vault::{Secret, SecretKind};
+
 /// Length of the per-connect authentication token (256 bits).
 pub const TOKEN_LEN: usize = 32;
+
+/// Upper bound on a framed field, to cap allocation from a hostile length.
+const MAX_FIELD: u32 = 64 * 1024;
+
+fn write_lp(w: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
+    let len: u32 = bytes
+        .len()
+        .try_into()
+        .map_err(|_| io::ErrorKind::InvalidInput)?;
+    w.write_all(&len.to_le_bytes())?;
+    w.write_all(bytes)
+}
+
+fn read_lp(r: &mut impl Read) -> io::Result<Vec<u8>> {
+    let mut lenb = [0u8; 4];
+    r.read_exact(&mut lenb)?;
+    let len = u32::from_le_bytes(lenb);
+    if len > MAX_FIELD {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "field too large",
+        ));
+    }
+    let mut buf = vec![0u8; len as usize];
+    r.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+/// Helper → listener: the token then the prompt.
+pub fn write_request(w: &mut impl Write, token: &[u8; TOKEN_LEN], prompt: &str) -> io::Result<()> {
+    w.write_all(token)?;
+    write_lp(w, prompt.as_bytes())?;
+    w.flush()
+}
+
+/// Listener: read the token and prompt.
+pub fn read_request(r: &mut impl Read) -> io::Result<([u8; TOKEN_LEN], String)> {
+    let mut token = [0u8; TOKEN_LEN];
+    r.read_exact(&mut token)?;
+    let prompt = read_lp(r)?;
+    let prompt = String::from_utf8(prompt)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "prompt not UTF-8"))?;
+    Ok((token, prompt))
+}
+
+/// Listener → helper: the chosen secret (length-prefixed) or a zero-length
+/// no-match reply.
+pub fn write_reply(w: &mut impl Write, secret: Option<&str>) -> io::Result<()> {
+    write_lp(w, secret.unwrap_or("").as_bytes())?;
+    w.flush()
+}
+
+/// Helper: read the reply. A zero-length reply is `None` (send nothing).
+pub fn read_reply(r: &mut impl Read) -> io::Result<Option<String>> {
+    let bytes = read_lp(r)?;
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    let s = String::from_utf8(bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "reply not UTF-8"))?;
+    Ok(Some(s))
+}
 
 /// The shape of a prompt OpenSSH passed to the helper, decided by text only.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,10 +146,6 @@ pub struct IdentityTokens {
     pub uid: String,                     // %i
     pub localhost: String,               // %l / %L
 }
-
-use std::collections::HashSet;
-
-use crate::os::vault::{Secret, SecretKind};
 
 /// Expand one raw IdentityFile entry (tilde + `%`-tokens) to an absolute path.
 /// Returns `None` (fail-safe: do not auto-fill) for any unhandled token, an
@@ -425,5 +488,44 @@ mod tests {
             cs.decide("Enter passphrase for key '/home/u/.ssh/id_ed25519': "),
             None
         );
+    }
+
+    use super::{TOKEN_LEN, read_reply, read_request, write_reply, write_request};
+    use std::io::Cursor;
+
+    #[test]
+    fn request_roundtrips() {
+        let token = [7u8; TOKEN_LEN];
+        let mut buf = Vec::new();
+        write_request(&mut buf, &token, "deploy@web1's password: ").unwrap();
+        let mut cur = Cursor::new(buf);
+        let (got_token, got_prompt) = read_request(&mut cur).unwrap();
+        assert_eq!(got_token, token);
+        assert_eq!(got_prompt, "deploy@web1's password: ");
+    }
+
+    #[test]
+    fn reply_roundtrips_secret_and_empty() {
+        // A served secret.
+        let mut buf = Vec::new();
+        write_reply(&mut buf, Some("hunter2")).unwrap();
+        let mut cur = Cursor::new(buf);
+        assert_eq!(read_reply(&mut cur).unwrap().as_deref(), Some("hunter2"));
+
+        // A zero-length (no-match) reply.
+        let mut buf = Vec::new();
+        write_reply(&mut buf, None).unwrap();
+        let mut cur = Cursor::new(buf);
+        assert_eq!(read_reply(&mut cur).unwrap(), None);
+    }
+
+    #[test]
+    fn read_request_rejects_oversized_prompt() {
+        // length prefix claims a huge prompt -> error, not allocation blowup.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&[0u8; TOKEN_LEN]);
+        buf.extend_from_slice(&u32::MAX.to_le_bytes());
+        let mut cur = Cursor::new(buf);
+        assert!(read_request(&mut cur).is_err());
     }
 }
