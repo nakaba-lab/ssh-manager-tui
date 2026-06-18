@@ -345,6 +345,31 @@ fn parse_token_hex(s: &str) -> Option<Token> {
     Some(out)
 }
 
+/// Strip a Windows verbatim path prefix so the result is a plain path that
+/// Win32-OpenSSH's `CreateProcessW` accepts as argv0: `\\?\C:\…` -> `C:\…`,
+/// `\\?\UNC\server\share\…` -> `\\server\share\…`. Any other string passes
+/// through unchanged. Operates on the string form (not `Path::components`) so it
+/// is unit-testable with synthetic inputs on every platform (the Linux gate runs
+/// these too). `current_exe()` emits the verbatim prefix for installs at a path
+/// longer than 260 chars, which OpenSSH would otherwise reject.
+pub fn strip_verbatim_prefix(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{rest}");
+    }
+    if let Some(rest) = path.strip_prefix(r"\\?\") {
+        return rest.to_string();
+    }
+    path.to_string()
+}
+
+/// The absolute, prefix-normalized path to the running sshm executable, for the
+/// `SSH_ASKPASS` env var. `current_exe()` already calls `GetModuleFileNameW`
+/// internally, so the only fix-up needed is the verbatim-prefix strip.
+pub fn askpass_exe_path() -> io::Result<String> {
+    let exe = std::env::current_exe()?;
+    Ok(strip_verbatim_prefix(&exe.to_string_lossy()))
+}
+
 /// The askpass helper body. `get_env` abstracts environment lookup for testing.
 ///
 /// Returns:
@@ -841,6 +866,28 @@ mod tests {
         // OpenSSH reads <=1023 bytes; refuse longer rather than truncate.
         assert!(!secret_is_one_line(&"x".repeat(1024)));
         assert!(secret_is_one_line(&"x".repeat(1023)));
+    }
+
+    #[test]
+    fn strips_verbatim_disk_and_unc_prefixes() {
+        use super::strip_verbatim_prefix;
+        assert_eq!(
+            strip_verbatim_prefix(r"\\?\C:\Users\me\sshm.exe"),
+            r"C:\Users\me\sshm.exe"
+        );
+        assert_eq!(
+            strip_verbatim_prefix(r"\\?\UNC\server\share\sshm.exe"),
+            r"\\server\share\sshm.exe"
+        );
+        // ordinary paths pass through unchanged
+        assert_eq!(
+            strip_verbatim_prefix(r"C:\Users\me\sshm.exe"),
+            r"C:\Users\me\sshm.exe"
+        );
+        assert_eq!(
+            strip_verbatim_prefix("/usr/local/bin/sshm"),
+            "/usr/local/bin/sshm"
+        );
     }
 
     #[test]
