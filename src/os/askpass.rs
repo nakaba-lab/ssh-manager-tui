@@ -310,13 +310,52 @@ fn paths_equal(expected: &str, from_prompt: &str) -> bool {
     norm(expected) == norm(from_prompt)
 }
 
+/// Constant-time equality for the per-connect token (length is fixed).
+pub fn ct_eq(a: &[u8; TOKEN_LEN], b: &[u8; TOKEN_LEN]) -> bool {
+    let mut diff = 0u8;
+    for i in 0..TOKEN_LEN {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
+}
+
+/// True if `s` can be delivered verbatim over OpenSSH's line-oriented askpass
+/// channel: no `\r`/`\n` (OpenSSH truncates at the first one) and within its
+/// 1023-byte read cap. The helper refuses to serve a secret that fails this.
+pub fn secret_is_one_line(s: &str) -> bool {
+    s.len() <= 1023 && !s.contains(['\r', '\n'])
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Classified, IdentityTokens, classify, expand_identity_path};
+    use super::{
+        Classified, IdentityTokens, TOKEN_LEN, classify, ct_eq, expand_identity_path,
+        secret_is_one_line,
+    };
 
     #[test]
     fn module_compiles() {
         assert_eq!(super::TOKEN_LEN, 32);
+    }
+
+    #[test]
+    fn ct_eq_matches_and_differs() {
+        let a = [9u8; TOKEN_LEN];
+        let mut b = a;
+        assert!(ct_eq(&a, &b));
+        b[TOKEN_LEN - 1] ^= 1;
+        assert!(!ct_eq(&a, &b));
+    }
+
+    #[test]
+    fn one_line_guard() {
+        assert!(secret_is_one_line("hunter2"));
+        assert!(secret_is_one_line("with spaces and ünïçødé"));
+        assert!(!secret_is_one_line("two\nlines"));
+        assert!(!secret_is_one_line("carriage\rreturn"));
+        // OpenSSH reads <=1023 bytes; refuse longer rather than truncate.
+        assert!(!secret_is_one_line(&"x".repeat(1024)));
+        assert!(secret_is_one_line(&"x".repeat(1023)));
     }
 
     #[test]
@@ -490,7 +529,7 @@ mod tests {
         );
     }
 
-    use super::{TOKEN_LEN, read_reply, read_request, write_reply, write_request};
+    use super::{read_reply, read_request, write_reply, write_request};
     use std::io::Cursor;
 
     #[test]
