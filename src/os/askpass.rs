@@ -387,6 +387,26 @@ where
     }
 }
 
+/// The terminal result of a connect's auto-fill, surfaced to the UI (Phase 3/4)
+/// and used as the detached-listener reap signal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outcome {
+    Served { kind: SecretKind },
+    Declined { reason: DeclineReason },
+    TimedOut,
+    NotAttempted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeclineReason {
+    /// The user declined the password-confirm modal.
+    PasswordDeclined,
+    /// The server used keyboard-interactive, so a stored password was withheld.
+    KeyboardInteractive,
+    /// Channel/token/identity mismatch or an unclassifiable prompt.
+    NoMatch,
+}
+
 #[cfg(unix)]
 mod chan {
     use super::*;
