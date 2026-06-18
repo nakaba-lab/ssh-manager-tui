@@ -15,6 +15,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use super::binaries::tools;
+use super::known_hosts::{HostSpec, parse_line};
 
 /// The effective connection identity for an alias, parsed from `ssh -G`.
 /// `ssh -G` lowercases keys and leaves IdentityFile `~`/`%`-tokens UNexpanded.
@@ -193,6 +194,40 @@ pub fn tofu_lookup_key(rc: &ResolvedConfig) -> Option<String> {
     }
 }
 
+/// True iff `lookup_key` has a PLAIN (no marker, no wildcard/negation)
+/// `known_hosts` entry in any of `files`. Uses `ssh-keygen -F` (hashed-aware).
+/// A `@revoked` / `@cert-authority` / wildcard match does NOT count — auto-fill
+/// must only arm for a host that is genuinely TOFU-pinned.
+pub fn is_host_known(lookup_key: &str, files: &[String]) -> bool {
+    files.iter().any(|file| known_in_file(lookup_key, file))
+}
+
+fn known_in_file(lookup_key: &str, file: &str) -> bool {
+    let output = match Command::new(&tools().ssh_keygen)
+        .arg("-F")
+        .arg(lookup_key)
+        .arg("-f")
+        .arg(file)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+    {
+        Ok(o) => o,
+        Err(_) => return false,
+    };
+    if !output.status.success() {
+        return false; // exit 1 = not found / file missing
+    }
+    // ssh-keygen -F prints `# Host <key> found: line N` comments plus the
+    // matching line(s). Accept only a plain, marker-free, non-wildcard entry.
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.lines().filter_map(|l| parse_line(l, 0)).any(|e| {
+        e.marker.is_none()
+            && matches!(e.host, HostSpec::Plain(ref h) if !h.contains(['*', '?', '!']))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,5 +369,48 @@ identityfile ~/.ssh/id_rsa
             ..Default::default()
         };
         assert_eq!(tofu_lookup_key(&no_port).as_deref(), Some("h")); // missing port = default 22
+    }
+
+    #[test]
+    fn is_known_accepts_plain_rejects_marker_and_absent() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("sshm-tofu-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let kh = dir.join("known_hosts");
+        let mut f = std::fs::File::create(&kh).unwrap();
+        // plain entry for good.example, a @revoked entry for bad.example,
+        // a @cert-authority wildcard for *.ca.example.
+        writeln!(f, "good.example ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAA").unwrap();
+        writeln!(
+            f,
+            "@revoked bad.example ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBBB"
+        )
+        .unwrap();
+        writeln!(
+            f,
+            "@cert-authority *.ca.example ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAICCC"
+        )
+        .unwrap();
+        drop(f);
+        let khs = vec![kh.to_string_lossy().to_string()];
+
+        assert!(
+            is_host_known("good.example", &khs),
+            "plain entry should be known"
+        );
+        assert!(
+            !is_host_known("bad.example", &khs),
+            "@revoked must not count as known"
+        );
+        assert!(
+            !is_host_known("ca.example", &khs),
+            "@cert-authority wildcard must not count"
+        );
+        assert!(
+            !is_host_known("absent.example", &khs),
+            "absent host is not known"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
