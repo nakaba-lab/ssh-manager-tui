@@ -10,6 +10,12 @@
 // TODO(phase3): remove this once the connect path references this module.
 #![allow(dead_code)]
 
+use std::io;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+use super::binaries::tools;
+
 /// The effective connection identity for an alias, parsed from `ssh -G`.
 /// `ssh -G` lowercases keys and leaves IdentityFile `~`/`%`-tokens UNexpanded.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -103,6 +109,51 @@ pub fn parse_ssh_g_output(dump: &str) -> ResolvedConfig {
     rc
 }
 
+/// Upper bound on how long the `ssh -G` resolve may take before we kill it and
+/// degrade to manual entry. Sized for the common case; a hanging `Match exec`
+/// or slow DNS must not wedge the caller.
+pub const SSH_G_RESOLVE_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Run `ssh -G <alias>` (default config, matching the connect path) on a bounded
+/// subprocess and parse the result. `stdin` is nulled so it can never block on a
+/// prompt; on timeout the child is killed and an error returned (caller degrades
+/// to manual entry / no auto-fill).
+pub fn resolve_config(alias: &str) -> io::Result<ResolvedConfig> {
+    run_ssh_g(&[alias.to_string()])
+}
+
+/// Shared bounded runner. `extra` is the argument list AFTER `-G` (production
+/// passes just the alias; tests may prepend `-F <fixture>`).
+fn run_ssh_g(extra: &[String]) -> io::Result<ResolvedConfig> {
+    let mut child = Command::new(&tools().ssh)
+        .arg("-G")
+        .args(extra)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+
+    let start = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            if !status.success() {
+                return Err(io::Error::other("ssh -G exited non-zero"));
+            }
+            break;
+        }
+        if start.elapsed() >= SSH_G_RESOLVE_TIMEOUT {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "ssh -G timed out"));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let output = child.wait_with_output()?;
+    let dump = String::from_utf8_lossy(&output.stdout);
+    Ok(parse_ssh_g_output(&dump))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,5 +229,19 @@ identityfile ~/.ssh/id_rsa
     fn ignores_blank_and_keyless_lines() {
         let rc = parse_ssh_g_output("\nhostname h\nbogusline\n   \n");
         assert_eq!(rc.hostname.as_deref(), Some("h"));
+    }
+
+    #[test]
+    fn resolve_config_returns_a_hostname_for_any_alias() {
+        // `ssh -G <alias>` always succeeds (an unknown alias resolves hostname to
+        // itself). Requires ssh on PATH (CLAUDE.md guarantees it; CI has it).
+        let rc = resolve_config("sshm-test-nonexistent-alias")
+            .expect("ssh -G should succeed for any alias");
+        // hostname defaults to the alias when not in config.
+        assert_eq!(rc.hostname.as_deref(), Some("sshm-test-nonexistent-alias"));
+        // ssh -G always emits at least one identityfile default.
+        assert!(!rc.identity_files.is_empty());
+        // user defaults to the OS account.
+        assert!(rc.user.is_some());
     }
 }
