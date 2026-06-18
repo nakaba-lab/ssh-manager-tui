@@ -178,7 +178,15 @@ pub fn has_match_exec(config_text: &str) -> bool {
         if line.starts_with('#') {
             continue;
         }
-        let mut words = line.split_whitespace();
+        // ssh_config accepts `=` (with optional surrounding space) as the
+        // keyword/argument separator, so `Match=exec`, `Match= exec`, and
+        // `exec="cmd"` are all valid forms a plain whitespace split would miss
+        // (verified: `Match=exec "cmd"` makes `ssh -G` run the predicate).
+        // Normalize `=` to space before scanning. Over-detection only costs a
+        // conservative skip of `ssh -G` (fail-safe); a miss would let `ssh -G`
+        // execute attacker-influenced shell during connect-time resolution.
+        let normalized = line.replace('=', " ");
+        let mut words = normalized.split_whitespace();
         if !words
             .next()
             .is_some_and(|w| w.eq_ignore_ascii_case("Match"))
@@ -358,6 +366,17 @@ identityfile ~/.ssh/id_rsa
         ));
         assert!(has_match_exec("match   Exec  uptime\n")); // case/space insensitive
         assert!(has_match_exec("Host a\nMatch host b exec \"cmd\"\n")); // exec as a later criterion
+    }
+
+    #[test]
+    fn detects_match_exec_with_equals_separator() {
+        // `=` is a valid keyword/argument separator in ssh_config; each of these
+        // forms makes `ssh -G` execute the predicate, so the pre-scan must catch
+        // them even though a plain whitespace split would not.
+        assert!(has_match_exec("Match=exec \"cmd\"\n"));
+        assert!(has_match_exec("Match= exec \"cmd\"\n"));
+        assert!(has_match_exec("Match exec=\"cmd\"\n"));
+        assert!(has_match_exec("Match=exec=\"cmd\"\n"));
     }
 
     #[test]
