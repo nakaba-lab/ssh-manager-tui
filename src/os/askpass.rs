@@ -326,6 +326,87 @@ pub fn secret_is_one_line(s: &str) -> bool {
     s.len() <= 1023 && !s.contains(['\r', '\n'])
 }
 
+/// The per-connect authentication token, carried in the env to the helper.
+pub type Token = [u8; TOKEN_LEN];
+
+#[cfg(unix)]
+mod chan {
+    use super::*;
+    use std::os::unix::fs::DirBuilderExt;
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::path::PathBuf;
+
+    /// A user-scoped channel: a unix socket inside a 0700 directory.
+    pub struct Listener {
+        inner: UnixListener,
+        path: PathBuf,
+        dir: PathBuf,
+        token: Token,
+    }
+
+    impl Listener {
+        pub fn bind(token: Token) -> io::Result<Listener> {
+            let base = std::env::temp_dir();
+            let suffix =
+                crate::os::vault::random_bytes(8).map_err(|e| io::Error::other(e.to_string()))?;
+            let hex: String = suffix.iter().map(|b| format!("{b:02x}")).collect();
+            let dir = base.join(format!("sshm-askpass-{}-{hex}", std::process::id()));
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .recursive(false)
+                .create(&dir)?;
+            let path = dir.join("sock");
+            let inner = UnixListener::bind(&path)?;
+            Ok(Listener {
+                inner,
+                path,
+                dir,
+                token,
+            })
+        }
+
+        /// The address string passed to the helper via SSHM_ASKPASS_CHANNEL.
+        pub fn address(&self) -> &str {
+            self.path.to_str().unwrap_or("")
+        }
+
+        /// Accept one client, verify the token, and serve at most one secret.
+        /// Returns Ok(true) if a secret (or a deliberate no-match) was served to
+        /// a token-valid client, Ok(false) if the token mismatched.
+        pub fn serve_one(&self, secrets: &mut ConnectSecrets) -> io::Result<bool> {
+            let (mut conn, _) = self.inner.accept()?;
+            let (token, prompt) = read_request(&mut conn)?;
+            if !ct_eq(&token, &self.token) {
+                return Ok(false); // drop without reply
+            }
+            let secret = secrets.decide(&prompt);
+            // Refuse a secret that cannot survive the line channel.
+            let to_send = match secret {
+                Some(s) if secret_is_one_line(&s) => Some(s),
+                _ => None,
+            };
+            write_reply(&mut conn, to_send.as_deref())?;
+            Ok(true)
+        }
+    }
+
+    impl Drop for Listener {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+            let _ = std::fs::remove_dir(&self.dir);
+        }
+    }
+
+    /// Helper side: connect to the listener's address.
+    pub fn connect_client(addr: &str) -> io::Result<UnixStream> {
+        UnixStream::connect(addr)
+    }
+}
+
+#[cfg(unix)]
+#[allow(unused_imports)]
+pub use chan::{Listener, connect_client};
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -566,5 +647,72 @@ mod tests {
         buf.extend_from_slice(&u32::MAX.to_le_bytes());
         let mut cur = Cursor::new(buf);
         assert!(read_request(&mut cur).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_channel_serves_one_request() {
+        use super::{
+            ConnectSecrets, Listener, ResolvedIdentity, TOKEN_LEN, connect_client, read_reply,
+            write_request,
+        };
+        use crate::os::vault::Secret;
+        use std::thread;
+
+        let token = [3u8; TOKEN_LEN];
+        let listener = Listener::bind(token).unwrap();
+        let addr = listener.address().to_string();
+
+        // Listener side: serve exactly one request from a background thread.
+        let handle = thread::spawn(move || {
+            let ident = ResolvedIdentity {
+                user: "deploy".into(),
+                host: "web1".into(),
+                host_key_alias: None,
+                identity_paths: vec![],
+            };
+            let mut secrets = ConnectSecrets::new(ident, Some(Secret::from("hunter2")), None);
+            listener.serve_one(&mut secrets).unwrap();
+        });
+
+        // Client side: present the token + prompt, read the reply.
+        let mut conn = connect_client(&addr).unwrap();
+        write_request(&mut conn, &token, "deploy@web1's password: ").unwrap();
+        let reply = read_reply(&mut conn).unwrap();
+        assert_eq!(reply.as_deref(), Some("hunter2"));
+
+        handle.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_channel_rejects_bad_token() {
+        use super::{
+            ConnectSecrets, Listener, ResolvedIdentity, TOKEN_LEN, connect_client, read_reply,
+            write_request,
+        };
+        use crate::os::vault::Secret;
+        use std::thread;
+
+        let token = [3u8; TOKEN_LEN];
+        let listener = Listener::bind(token).unwrap();
+        let addr = listener.address().to_string();
+        let handle = thread::spawn(move || {
+            let ident = ResolvedIdentity {
+                user: "deploy".into(),
+                host: "web1".into(),
+                host_key_alias: None,
+                identity_paths: vec![],
+            };
+            let mut secrets = ConnectSecrets::new(ident, Some(Secret::from("hunter2")), None);
+            // serve_one returns Ok(false) when the token mismatched.
+            let served = listener.serve_one(&mut secrets).unwrap();
+            assert!(!served);
+        });
+        let mut conn = connect_client(&addr).unwrap();
+        write_request(&mut conn, &[0u8; TOKEN_LEN], "deploy@web1's password: ").unwrap();
+        // No reply on bad token -> read_reply sees EOF/error.
+        let _ = read_reply(&mut conn);
+        handle.join().unwrap();
     }
 }
