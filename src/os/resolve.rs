@@ -154,6 +154,29 @@ fn run_ssh_g(extra: &[String]) -> io::Result<ResolvedConfig> {
     Ok(parse_ssh_g_output(&dump))
 }
 
+/// True if the raw SSH config text contains a `Match` line with an `exec`
+/// criterion. Conservative + syntax-only: it never runs anything. Used to skip
+/// `ssh -G` entirely for such hosts (which would otherwise execute the predicate).
+pub fn has_match_exec(config_text: &str) -> bool {
+    for line in config_text.lines() {
+        let line = line.trim_start();
+        if line.starts_with('#') {
+            continue;
+        }
+        let mut words = line.split_whitespace();
+        if !words
+            .next()
+            .is_some_and(|w| w.eq_ignore_ascii_case("Match"))
+        {
+            continue;
+        }
+        if words.any(|w| w.eq_ignore_ascii_case("exec")) {
+            return true;
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,5 +266,22 @@ identityfile ~/.ssh/id_rsa
         assert!(!rc.identity_files.is_empty());
         // user defaults to the OS account.
         assert!(rc.user.is_some());
+    }
+
+    #[test]
+    fn detects_match_exec() {
+        assert!(has_match_exec(
+            "Match exec \"test -e /tmp/x\"\n  User bob\n"
+        ));
+        assert!(has_match_exec("match   Exec  uptime\n")); // case/space insensitive
+        assert!(has_match_exec("Host a\nMatch host b exec \"cmd\"\n")); // exec as a later criterion
+    }
+
+    #[test]
+    fn ignores_non_exec_match_and_comments() {
+        assert!(!has_match_exec("Match host web1\n  User bob\n"));
+        assert!(!has_match_exec("# Match exec \"cmd\"\n")); // commented out
+        assert!(!has_match_exec("Host exec-server\n  HostName x\n")); // 'exec' in a value, not a Match
+        assert!(!has_match_exec(""));
     }
 }
