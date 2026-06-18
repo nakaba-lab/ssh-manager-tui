@@ -1263,6 +1263,13 @@ fn save_vault_entry(app: &mut App, editing: Option<usize>) {
         app.toast("secret is required", true);
         return;
     }
+    // A secret with a newline/CR (or over OpenSSH's 1023-byte read cap) cannot be
+    // delivered by the connect-time auto-fill helper, so reject it at save time
+    // rather than store a value that would be silently truncated on the channel.
+    if let Err(e) = vault::reject_unservable_secret(&app.vault_entry.secret) {
+        app.toast(format!("{e}"), true);
+        return;
+    }
     let entry = VaultEntry {
         host,
         kind: app.vault_entry.kind,

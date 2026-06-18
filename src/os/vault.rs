@@ -108,6 +108,22 @@ impl<'de> Deserialize<'de> for Secret {
     }
 }
 
+/// Reject a secret that cannot be delivered over OpenSSH's line-oriented askpass
+/// channel: it must not contain `\r`/`\n` (OpenSSH truncates at the first one)
+/// and must fit OpenSSH's 1023-byte read cap. Enforced at vault-entry save time
+/// so an unservable secret never reaches the connect-time auto-fill channel.
+pub fn reject_unservable_secret(secret: &str) -> Result<()> {
+    if secret.contains(['\r', '\n']) {
+        return Err(anyhow!(
+            "secret must not contain a newline or carriage return"
+        ));
+    }
+    if secret.len() > 1023 {
+        return Err(anyhow!("secret is too long (max 1023 bytes)"));
+    }
+    Ok(())
+}
+
 /// Which kind of secret an entry holds. A host can have one of each.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum SecretKind {
@@ -344,6 +360,15 @@ impl Vault {
             Some(i) if i < self.entries.len() => self.entries[i] = entry,
             _ => self.entries.push(entry),
         }
+    }
+
+    /// All stored secrets whose `host` field equals `host` (case-sensitive — the
+    /// verbatim ssh destination). This is the connect-time *candidacy* lookup;
+    /// the listener's identity binding (`os/askpass.rs`) decides actual release.
+    // TODO(phase3): consumed by connect dispatch (connect_by_alias).
+    #[allow(dead_code)]
+    pub fn secrets_for_host(&self, host: &str) -> Vec<&VaultEntry> {
+        self.entries.iter().filter(|e| e.host == host).collect()
     }
 
     /// Remove the entry at `idx`, returning it so the caller can roll the removal
@@ -631,6 +656,31 @@ mod tests {
         // glob / negation patterns are never candidates.
         assert_eq!(match_vault_kinds(&["web*".to_string()], &entries), None);
         assert_eq!(match_vault_kinds(&["!web1".to_string()], &entries), None);
+    }
+
+    #[test]
+    fn secrets_for_host_returns_matching_kinds() {
+        let mut v = Vault::create("pw").unwrap();
+        v.upsert(None, entry("web1", SecretKind::Password, "p"));
+        v.upsert(None, entry("web1", SecretKind::Passphrase, "k"));
+        v.upsert(None, entry("db", SecretKind::Password, "d"));
+        let got = v.secrets_for_host("web1");
+        assert_eq!(got.len(), 2);
+        assert!(
+            got.iter()
+                .any(|e| e.kind == SecretKind::Password && e.secret.as_str() == "p")
+        );
+        assert!(got.iter().any(|e| e.kind == SecretKind::Passphrase));
+        assert!(v.secrets_for_host("nope").is_empty());
+    }
+
+    #[test]
+    fn secret_validation_rejects_newlines() {
+        assert!(reject_unservable_secret("ok").is_ok());
+        assert!(reject_unservable_secret("two\nlines").is_err());
+        assert!(reject_unservable_secret("cr\rret").is_err());
+        assert!(reject_unservable_secret(&"x".repeat(1024)).is_err()); // > OpenSSH 1023 cap
+        assert!(reject_unservable_secret(&"x".repeat(1023)).is_ok());
     }
 
     #[test]
