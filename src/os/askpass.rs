@@ -221,6 +221,76 @@ impl ResolvedIdentity {
     }
 }
 
+/// OS-sourced expansion inputs that `ssh -G` does not provide (`%d` home, `%u`
+/// local user, `%i` uid, `%l`/`%L` localhost). Injected so the bridge below is
+/// unit-testable; [`os_tokens`] fills them from the environment.
+#[derive(Debug, Clone)]
+pub struct OsTokens {
+    pub home: String,
+    pub local_user: String,
+    pub uid: String,
+    pub localhost: String,
+}
+
+/// Build the `ssh -G`-bound [`ResolvedIdentity`] for `host_arg` (the alias passed
+/// to ssh) from a parsed [`crate::os::resolve::ResolvedConfig`] plus the OS-sourced
+/// tokens. The IdentityFile set is the subset of `ssh -G`-reported entries that
+/// expand cleanly; an entry with an unhandled token (`%C`, `~user`, …) is dropped
+/// — fail-safe, the listener simply will not release a passphrase for it.
+pub fn resolved_identity(
+    rc: &crate::os::resolve::ResolvedConfig,
+    host_arg: &str,
+    os: &OsTokens,
+) -> ResolvedIdentity {
+    let toks = IdentityTokens {
+        home: os.home.clone(),
+        hostname: rc.hostname.clone().unwrap_or_else(|| host_arg.to_string()),
+        local_user: os.local_user.clone(),
+        remote_user: rc.user.clone().unwrap_or_default(),
+        host_key_alias: rc.host_key_alias.clone(),
+        host_arg: host_arg.to_string(),
+        port: rc.port.clone().unwrap_or_else(|| "22".into()),
+        proxy_jump_host: rc.proxy_jump.clone(),
+        uid: os.uid.clone(),
+        localhost: os.localhost.clone(),
+    };
+    let identity_paths = rc
+        .identity_files
+        .iter()
+        .filter_map(|raw| expand_identity_path(raw, &toks))
+        .collect();
+    ResolvedIdentity {
+        user: rc.user.clone().unwrap_or_default(),
+        // `ssh -G` already ASCII-lowercased hostname — the exact form the prompt
+        // carries — so do NOT re-fold it here.
+        host: rc.hostname.clone().unwrap_or_else(|| host_arg.to_string()),
+        host_key_alias: rc.host_key_alias.clone(),
+        identity_paths,
+    }
+}
+
+/// Fill [`OsTokens`] from the environment. Best-effort: a value the environment
+/// does not expose becomes empty, so an IdentityFile token that needs it fails to
+/// match (fail-safe, no auto-fill). `%i` (uid) has no portable `std` source and is
+/// left empty — a `%i`-bearing IdentityFile is rare and degrades to manual.
+pub fn os_tokens() -> OsTokens {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_default();
+    let local_user = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_default();
+    let localhost = std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .unwrap_or_default();
+    OsTokens {
+        home,
+        local_user,
+        uid: String::new(),
+        localhost,
+    }
+}
+
 /// Listener-side per-connect secret state. Holds the armed secrets, the
 /// identity to bind against, and single-shot served-state. Secrets zeroize on
 /// drop (via `Secret`).
@@ -978,6 +1048,34 @@ mod tests {
     fn unknown_token_is_fail_safe_none() {
         assert_eq!(expand_identity_path("~/.ssh/id_%C", &toks()), None);
         assert_eq!(expand_identity_path("~/.ssh/id_%z", &toks()), None);
+    }
+
+    #[test]
+    fn identity_from_resolved_config_expands_paths() {
+        use super::{OsTokens, resolved_identity};
+        use crate::os::resolve::ResolvedConfig;
+        let rc = ResolvedConfig {
+            hostname: Some("web1".into()),
+            user: Some("deploy".into()),
+            port: Some("22".into()),
+            host_key_alias: None,
+            identity_files: vec!["~/.ssh/id_ed25519".into(), "~/.ssh/id_%C".into()],
+            ..Default::default()
+        };
+        let os = OsTokens {
+            home: "/home/u".into(),
+            local_user: "u".into(),
+            uid: "1000".into(),
+            localhost: "box".into(),
+        };
+        let id = resolved_identity(&rc, "web1", &os);
+        assert_eq!(id.user, "deploy");
+        assert_eq!(id.host, "web1");
+        // the expandable path is kept; the %C path is dropped (fail-safe).
+        assert_eq!(
+            id.identity_paths,
+            vec!["/home/u/.ssh/id_ed25519".to_string()]
+        );
     }
 
     #[test]
