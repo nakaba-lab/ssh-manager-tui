@@ -120,15 +120,29 @@ pub const SSH_G_RESOLVE_TIMEOUT: Duration = Duration::from_millis(500);
 /// prompt; on timeout the child is killed and an error returned (caller degrades
 /// to manual entry / no auto-fill).
 pub fn resolve_config(alias: &str) -> io::Result<ResolvedConfig> {
-    run_ssh_g(&[alias.to_string()])
+    // Defense against argv flag-smuggling: an alias beginning with '-' would be
+    // parsed by ssh as an option (e.g. `-oProxyCommand=...` → code execution).
+    // No legitimate SSH host alias starts with '-' (plain `ssh <alias>` could
+    // not use one either), so reject it outright rather than resolve it.
+    if alias.starts_with('-') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "alias may not start with '-'",
+        ));
+    }
+    run_ssh_g(&[], alias)
 }
 
-/// Shared bounded runner. `extra` is the argument list AFTER `-G` (production
-/// passes just the alias; tests may prepend `-F <fixture>`).
-fn run_ssh_g(extra: &[String]) -> io::Result<ResolvedConfig> {
+/// Shared bounded runner: `ssh -G <options> -- <alias>`. `options` are trusted
+/// leading flags (production passes none; tests may pass `-F <fixture>`); the
+/// untrusted `alias` always follows the `--` end-of-options sentinel so it can
+/// never be interpreted as a flag, even if an upstream caller skips validation.
+fn run_ssh_g(options: &[String], alias: &str) -> io::Result<ResolvedConfig> {
     let mut child = Command::new(&tools().ssh)
         .arg("-G")
-        .args(extra)
+        .args(options)
+        .arg("--")
+        .arg(alias)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -317,6 +331,14 @@ identityfile ~/.ssh/id_rsa
         assert!(!rc.identity_files.is_empty());
         // user defaults to the OS account.
         assert!(rc.user.is_some());
+    }
+
+    #[test]
+    fn resolve_config_rejects_leading_dash_alias() {
+        // argv flag-smuggling guard: a `-`-prefixed alias must be refused, not
+        // handed to `ssh`, where it would be parsed as an option.
+        let err = resolve_config("-oProxyCommand=evil").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 
     #[test]
