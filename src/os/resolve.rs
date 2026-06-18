@@ -178,14 +178,17 @@ pub fn has_match_exec(config_text: &str) -> bool {
         if line.starts_with('#') {
             continue;
         }
-        // ssh_config accepts `=` (with optional surrounding space) as the
-        // keyword/argument separator, so `Match=exec`, `Match= exec`, and
-        // `exec="cmd"` are all valid forms a plain whitespace split would miss
-        // (verified: `Match=exec "cmd"` makes `ssh -G` run the predicate).
-        // Normalize `=` to space before scanning. Over-detection only costs a
-        // conservative skip of `ssh -G` (fail-safe); a miss would let `ssh -G`
-        // execute attacker-influenced shell during connect-time resolution.
-        let normalized = line.replace('=', " ");
+        // ssh_config splices double quotes within/around a token (`"Match"`,
+        // `Mat"ch"`, `"exec"`, `ex"ec"` all collapse to the bare keyword) and
+        // accepts `=` (with optional spaces) as the keyword/argument separator
+        // (`Match=exec`, `Match= exec`, `exec="cmd"`). Each of these makes
+        // `ssh -G` run the predicate yet evades a naive whitespace split, so
+        // remove `"` (splice) and turn `=` into a boundary before scanning.
+        // Both transforms only ADD/erase token decoration — never merge two real
+        // words — so detection can widen but never narrow. Over-detection just
+        // costs a conservative skip of `ssh -G` (fail-safe); a miss would let
+        // `ssh -G` execute attacker-influenced shell during connect resolution.
+        let normalized = line.replace('"', "").replace('=', " ");
         let mut words = normalized.split_whitespace();
         if !words
             .next()
@@ -227,6 +230,11 @@ pub fn is_host_known(lookup_key: &str, files: &[String]) -> bool {
     // that token, then coalesce the space-split words back into real files by
     // existence (a single path containing a space — e.g. a Windows home under
     // `C:\Users\First Last\` — is otherwise indistinguishable from two paths).
+    // KNOWN (fail-safe) GAP: an *explicitly-set* `GlobalKnownHostsFile` with a
+    // `~`/`%` token is dumped by `ssh -G` UNexpanded (unlike the user file), so
+    // it stat-misses and that file silently never contributes — a host pinned
+    // only there won't arm. Rare; never wrongly arms. The default global file
+    // (the `__PROGRAMDATA__` form) and all user files are handled.
     let expanded: Vec<String> = files.iter().map(|p| expand_known_hosts_path(p)).collect();
     coalesce_existing_paths(&expanded, |p| std::path::Path::new(p).exists())
         .iter()
@@ -254,6 +262,11 @@ fn expand_known_hosts_path(path: &str) -> String {
 /// files stay split. Fail-safe — a run that matches nothing degrades to single
 /// words, which `ssh-keygen -F` then stat-misses (host treated unknown). `exists`
 /// is injected so the logic is unit-testable without touching the filesystem.
+///
+/// KNOWN (fail-safe) GAP: the upstream split collapses whitespace runs, and runs
+/// are rejoined with a single space, so a path containing a *double* space or a
+/// tab won't be reconstructed and that file is skipped (host treated unknown,
+/// never wrongly armed). Single-space paths — the realistic Windows case — work.
 fn coalesce_existing_paths(words: &[String], exists: impl Fn(&str) -> bool) -> Vec<String> {
     let mut out = Vec::new();
     let mut i = 0;
@@ -428,6 +441,23 @@ identityfile ~/.ssh/id_rsa
         assert!(has_match_exec("Match= exec \"cmd\"\n"));
         assert!(has_match_exec("Match exec=\"cmd\"\n"));
         assert!(has_match_exec("Match=exec=\"cmd\"\n"));
+    }
+
+    #[test]
+    fn detects_match_exec_through_quote_splicing() {
+        // ssh_config splices double quotes, so each of these is parsed as
+        // `Match exec` and runs the predicate (verified empirically against
+        // `ssh -G` on both System32 and MSYS OpenSSH) — the pre-scan must catch
+        // them. Quote removal must SPLICE (not split), so `Mat"ch"` -> `Match`.
+        assert!(has_match_exec("\"Match\" exec \"cmd\"\n"));
+        assert!(has_match_exec("Match \"exec\" \"cmd\"\n"));
+        assert!(has_match_exec("\"Match\" \"exec\" \"cmd\"\n"));
+        assert!(has_match_exec("Mat\"ch\" exec \"cmd\"\n")); // mid-token splice
+        assert!(has_match_exec("Match ex\"ec\" \"cmd\"\n")); // mid-token splice
+        assert!(has_match_exec("Match \"exec\"=\"cmd\"\n"));
+        // Two separately-quoted fragments are two tokens, NOT a splice, so this
+        // is `Match` with criteria `ex` `ec` — no exec criterion, no detection.
+        assert!(!has_match_exec("Match \"ex\" \"ec\" \"cmd\"\n"));
     }
 
     #[test]
