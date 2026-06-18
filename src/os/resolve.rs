@@ -222,7 +222,58 @@ pub fn tofu_lookup_key(rc: &ResolvedConfig) -> Option<String> {
 /// default) match too. A `@revoked` / `@cert-authority` / wildcard / negation
 /// match does NOT count — auto-fill must only arm for a host the user pinned.
 pub fn is_host_known(lookup_key: &str, files: &[String]) -> bool {
-    files.iter().any(|file| known_in_file(lookup_key, file))
+    // `ssh -G` prints the known-hosts file list with `~`/`%` already expanded but
+    // UNQUOTED, and on Windows leaves the literal `__PROGRAMDATA__` token. Expand
+    // that token, then coalesce the space-split words back into real files by
+    // existence (a single path containing a space — e.g. a Windows home under
+    // `C:\Users\First Last\` — is otherwise indistinguishable from two paths).
+    let expanded: Vec<String> = files.iter().map(|p| expand_known_hosts_path(p)).collect();
+    coalesce_existing_paths(&expanded, |p| std::path::Path::new(p).exists())
+        .iter()
+        .any(|file| known_in_file(lookup_key, file))
+}
+
+/// Expand OpenSSH-for-Windows's literal `__PROGRAMDATA__` prefix (which `ssh -G`
+/// does NOT resolve) using `program_data`. No-op for any other path or when
+/// `program_data` is unavailable. Split out as a pure fn for testability.
+fn expand_program_data(path: &str, program_data: Option<&str>) -> String {
+    const TOKEN: &str = "__PROGRAMDATA__";
+    match (path.strip_prefix(TOKEN), program_data) {
+        (Some(rest), Some(pd)) => format!("{pd}{rest}"),
+        _ => path.to_string(),
+    }
+}
+
+fn expand_known_hosts_path(path: &str) -> String {
+    expand_program_data(path, std::env::var("ProgramData").ok().as_deref())
+}
+
+/// Coalesce `ssh -G`'s whitespace-joined, UNQUOTED known-hosts file list back
+/// into real paths: greedily take the longest leading run of words that names an
+/// existing file, so a space-bearing path is rejoined while genuinely separate
+/// files stay split. Fail-safe — a run that matches nothing degrades to single
+/// words, which `ssh-keygen -F` then stat-misses (host treated unknown). `exists`
+/// is injected so the logic is unit-testable without touching the filesystem.
+fn coalesce_existing_paths(words: &[String], exists: impl Fn(&str) -> bool) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < words.len() {
+        // Longest run [i..=j] (j descending) that exists on disk.
+        match (i..words.len())
+            .rev()
+            .find(|&j| exists(&words[i..=j].join(" ")))
+        {
+            Some(j) => {
+                out.push(words[i..=j].join(" "));
+                i = j + 1;
+            }
+            None => {
+                out.push(words[i].clone());
+                i += 1;
+            }
+        }
+    }
+    out
 }
 
 fn known_in_file(lookup_key: &str, file: &str) -> bool {
@@ -420,6 +471,69 @@ identityfile ~/.ssh/id_rsa
             ..Default::default()
         };
         assert_eq!(tofu_lookup_key(&no_port).as_deref(), Some("h")); // missing port = default 22
+    }
+
+    #[test]
+    fn expand_program_data_handles_windows_token() {
+        assert_eq!(
+            expand_program_data(
+                "__PROGRAMDATA__\\ssh/ssh_known_hosts",
+                Some("C:\\ProgramData")
+            ),
+            "C:\\ProgramData\\ssh/ssh_known_hosts"
+        );
+        // a non-token path is left untouched
+        assert_eq!(
+            expand_program_data("/etc/ssh/ssh_known_hosts", Some("C:\\ProgramData")),
+            "/etc/ssh/ssh_known_hosts"
+        );
+        // token present but no ProgramData available -> untouched (fail-safe)
+        assert_eq!(
+            expand_program_data("__PROGRAMDATA__\\x", None),
+            "__PROGRAMDATA__\\x"
+        );
+    }
+
+    #[test]
+    fn coalesce_existing_paths_rejoins_spaced_and_keeps_separate_files() {
+        let present: std::collections::HashSet<&str> = [
+            "C:/Users/First Last/.ssh/known_hosts",
+            "C:/Users/First Last/.ssh/known_hosts2",
+            "/a/kh",
+            "/b/kh2",
+        ]
+        .into_iter()
+        .collect();
+        let exists = |p: &str| present.contains(p);
+
+        // Default config under a spaced home: 4 split words -> 2 real files.
+        let words = vec![
+            "C:/Users/First".to_string(),
+            "Last/.ssh/known_hosts".to_string(),
+            "C:/Users/First".to_string(),
+            "Last/.ssh/known_hosts2".to_string(),
+        ];
+        assert_eq!(
+            coalesce_existing_paths(&words, exists),
+            vec![
+                "C:/Users/First Last/.ssh/known_hosts".to_string(),
+                "C:/Users/First Last/.ssh/known_hosts2".to_string()
+            ]
+        );
+
+        // Two ordinary space-free files stay separate.
+        let words2 = vec!["/a/kh".to_string(), "/b/kh2".to_string()];
+        assert_eq!(
+            coalesce_existing_paths(&words2, exists),
+            vec!["/a/kh".to_string(), "/b/kh2".to_string()]
+        );
+
+        // Nothing exists -> degrade to single words (fail-safe), never panics.
+        let words3 = vec!["/x/missing".to_string(), "tail".to_string()];
+        assert_eq!(
+            coalesce_existing_paths(&words3, |_| false),
+            vec!["/x/missing".to_string(), "tail".to_string()]
+        );
     }
 
     #[test]
