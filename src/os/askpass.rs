@@ -407,6 +407,332 @@ mod chan {
 #[allow(unused_imports)]
 pub use chan::{Listener, connect_client};
 
+#[cfg(windows)]
+mod chan {
+    //! Windows named-pipe channel arm.
+    //!
+    //! HANDLE ownership (resolves the reuse-loop hazard): the single owned
+    //! resource is the raw `HANDLE` from `CreateNamedPipeW`, created ONCE in
+    //! `bind` and kept alive for the whole `Listener` lifetime. Keeping the same
+    //! instance preserves the `FILE_FLAG_FIRST_PIPE_INSTANCE` squat-protection,
+    //! and the handle is closed exactly once — in `Drop` via `CloseHandle`.
+    //!
+    //! I/O form (B): each `serve_one` wraps a *borrowed* `std::fs::File` around
+    //! the persistent `HANDLE` via `File::from_raw_handle`, uses it for the byte
+    //! loop (so the safe `read_request`/`write_reply` helpers apply), then
+    //! `std::mem::forget`s it so its `Drop` does NOT `CloseHandle` the
+    //! persistent instance. Only `Listener::drop` ever calls `CloseHandle`.
+
+    use super::*;
+    use std::fs::File;
+    use std::os::windows::io::FromRawHandle;
+
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, HANDLE,
+        INVALID_HANDLE_VALUE, LocalFree,
+    };
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+        SDDL_REVISION_1,
+    };
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
+        TokenUser,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_FIRST_PIPE_INSTANCE, FlushFileBuffers, PIPE_ACCESS_DUPLEX,
+    };
+    use windows_sys::Win32::System::Pipes::{
+        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_TYPE_BYTE, PIPE_WAIT,
+        WaitNamedPipeW,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    /// Default per-instance buffer hints (kernel uses these only as hints).
+    const PIPE_BUF: u32 = 4096;
+    /// `nDefaultTimeOut` for the pipe (ms); only relevant to client timeouts.
+    const PIPE_DEFAULT_TIMEOUT_MS: u32 = 5000;
+
+    /// Encode a Rust `&str` as a NUL-terminated UTF-16 wide string for Win32.
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    /// Resolve the current process user's SID and format it as an SDDL string
+    /// of the form `D:(A;;GA;;;<SID>)` — a DACL granting GENERIC_ALL to ONLY the
+    /// current user. The default named-pipe SD would grant Everyone + anonymous;
+    /// this locks the pipe to the user that created it.
+    fn current_user_sddl() -> io::Result<Vec<u16>> {
+        // SAFETY: all FFI below uses freshly-owned locals; every acquired
+        // resource (the process token, the SID string) is released before
+        // return on every path.
+        unsafe {
+            let mut token: HANDLE = std::ptr::null_mut();
+            if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // Helper so any error after the token is opened still closes it.
+            let result = current_user_sddl_with_token(token);
+            CloseHandle(token);
+            result
+        }
+    }
+
+    /// SID resolution given an already-opened process token (closed by caller).
+    ///
+    /// SAFETY: `token` must be a valid, live token handle with TOKEN_QUERY.
+    unsafe fn current_user_sddl_with_token(token: HANDLE) -> io::Result<Vec<u16>> {
+        unsafe {
+            // First call sizes the TokenUser buffer.
+            let mut needed: u32 = 0;
+            let ok = GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed);
+            // Expected to fail with ERROR_INSUFFICIENT_BUFFER and set `needed`.
+            if ok != 0 || needed == 0 {
+                let err = io::Error::last_os_error();
+                if err.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32) {
+                    return Err(err);
+                }
+            }
+            // Over-aligned backing store: the TOKEN_USER struct is read out of
+            // this buffer, which the kernel fills with a SID trailing the struct.
+            let mut buf = vec![0u8; needed as usize];
+            if GetTokenInformation(
+                token,
+                TokenUser,
+                buf.as_mut_ptr() as *mut core::ffi::c_void,
+                needed,
+                &mut needed,
+            ) == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            // The SID pointer points back into `buf`; keep `buf` alive until the
+            // SID has been stringified.
+            let token_user = &*(buf.as_ptr() as *const TOKEN_USER);
+            let sid = token_user.User.Sid;
+            if sid.is_null() {
+                return Err(io::Error::other("token user SID is null"));
+            }
+
+            let mut sid_str: windows_sys::core::PWSTR = std::ptr::null_mut();
+            if ConvertSidToStringSidW(sid, &mut sid_str) == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // Copy the SID text into an owned String, then free the API buffer.
+            let sid_owned = pwstr_to_string(sid_str);
+            LocalFree(sid_str as _);
+
+            let sddl = format!("D:(A;;GA;;;{sid_owned})");
+            Ok(wide(&sddl))
+        }
+    }
+
+    /// Copy a NUL-terminated wide string allocated by Win32 into a Rust String.
+    ///
+    /// SAFETY: `p` must be a valid, NUL-terminated UTF-16 pointer.
+    unsafe fn pwstr_to_string(p: windows_sys::core::PWSTR) -> String {
+        unsafe {
+            let mut len = 0usize;
+            while *p.add(len) != 0 {
+                len += 1;
+            }
+            let slice = std::slice::from_raw_parts(p, len);
+            String::from_utf16_lossy(slice)
+        }
+    }
+
+    pub struct Listener {
+        handle: HANDLE,           // the single owned, squat-protected instance
+        name: Vec<u16>,           // \\.\pipe\... as a wide string for clients
+        addr: String,             // the same name as UTF-8 for SSHM_ASKPASS_CHANNEL
+        token: Token,             // per-connect auth token (constant-time compared)
+        sd: PSECURITY_DESCRIPTOR, // owned; LocalFree on drop
+    }
+
+    // SAFETY: the HANDLE is owned solely by this Listener and only touched on
+    // the listener thread; the security descriptor is likewise owned here.
+    unsafe impl Send for Listener {}
+
+    impl Listener {
+        pub fn bind(token: Token) -> io::Result<Listener> {
+            // 1. Random, unpredictable name with >=128 bits of entropy.
+            let rnd =
+                crate::os::vault::random_bytes(16).map_err(|e| io::Error::other(e.to_string()))?;
+            let hex: String = rnd.iter().map(|b| format!("{b:02x}")).collect();
+            let addr = format!(r"\\.\pipe\sshm-askpass-{}-{hex}", std::process::id());
+            let name = wide(&addr);
+
+            // 2. SID-only DACL via SDDL -> PSECURITY_DESCRIPTOR.
+            let sddl = current_user_sddl()?;
+            let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+            // SAFETY: `sddl` is a valid NUL-terminated wide string; `sd` is an
+            // out-param. On success the kernel allocates an SD freed in Drop.
+            let sd_ok = unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    sddl.as_ptr(),
+                    SDDL_REVISION_1,
+                    &mut sd,
+                    std::ptr::null_mut(),
+                )
+            };
+            if sd_ok == 0 {
+                return Err(io::Error::last_os_error());
+            }
+
+            let sa = SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: sd,
+                bInheritHandle: 0,
+            };
+
+            // 3. Create the single squat-protected instance.
+            // SAFETY: `name` is a valid NUL-terminated wide string and `sa`
+            // outlives the call. On failure the SD is freed before returning.
+            let handle = unsafe {
+                CreateNamedPipeW(
+                    name.as_ptr(),
+                    PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                    PIPE_TYPE_BYTE | PIPE_WAIT,
+                    1, // nMaxInstances: exactly one
+                    PIPE_BUF,
+                    PIPE_BUF,
+                    PIPE_DEFAULT_TIMEOUT_MS,
+                    &sa,
+                )
+            };
+            if handle == INVALID_HANDLE_VALUE || handle.is_null() {
+                let err = io::Error::last_os_error();
+                // SAFETY: `sd` is the SD we just allocated and have not freed.
+                unsafe {
+                    LocalFree(sd as _);
+                }
+                return Err(err);
+            }
+
+            Ok(Listener {
+                handle,
+                name,
+                addr,
+                token,
+                sd,
+            })
+        }
+
+        /// The address string passed to the helper via SSHM_ASKPASS_CHANNEL.
+        pub fn address(&self) -> &str {
+            &self.addr
+        }
+
+        /// Accept one client over the persistent instance, verify the token, and
+        /// serve at most one secret. Returns Ok(true) for a token-valid client
+        /// (secret or deliberate no-match served), Ok(false) on token mismatch.
+        /// The same handle is reused for the next client after DisconnectNamedPipe.
+        pub fn serve_one(&self, secrets: &mut ConnectSecrets) -> io::Result<bool> {
+            // Wait for a client to connect to the persistent instance.
+            // SAFETY: `self.handle` is the live, owned pipe instance.
+            let connected = unsafe { ConnectNamedPipe(self.handle, std::ptr::null_mut()) };
+            if connected == 0 {
+                let err = io::Error::last_os_error();
+                // A client that connected between CreateNamedPipe and
+                // ConnectNamedPipe surfaces as ERROR_PIPE_CONNECTED — success.
+                if err.raw_os_error() != Some(ERROR_PIPE_CONNECTED as i32) {
+                    return Err(err);
+                }
+            }
+
+            // Borrow the persistent HANDLE as a File for the byte loop WITHOUT
+            // taking ownership: mem::forget below stops its Drop from closing it.
+            // SAFETY: the handle is valid and exclusively owned by self; we never
+            // let this File's Drop run, so CloseHandle happens only in Listener::drop.
+            let mut io = unsafe { File::from_raw_handle(self.handle as _) };
+
+            // Run the connection through the safe wire protocol. We must NOT
+            // early-return while `io` is live without forgetting it, or its Drop
+            // would CloseHandle the persistent instance — so capture the result.
+            let result = (|| -> io::Result<bool> {
+                let (token, prompt) = read_request(&mut io)?;
+                if !ct_eq(&token, &self.token) {
+                    return Ok(false); // drop without reply
+                }
+                let secret = secrets.decide(&prompt);
+                // Refuse a secret that cannot survive the line channel.
+                let to_send = match secret {
+                    Some(s) if secret_is_one_line(&s) => Some(s),
+                    _ => None,
+                };
+                write_reply(&mut io, to_send.as_deref())?;
+                Ok(true)
+            })();
+
+            // Relinquish the borrowed File without closing the handle.
+            std::mem::forget(io);
+
+            // If we replied, block until the client has drained the reply before
+            // disconnecting — DisconnectNamedPipe discards un-read pipe data, so
+            // a premature disconnect makes the client's read see ERROR_PIPE_NOT_CONNECTED.
+            // SAFETY: same persistent handle.
+            if matches!(result, Ok(true)) {
+                unsafe {
+                    FlushFileBuffers(self.handle);
+                }
+            }
+
+            // Ready the instance for the next client regardless of outcome.
+            // SAFETY: same persistent handle.
+            unsafe {
+                DisconnectNamedPipe(self.handle);
+            }
+
+            result
+        }
+    }
+
+    impl Drop for Listener {
+        fn drop(&mut self) {
+            // SAFETY: handle/sd are owned solely by self and closed once here.
+            unsafe {
+                if !self.handle.is_null() && self.handle != INVALID_HANDLE_VALUE {
+                    DisconnectNamedPipe(self.handle);
+                    CloseHandle(self.handle);
+                }
+                if !self.sd.is_null() {
+                    LocalFree(self.sd as _);
+                }
+            }
+            // `name` is just a Vec<u16>; nothing to free.
+            let _ = &self.name;
+        }
+    }
+
+    /// Helper side: connect to the listener's named pipe. A byte-mode pipe path
+    /// opens as an ordinary file handle. ERROR_PIPE_BUSY (all instances busy) is
+    /// retried briefly via WaitNamedPipeW so the test connects reliably.
+    pub fn connect_client(addr: &str) -> io::Result<std::fs::File> {
+        use std::fs::OpenOptions;
+        let name = wide(addr);
+        // A few short waits cover the window between one client disconnecting and
+        // the listener's DisconnectNamedPipe/ConnectNamedPipe readying the instance.
+        for _ in 0..50 {
+            match OpenOptions::new().read(true).write(true).open(addr) {
+                Ok(f) => return Ok(f),
+                Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) => {
+                    // SAFETY: `name` is a valid NUL-terminated wide string.
+                    unsafe {
+                        WaitNamedPipeW(name.as_ptr(), 200);
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        // Final attempt; surface whatever error it yields.
+        OpenOptions::new().read(true).write(true).open(addr)
+    }
+}
+
+#[cfg(windows)]
+#[allow(unused_imports)]
+pub use chan::{Listener, connect_client};
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -713,6 +1039,54 @@ mod tests {
         write_request(&mut conn, &[0u8; TOKEN_LEN], "deploy@web1's password: ").unwrap();
         // No reply on bad token -> read_reply sees EOF/error.
         let _ = read_reply(&mut conn);
+        handle.join().unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_channel_serves_two_sequential_requests() {
+        use super::{
+            ConnectSecrets, Listener, ResolvedIdentity, TOKEN_LEN, connect_client, read_reply,
+            write_request,
+        };
+        use crate::os::vault::Secret;
+        use std::thread;
+
+        let token = [5u8; TOKEN_LEN];
+        let listener = Listener::bind(token).unwrap();
+        let addr = listener.address().to_string();
+
+        let handle = thread::spawn(move || {
+            let ident = ResolvedIdentity {
+                user: "deploy".into(),
+                host: "web1".into(),
+                host_key_alias: None,
+                identity_paths: vec!["C:/Users/u/.ssh/id_ed25519".into()],
+            };
+            let mut secrets = ConnectSecrets::new(
+                ident,
+                Some(Secret::from("hunter2")),
+                Some(Secret::from("pp")),
+            );
+            // Serve two sequential clients over the SAME persistent instance.
+            listener.serve_one(&mut secrets).unwrap();
+            listener.serve_one(&mut secrets).unwrap();
+        });
+
+        let mut c1 = connect_client(&addr).unwrap();
+        write_request(&mut c1, &token, "deploy@web1's password: ").unwrap();
+        assert_eq!(read_reply(&mut c1).unwrap().as_deref(), Some("hunter2"));
+        drop(c1);
+
+        let mut c2 = connect_client(&addr).unwrap();
+        write_request(
+            &mut c2,
+            &token,
+            "Enter passphrase for key 'C:/Users/u/.ssh/id_ed25519': ",
+        )
+        .unwrap();
+        assert_eq!(read_reply(&mut c2).unwrap().as_deref(), Some("pp"));
+
         handle.join().unwrap();
     }
 }
