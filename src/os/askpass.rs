@@ -329,6 +329,64 @@ pub fn secret_is_one_line(s: &str) -> bool {
 /// The per-connect authentication token, carried in the env to the helper.
 pub type Token = [u8; TOKEN_LEN];
 
+/// Env var carrying the channel address; its PRESENCE selects askpass mode.
+pub const CHANNEL_ENV: &str = "SSHM_ASKPASS_CHANNEL";
+/// Env var carrying the per-connect token (hex).
+pub const TOKEN_ENV: &str = "SSHM_ASKPASS_TOKEN";
+
+fn parse_token_hex(s: &str) -> Option<Token> {
+    if s.len() != TOKEN_LEN * 2 {
+        return None;
+    }
+    let mut out = [0u8; TOKEN_LEN];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+/// The askpass helper body. `get_env` abstracts environment lookup for testing.
+///
+/// Returns:
+/// - `None` — not in askpass mode (no `SSHM_ASKPASS_CHANNEL`); the caller should
+///   continue normal CLI parsing.
+/// - `Some(bytes)` — askpass mode succeeded; print `bytes` to stdout and exit 0.
+///   (Bytes already include the single trailing `\n`.)
+/// - `Some(empty)` is never returned; a no-match/error yields `Some(Vec::new())`
+///   meaning "exit non-zero, no stdout" — the caller distinguishes by emptiness.
+///
+/// Contract for the caller (Phase 3 main.rs): if this returns `Some(b)` with
+/// `b` non-empty, write `b` to stdout and exit 0; if `Some(b)` empty, exit
+/// non-zero with no stdout; if `None`, fall through to normal arg parsing.
+pub fn run_helper<F>(prompt: Option<String>, get_env: F) -> Option<Vec<u8>>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let addr = get_env(CHANNEL_ENV)?; // PRESENCE selects askpass mode
+    // From here we are committed to askpass mode: always Some(...), never None.
+    let fail = || Some(Vec::new());
+
+    let Some(prompt) = prompt else { return fail() };
+    let Some(token) = get_env(TOKEN_ENV).as_deref().and_then(parse_token_hex) else {
+        return fail();
+    };
+
+    let result = (|| -> io::Result<Option<String>> {
+        let mut conn = connect_client(&addr)?;
+        write_request(&mut conn, &token, &prompt)?;
+        read_reply(&mut conn)
+    })();
+
+    match result {
+        Ok(Some(secret)) if secret_is_one_line(&secret) => {
+            let mut bytes = secret.into_bytes();
+            bytes.push(b'\n');
+            Some(bytes)
+        }
+        _ => fail(),
+    }
+}
+
 #[cfg(unix)]
 mod chan {
     use super::*;
@@ -1088,5 +1146,49 @@ mod tests {
         assert_eq!(read_reply(&mut c2).unwrap().as_deref(), Some("pp"));
 
         handle.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn helper_prints_served_secret() {
+        use super::{
+            CHANNEL_ENV, ConnectSecrets, Listener, ResolvedIdentity, TOKEN_ENV, TOKEN_LEN,
+            run_helper,
+        };
+        use crate::os::vault::Secret;
+        use std::thread;
+
+        let token = [4u8; TOKEN_LEN];
+        let listener = Listener::bind(token).unwrap();
+        let addr = listener.address().to_string();
+        let handle = thread::spawn(move || {
+            let ident = ResolvedIdentity {
+                user: "deploy".into(),
+                host: "web1".into(),
+                host_key_alias: None,
+                identity_paths: vec![],
+            };
+            let mut secrets = ConnectSecrets::new(ident, Some(Secret::from("hunter2")), None);
+            listener.serve_one(&mut secrets).unwrap();
+        });
+
+        // run_helper reads CHANNEL/TOKEN from a passed-in Env abstraction so the
+        // test need not mutate process-global env.
+        let hextok: String = token.iter().map(|b| format!("{b:02x}")).collect();
+        let out = run_helper(Some("deploy@web1's password: ".to_string()), |k| match k {
+            CHANNEL_ENV => Some(addr.clone()),
+            TOKEN_ENV => Some(hextok.clone()),
+            _ => None,
+        });
+        assert_eq!(out.unwrap(), b"hunter2\n");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn helper_without_channel_env_is_none() {
+        use super::run_helper;
+        // No SSHM_ASKPASS_CHANNEL -> not in askpass mode -> None (caller falls through).
+        let out = run_helper(Some("x".into()), |_| None);
+        assert!(out.is_none());
     }
 }
