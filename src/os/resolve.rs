@@ -177,6 +177,22 @@ pub fn has_match_exec(config_text: &str) -> bool {
     false
 }
 
+/// The `known_hosts` lookup key for a resolved host, matching OpenSSH:
+/// `HostKeyAlias` verbatim if set; else `hostname` when the port is 22 (or
+/// unset); else `[hostname]:port`. `None` if no hostname resolved.
+pub fn tofu_lookup_key(rc: &ResolvedConfig) -> Option<String> {
+    if let Some(ka) = &rc.host_key_alias {
+        return Some(ka.clone());
+    }
+    let host = rc.hostname.as_deref()?;
+    let port = rc.port.as_deref().unwrap_or("22");
+    if port == "22" {
+        Some(host.to_string())
+    } else {
+        Some(format!("[{host}]:{port}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,5 +299,40 @@ identityfile ~/.ssh/id_rsa
         assert!(!has_match_exec("# Match exec \"cmd\"\n")); // commented out
         assert!(!has_match_exec("Host exec-server\n  HostName x\n")); // 'exec' in a value, not a Match
         assert!(!has_match_exec(""));
+    }
+
+    #[test]
+    fn lookup_key_rules() {
+        let base = ResolvedConfig {
+            hostname: Some("10.0.0.5".into()),
+            port: Some("22".into()),
+            ..Default::default()
+        };
+        assert_eq!(tofu_lookup_key(&base).as_deref(), Some("10.0.0.5"));
+
+        let p2222 = ResolvedConfig {
+            hostname: Some("10.0.0.5".into()),
+            port: Some("2222".into()),
+            ..Default::default()
+        };
+        assert_eq!(tofu_lookup_key(&p2222).as_deref(), Some("[10.0.0.5]:2222"));
+
+        let ka = ResolvedConfig {
+            hostname: Some("10.0.0.5".into()),
+            port: Some("2222".into()),
+            host_key_alias: Some("web1ka".into()),
+            ..Default::default()
+        };
+        assert_eq!(tofu_lookup_key(&ka).as_deref(), Some("web1ka")); // verbatim, ignores port
+
+        let no_host = ResolvedConfig::default();
+        assert_eq!(tofu_lookup_key(&no_host), None);
+
+        let no_port = ResolvedConfig {
+            hostname: Some("h".into()),
+            port: None,
+            ..Default::default()
+        };
+        assert_eq!(tofu_lookup_key(&no_port).as_deref(), Some("h")); // missing port = default 22
     }
 }
