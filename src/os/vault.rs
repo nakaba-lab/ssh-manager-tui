@@ -145,6 +145,48 @@ pub struct VaultEntry {
     pub note: String,
 }
 
+/// Which secret kinds a host has stored, for the auto-fill candidacy predicate.
+// TODO(phase3): consumed by App::vault_secret_kinds + the indicator.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MatchedKinds {
+    pub password: bool,
+    pub passphrase: bool,
+}
+
+impl MatchedKinds {
+    // TODO(phase3): consumed by App::vault_secret_kinds + the indicator.
+    #[allow(dead_code)]
+    pub fn any(self) -> bool {
+        self.password || self.passphrase
+    }
+}
+
+/// The pure auto-fill candidacy match: a host (given its `Host`-line `patterns`)
+/// is a candidate if a vault entry's `host` equals ANY non-glob, non-negation
+/// pattern. Returns the kinds present, or `None` if nothing matches. This is the
+/// host<->entry match only — it is NOT the listener's prompt/identity-binding
+/// release logic (see `os/askpass.rs`).
+// TODO(phase3): consumed by App::vault_secret_kinds + the indicator.
+#[allow(dead_code)]
+pub fn match_vault_kinds(patterns: &[String], entries: &[VaultEntry]) -> Option<MatchedKinds> {
+    let mut m = MatchedKinds::default();
+    for pat in patterns {
+        if pat.contains(['*', '?', '!']) {
+            continue;
+        }
+        for e in entries {
+            if e.host == *pat {
+                match e.kind {
+                    SecretKind::Password => m.password = true,
+                    SecretKind::Passphrase => m.passphrase = true,
+                }
+            }
+        }
+    }
+    m.any().then_some(m)
+}
+
 /// Argon2id cost parameters, persisted so an existing vault stays openable even
 /// if the in-app defaults change later.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -559,6 +601,36 @@ mod tests {
             secret: secret.into(),
             note: String::new(),
         }
+    }
+
+    #[test]
+    fn match_vault_kinds_basics() {
+        let entries = vec![
+            entry("web1", SecretKind::Password, "p"),
+            entry("web1", SecretKind::Passphrase, "k"),
+            entry("db", SecretKind::Password, "p"),
+        ];
+        // exact alias match, both kinds.
+        assert_eq!(
+            match_vault_kinds(&["web1".to_string()], &entries),
+            Some(MatchedKinds {
+                password: true,
+                passphrase: true
+            })
+        );
+        // a second pattern on the Host line matches too.
+        assert_eq!(
+            match_vault_kinds(&["nope".to_string(), "db".to_string()], &entries),
+            Some(MatchedKinds {
+                password: true,
+                passphrase: false
+            })
+        );
+        // no match -> None.
+        assert_eq!(match_vault_kinds(&["other".to_string()], &entries), None);
+        // glob / negation patterns are never candidates.
+        assert_eq!(match_vault_kinds(&["web*".to_string()], &entries), None);
+        assert_eq!(match_vault_kinds(&["!web1".to_string()], &entries), None);
     }
 
     #[test]
