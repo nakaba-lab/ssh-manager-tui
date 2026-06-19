@@ -45,3 +45,18 @@ jobs:
       # windows: bundled OpenSSH client) if that ever changes.
       - name: Test
         run: cargo test --all
+
+  audit:
+    name: cargo audit (advisories)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Surface RUSTSEC advisories / yanked crates in the dependency graph — the
+      # vault's crypto stack (argon2, chacha20poly1305, zeroize, getrandom) is the
+      # app's weak link, so an advisory landing there must not ship silently.
+      - name: Audit dependencies
+        uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
