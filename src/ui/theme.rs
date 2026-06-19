@@ -36,6 +36,14 @@ pub const CHECKING: Color = Color::Rgb(0x7d, 0xcf, 0xff);
 /// The left-edge marker drawn before a selected list/table row.
 pub const SELECT_SYMBOL: &str = "▎ ";
 
+/// Connect-time auto-fill indicator glyphs: the unlocked vault has a stored secret
+/// for the host. One cell each so the alias column stays aligned. Coloured
+/// [`ACCENT2`] when the host already has a `known_hosts` pin (auto-fill will fire)
+/// or [`FAINT`] when it is a candidate but not yet trusted (accept the key first).
+pub const SECRET_PASSWORD: &str = "p";
+pub const SECRET_PASSPHRASE: &str = "k";
+pub const SECRET_BOTH: &str = "*";
+
 /// Border color for a panel: accent when focused, the normal `BORDER` otherwise.
 pub fn border(focused: bool) -> Color {
     if focused { ACCENT } else { BORDER }

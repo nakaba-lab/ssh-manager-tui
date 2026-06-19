@@ -13,7 +13,7 @@ use zeroize::Zeroize;
 use crate::config::SshConfig;
 use crate::config::model::HostView;
 use crate::os::keys::KeyInfo;
-use crate::os::known_hosts::KnownHostEntry;
+use crate::os::known_hosts::{HostSpec, KnownHostEntry};
 use crate::os::liveness::{Liveness, LivenessProbe, ProbeTarget};
 use crate::os::vault::{MatchedKinds, SecretKind, Vault, match_vault_kinds};
 use crate::os::{self, keys, known_hosts};
@@ -461,6 +461,29 @@ impl App {
         mask_password_kinds(matched, self.password_autofill_enabled)
     }
 
+    /// A cheap, in-memory approximation of "this host has a plain `known_hosts`
+    /// pin", used ONLY to render the connect-time secret indicator active (a known
+    /// pin → auto-fill will fire) vs muted (a candidate not yet trusted). This is
+    /// deliberately NOT the authoritative connect-time TOFU gate
+    /// (`os::resolve::is_host_known`, which resolves via `ssh -G` + `ssh-keygen -F`
+    /// and so cannot run per render frame): it settles for a hostname match against
+    /// the already-parsed `known_hosts`. Marker entries (`@revoked`/`@cert-authority`)
+    /// don't count, mirroring the real gate. A hashed `known_hosts` can't be matched
+    /// by name, so every candidate then shows muted (a safe, conservative hint).
+    pub fn host_known_hint(&self, host: &HostView) -> bool {
+        let target = host
+            .host_name
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| host.alias());
+        if target.is_empty() {
+            return false;
+        }
+        self.known_hosts
+            .iter()
+            .any(|e| e.marker.is_none() && known_host_spec_matches(&e.host, target))
+    }
+
     /// Recompute `filtered` from `search` (fuzzy ranked; identity when empty).
     pub fn refilter(&mut self) {
         if self.search.is_empty() {
@@ -791,6 +814,23 @@ pub fn view_from_form(form: &EditForm) -> HostView {
 /// Apply the password-autofill opt-in mask to a raw candidacy match. While
 /// password auto-fill is off, the Password kind is dropped: a password-only host
 /// then yields `None`, a both-kinds host downgrades to passphrase-only.
+/// Whether a `known_hosts` host field matches `target` by name (the cheap
+/// indicator probe — see [`App::host_known_hint`]). Only `Plain` specs match;
+/// each comma-separated token is compared case-insensitively after stripping a
+/// `[host]:port` bracket. Hashed specs never match by name.
+fn known_host_spec_matches(spec: &HostSpec, target: &str) -> bool {
+    let HostSpec::Plain(list) = spec else {
+        return false;
+    };
+    list.split(',').any(|tok| {
+        let host = tok
+            .strip_prefix('[')
+            .and_then(|t| t.split("]:").next())
+            .unwrap_or(tok);
+        host.eq_ignore_ascii_case(target)
+    })
+}
+
 /// Passphrase is never gated. Pure, so the masking is unit-tested directly.
 fn mask_password_kinds(
     matched: Option<MatchedKinds>,
@@ -832,5 +872,23 @@ mod tests {
         // No candidacy match stays None regardless.
         assert_eq!(mask_password_kinds(None, true), None);
         assert_eq!(mask_password_kinds(None, false), None);
+    }
+
+    #[test]
+    fn known_host_spec_matches_plain_and_bracketed() {
+        let plain = HostSpec::Plain("web1.example.com".into());
+        assert!(known_host_spec_matches(&plain, "web1.example.com"));
+        assert!(known_host_spec_matches(&plain, "WEB1.EXAMPLE.COM")); // case-insensitive
+        assert!(!known_host_spec_matches(&plain, "web2.example.com"));
+        // Comma-separated list with a bracketed [host]:port token.
+        let list = HostSpec::Plain("alias,[10.0.0.5]:2222".into());
+        assert!(known_host_spec_matches(&list, "alias"));
+        assert!(known_host_spec_matches(&list, "10.0.0.5"));
+        assert!(!known_host_spec_matches(&list, "2222"));
+        // Hashed specs never match by name (so they always render muted).
+        assert!(!known_host_spec_matches(
+            &HostSpec::Hashed("|1|abc=|def=".into()),
+            "web1.example.com"
+        ));
     }
 }

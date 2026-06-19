@@ -7,6 +7,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Clear, List, ListItem, Paragraph, Row, Table, Wrap};
 
 use crate::app::{App, ListFocus};
+use crate::config::model::HostView;
 use crate::os::liveness::Liveness;
 
 use super::theme;
@@ -80,7 +81,10 @@ fn draw_list_pane(f: &mut Frame, app: &mut App, area: Rect) {
             let state = app.liveness_by_index(i);
             Row::new(vec![
                 Line::from(liveness_span(state)),
-                Line::from(h.alias().to_string()),
+                Line::from(vec![
+                    secret_indicator_span(app, h),
+                    Span::raw(h.alias().to_string()),
+                ]),
                 Line::from(h.host_name.clone().unwrap_or_else(|| "—".into())),
                 Line::from(h.user.clone().unwrap_or_else(|| "—".into())),
             ])
@@ -102,6 +106,29 @@ fn draw_list_pane(f: &mut Frame, app: &mut App, area: Rect) {
     .highlight_symbol(theme::SELECT_SYMBOL);
 
     f.render_stateful_widget(table, rows[1], &mut app.list_state);
+}
+
+/// The 2-cell stored-secret indicator prefix for a host row: a glyph (password
+/// `p`, passphrase `k`, both `*`) coloured active (the host has a `known_hosts`
+/// pin) or muted (a candidate not yet trusted), or two blanks when the host has no
+/// stored secret or the vault is locked. Always two cells so the alias stays
+/// aligned. Mirrors connect dispatch exactly — both consult `vault_secret_kinds`.
+fn secret_indicator_span(app: &App, host: &HostView) -> Span<'static> {
+    let Some(kinds) = app.vault_secret_kinds(host) else {
+        return Span::raw("  ");
+    };
+    let glyph = match (kinds.password, kinds.passphrase) {
+        (true, true) => theme::SECRET_BOTH,
+        (true, false) => theme::SECRET_PASSWORD,
+        (false, true) => theme::SECRET_PASSPHRASE,
+        (false, false) => return Span::raw("  "), // unreachable: any() held
+    };
+    let color = if app.host_known_hint(host) {
+        theme::ACCENT2
+    } else {
+        theme::FAINT
+    };
+    Span::styled(format!("{glyph} "), Style::default().fg(color))
 }
 
 fn draw_search(f: &mut Frame, app: &App, area: Rect) {
@@ -255,6 +282,25 @@ fn draw_detail_pane(f: &mut Frame, app: &App, area: Rect) {
     ));
     if let Some(j) = &h.proxy_jump {
         lines.push(kv_line("ProxyJump", j.clone()));
+    }
+    // Auto-fill (only when the vault is unlocked and has a stored secret here).
+    if let Some(kinds) = app.vault_secret_kinds(h) {
+        let mut parts = Vec::new();
+        if kinds.password {
+            parts.push("password");
+        }
+        if kinds.passphrase {
+            parts.push("passphrase");
+        }
+        let suffix = if app.host_known_hint(h) {
+            ""
+        } else {
+            " (accept host key first)"
+        };
+        lines.push(kv_line(
+            "Auto-fill",
+            format!("{}{suffix}", parts.join(" + ")),
+        ));
     }
 
     // Identity (only when present).
