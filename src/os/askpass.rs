@@ -415,6 +415,35 @@ fn parse_token_hex(s: &str) -> Option<Token> {
     Some(out)
 }
 
+/// Hex-encode the token for the `SSHM_ASKPASS_TOKEN` env var.
+fn token_hex(t: &Token) -> String {
+    t.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The env `(name, value)` pairs to apply to the connect `Command` so OpenSSH
+/// routes its prompts to this sshm-as-helper: the normalized exe as
+/// `SSH_ASKPASS`, `SSH_ASKPASS_REQUIRE=force` (use the helper even with a TTY),
+/// and the channel address + per-connect token. Secrets never appear here — only
+/// the token + address do.
+pub fn arm_env(
+    channel_addr: &str,
+    token: &Token,
+) -> io::Result<Vec<(std::ffi::OsString, std::ffi::OsString)>> {
+    use std::ffi::OsString;
+    Ok(vec![
+        (
+            OsString::from("SSH_ASKPASS"),
+            OsString::from(askpass_exe_path()?),
+        ),
+        (
+            OsString::from("SSH_ASKPASS_REQUIRE"),
+            OsString::from("force"),
+        ),
+        (OsString::from(CHANNEL_ENV), OsString::from(channel_addr)),
+        (OsString::from(TOKEN_ENV), OsString::from(token_hex(token))),
+    ])
+}
+
 /// Strip a Windows verbatim path prefix so the result is a plain path that
 /// Win32-OpenSSH's `CreateProcessW` accepts as argv0: `\\?\C:\…` -> `C:\…`,
 /// `\\?\UNC\server\share\…` -> `\\server\share\…`. Any other string passes
@@ -526,6 +555,42 @@ fn serve_result(prompt: &str, released: bool) -> ServeResult {
         ServeResult::NoMatch {
             kbd_interactive: prompt.starts_with('('),
         }
+    }
+}
+
+/// Reduce the per-connection [`ServeResult`]s of one connect into its terminal
+/// [`Outcome`]. Token mismatches are ignored (a hostile/foreign client is not
+/// this connect's auth flow). `Served` wins; else if no token-valid request ever
+/// arrived → `NotAttempted`; else if a password was armed and a
+/// keyboard-interactive prompt was seen → `Declined { KeyboardInteractive }`;
+/// else `Declined { NoMatch }`. The `TimedOut` case is decided by the listener
+/// loop (timeout fired with nothing served), not here.
+pub fn outcome_from(results: &[ServeResult], password_armed: bool) -> Outcome {
+    let mut last_served: Option<SecretKind> = None;
+    let mut saw_kbd_interactive = false;
+    let mut any_valid_request = false;
+    for r in results {
+        match r {
+            ServeResult::BadToken => {}
+            ServeResult::Served(k) => {
+                any_valid_request = true;
+                last_served = Some(*k);
+            }
+            ServeResult::NoMatch { kbd_interactive } => {
+                any_valid_request = true;
+                saw_kbd_interactive |= *kbd_interactive;
+            }
+        }
+    }
+    match last_served {
+        Some(kind) => Outcome::Served { kind },
+        None if !any_valid_request => Outcome::NotAttempted,
+        None if password_armed && saw_kbd_interactive => Outcome::Declined {
+            reason: DeclineReason::KeyboardInteractive,
+        },
+        None => Outcome::Declined {
+            reason: DeclineReason::NoMatch,
+        },
     }
 }
 
@@ -988,6 +1053,96 @@ mod tests {
         assert_eq!(
             strip_verbatim_prefix("/usr/local/bin/sshm"),
             "/usr/local/bin/sshm"
+        );
+    }
+
+    #[test]
+    fn token_hex_roundtrips_and_arm_env_carries_force_and_token() {
+        use super::{CHANNEL_ENV, TOKEN_ENV, TOKEN_LEN, arm_env, parse_token_hex, token_hex};
+        let token = [0xABu8; TOKEN_LEN];
+        let hex = token_hex(&token);
+        assert_eq!(hex.len(), TOKEN_LEN * 2);
+        assert_eq!(parse_token_hex(&hex), Some(token));
+
+        let env = arm_env(r"\\.\pipe\sshm-askpass-x", &token).unwrap();
+        let get = |k: &str| {
+            env.iter()
+                .find(|(n, _)| n == k)
+                .map(|(_, v)| v.to_string_lossy().into_owned())
+        };
+        assert_eq!(get("SSH_ASKPASS_REQUIRE").as_deref(), Some("force"));
+        assert_eq!(
+            get(CHANNEL_ENV).as_deref(),
+            Some(r"\\.\pipe\sshm-askpass-x")
+        );
+        assert_eq!(get(TOKEN_ENV).as_deref(), Some(hex.as_str()));
+        // SSH_ASKPASS is the running exe (current_exe in tests) — present, non-empty.
+        assert!(get("SSH_ASKPASS").is_some_and(|p| !p.is_empty()));
+        // Secrets never appear in the bundle — only the token + address do.
+        assert_eq!(env.len(), 4);
+    }
+
+    #[test]
+    fn outcome_from_reduces_serve_results() {
+        use super::{DeclineReason, Outcome, ServeResult, outcome_from};
+        use crate::os::vault::SecretKind;
+
+        // a served secret wins, regardless of order or earlier no-matches.
+        assert_eq!(
+            outcome_from(
+                &[
+                    ServeResult::NoMatch {
+                        kbd_interactive: true
+                    },
+                    ServeResult::Served(SecretKind::Passphrase),
+                ],
+                true,
+            ),
+            Outcome::Served {
+                kind: SecretKind::Passphrase
+            }
+        );
+        // no token-valid request at all -> NotAttempted (a bad token is ignored).
+        assert_eq!(outcome_from(&[], false), Outcome::NotAttempted);
+        assert_eq!(
+            outcome_from(&[ServeResult::BadToken], false),
+            Outcome::NotAttempted
+        );
+        // password armed + a keyboard-interactive prompt seen, nothing served.
+        assert_eq!(
+            outcome_from(
+                &[ServeResult::NoMatch {
+                    kbd_interactive: true
+                }],
+                true
+            ),
+            Outcome::Declined {
+                reason: DeclineReason::KeyboardInteractive
+            }
+        );
+        // a plain no-match with a password armed -> NoMatch (not kbd-interactive).
+        assert_eq!(
+            outcome_from(
+                &[ServeResult::NoMatch {
+                    kbd_interactive: false
+                }],
+                true
+            ),
+            Outcome::Declined {
+                reason: DeclineReason::NoMatch
+            }
+        );
+        // kbd-interactive seen but NO password armed -> plain NoMatch.
+        assert_eq!(
+            outcome_from(
+                &[ServeResult::NoMatch {
+                    kbd_interactive: true
+                }],
+                false
+            ),
+            Outcome::Declined {
+                reason: DeclineReason::NoMatch
+            }
         );
     }
 
