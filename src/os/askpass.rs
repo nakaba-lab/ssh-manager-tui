@@ -502,6 +502,33 @@ pub enum DeclineReason {
     NoMatch,
 }
 
+/// The result of serving one helper connection, accumulated by the listener loop
+/// to compute the connect's terminal [`Outcome`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServeResult {
+    /// Token mismatch — the connection was dropped without a reply.
+    BadToken,
+    /// A secret of this kind was released to a token-valid client.
+    Served(SecretKind),
+    /// Token valid, but nothing was released (no match, single-shot exhausted,
+    /// identity mismatch, or an unclassifiable prompt). `kbd_interactive` flags
+    /// the `(user@host) …` instance-prefixed form so the loop can report
+    /// `Declined { KeyboardInteractive }` when a password was armed.
+    NoMatch { kbd_interactive: bool },
+}
+
+/// Classify what a (token-valid) `decide` did into a [`ServeResult`], given the
+/// prompt and whether a secret was released. Shared by both channel arms.
+fn serve_result(prompt: &str, released: bool) -> ServeResult {
+    if released {
+        ServeResult::Served(ConnectSecrets::last_kind(prompt).unwrap_or(SecretKind::Password))
+    } else {
+        ServeResult::NoMatch {
+            kbd_interactive: prompt.starts_with('('),
+        }
+    }
+}
+
 #[cfg(unix)]
 mod chan {
     use super::*;
@@ -544,13 +571,13 @@ mod chan {
         }
 
         /// Accept one client, verify the token, and serve at most one secret.
-        /// Returns Ok(true) if a secret (or a deliberate no-match) was served to
-        /// a token-valid client, Ok(false) if the token mismatched.
-        pub fn serve_one(&self, secrets: &mut ConnectSecrets) -> io::Result<bool> {
+        /// Returns the [`ServeResult`]: `BadToken` on token mismatch (dropped with
+        /// no reply), else `Served`/`NoMatch` for a token-valid client.
+        pub fn serve_one(&self, secrets: &mut ConnectSecrets) -> io::Result<ServeResult> {
             let (mut conn, _) = self.inner.accept()?;
             let (token, prompt) = read_request(&mut conn)?;
             if !ct_eq(&token, &self.token) {
-                return Ok(false); // drop without reply
+                return Ok(ServeResult::BadToken); // drop without reply
             }
             let secret = secrets.decide(&prompt);
             // Refuse a secret that cannot survive the line channel.
@@ -559,7 +586,7 @@ mod chan {
                 _ => None,
             };
             write_reply(&mut conn, to_send.as_deref())?;
-            Ok(true)
+            Ok(serve_result(&prompt, to_send.is_some()))
         }
     }
 
@@ -797,10 +824,10 @@ mod chan {
         }
 
         /// Accept one client over the persistent instance, verify the token, and
-        /// serve at most one secret. Returns Ok(true) for a token-valid client
-        /// (secret or deliberate no-match served), Ok(false) on token mismatch.
-        /// The same handle is reused for the next client after DisconnectNamedPipe.
-        pub fn serve_one(&self, secrets: &mut ConnectSecrets) -> io::Result<bool> {
+        /// serve at most one secret. Returns the [`ServeResult`]: `BadToken` on
+        /// token mismatch, else `Served`/`NoMatch` for a token-valid client. The
+        /// same handle is reused for the next client after DisconnectNamedPipe.
+        pub fn serve_one(&self, secrets: &mut ConnectSecrets) -> io::Result<ServeResult> {
             // Wait for a client to connect to the persistent instance.
             // SAFETY: `self.handle` is the live, owned pipe instance.
             let connected = unsafe { ConnectNamedPipe(self.handle, std::ptr::null_mut()) };
@@ -822,10 +849,10 @@ mod chan {
             // Run the connection through the safe wire protocol. We must NOT
             // early-return while `io` is live without forgetting it, or its Drop
             // would CloseHandle the persistent instance — so capture the result.
-            let result = (|| -> io::Result<bool> {
+            let result = (|| -> io::Result<ServeResult> {
                 let (token, prompt) = read_request(&mut io)?;
                 if !ct_eq(&token, &self.token) {
-                    return Ok(false); // drop without reply
+                    return Ok(ServeResult::BadToken); // drop without reply
                 }
                 let secret = secrets.decide(&prompt);
                 // Refuse a secret that cannot survive the line channel.
@@ -834,17 +861,21 @@ mod chan {
                     _ => None,
                 };
                 write_reply(&mut io, to_send.as_deref())?;
-                Ok(true)
+                Ok(serve_result(&prompt, to_send.is_some()))
             })();
 
             // Relinquish the borrowed File without closing the handle.
             std::mem::forget(io);
 
-            // If we replied, block until the client has drained the reply before
-            // disconnecting — DisconnectNamedPipe discards un-read pipe data, so
-            // a premature disconnect makes the client's read see ERROR_PIPE_NOT_CONNECTED.
+            // If we replied (Served or a zero-length NoMatch), block until the
+            // client has drained the reply before disconnecting — DisconnectNamedPipe
+            // discards un-read pipe data, so a premature disconnect makes the
+            // client's read see ERROR_PIPE_NOT_CONNECTED. A BadToken wrote nothing.
             // SAFETY: same persistent handle.
-            if matches!(result, Ok(true)) {
+            if matches!(
+                result,
+                Ok(ServeResult::Served(_) | ServeResult::NoMatch { .. })
+            ) {
                 unsafe {
                     FlushFileBuffers(self.handle);
                 }
@@ -1254,9 +1285,9 @@ mod tests {
                 identity_paths: vec![],
             };
             let mut secrets = ConnectSecrets::new(ident, Some(Secret::from("hunter2")), None);
-            // serve_one returns Ok(false) when the token mismatched.
+            // serve_one returns BadToken when the token mismatched.
             let served = listener.serve_one(&mut secrets).unwrap();
-            assert!(!served);
+            assert_eq!(served, super::ServeResult::BadToken);
         });
         let mut conn = connect_client(&addr).unwrap();
         write_request(&mut conn, &[0u8; TOKEN_LEN], "deploy@web1's password: ").unwrap();
