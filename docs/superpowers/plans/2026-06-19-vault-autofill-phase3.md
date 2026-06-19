@@ -47,6 +47,41 @@ Until it is run, build to **conservative defaults** (which are already the desig
 - The implementation **degrades safely** (connect normally, no env) on any gate miss,
   so an unrun/partial spike never releases a secret wrongly — it only withholds.
 
+### Spike RESULTS (run 2026-06-19, Windows 11 + System32 OpenSSH_for_Windows 9.5p2)
+
+Validated empirically against the **System32 ssh `tools()` resolves** (a throwaway
+sentinel-writing askpass exe captured the prompt; no login — the helper returned
+empty so auth failed after capture; a temp `known_hosts` kept the real one clean):
+
+- **force invokes the helper on Windows** ✅ — `SSH_ASKPASS_REQUIRE=force` +
+  `SSH_ASKPASS=<exe>` routed every prompt to the helper (9.5p2). The core mechanism
+  works here. (Helper-side dispatch already verified in T6.)
+- **Host-key prompt IS hijacked** ✅ — an unknown host's "Are you sure you want to
+  continue connecting (yes/no/[fingerprint])? " went to the helper → empty →
+  "Host key verification failed". This **confirms the TOFU blocker** (Phase 2's
+  `is_host_known` gate is load-bearing: never arm an unknown host).
+- **Password prompt = `<user>@<host>'s password: `** ✅ — captured verbatim
+  `demo@test.rebex.net's password: ` → `classify()` → `Password{user,host}`. Matches.
+- **Keyboard-interactive prompt = `(<user>@<host>) Password: `** ✅ — the `(user@host)`
+  instance prefix IS emitted by 9.5p2 (OpenSSH ≥8.5), so `classify()` → `Other` →
+  password withheld. The load-bearing discriminator works against real server output;
+  a stock server offering `keyboard-interactive` correctly burns-but-withholds (→
+  `Declined{KeyboardInteractive}`). Confirms **password auto-fill must default OFF**.
+- **`ssh -G` spawn latency ≈ 35–37 ms** ✅ — `SSH_G_RESOLVE_TIMEOUT = 500 ms` has >10×
+  headroom. Confirmed.
+- **Passphrase prompt — NOT server-captured** (no publickey-offering server was
+  available; `test.rebex.net` is password/kbd-interactive only). `ssh-keygen -y` under
+  force used `Enter passphrase: ` (no path) — that is ssh-keygen's form, NOT ssh's
+  connect-time `Enter passphrase for key '<path>': ` that `classify()` targets; do
+  **not** change classify to ssh-keygen's form. The ssh-connect passphrase format
+  remains the documented openssh-portable source string (still owed a live capture
+  against a publickey server before claiming the passphrase path end-to-end verified).
+- **Still un-spiked:** new-tab (`wt.exe -w 0`) env inheritance → keep new-tab auto-fill
+  gated OFF; the ssh-connect passphrase prompt live-capture (above).
+
+Net: the password + host-key + force-mechanism + timeout are validated; T8 can wire the
+inline connect path with confidence. New-tab + the passphrase live-capture stay deferred.
+
 Tasks below are ordered **headless-first** (T1–T4: testable, spike-independent),
 then **wiring** (T5–T9), then **UI** (T10–T12, best verified manually).
 
