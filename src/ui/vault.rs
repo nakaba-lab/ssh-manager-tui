@@ -185,6 +185,56 @@ pub fn draw_unlock(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(Text::from(lines)).block(block), modal);
 }
 
+/// One-time connect-time **password** consent modal. Shows the resolved
+/// `<user@host>` the stored password would be sent to, framed as a consent/typo
+/// guard (it is NOT a redirect/MITM defense — the listener's identity binding is).
+/// Passphrase auto-fill needs no confirmation, so this only ever gates a password.
+pub fn draw_password_confirm(
+    f: &mut Frame,
+    target: &str,
+    kinds: crate::os::vault::MatchedKinds,
+    area: Rect,
+) {
+    let modal = centered(64, 11, area);
+    f.render_widget(Clear, modal);
+    let block = modal_block("Send stored password?", false);
+
+    let also_passphrase = if kinds.passphrase {
+        "  (its passphrase auto-fills without asking)"
+    } else {
+        ""
+    };
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Auto-fill your stored password for",
+            Style::default().fg(theme::FAINT),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("      {target}"),
+            Style::default()
+                .fg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Confirm you meant this host (a typo guard, not a",
+            Style::default().fg(theme::FAINT),
+        )),
+        Line::from(Span::styled(
+            format!("  redirect defense).{also_passphrase}"),
+            Style::default().fg(theme::FAINT),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Enter send · Esc skip (connect without it)",
+            Style::default().fg(theme::FAINT),
+        )),
+    ];
+    f.render_widget(Paragraph::new(Text::from(lines)).block(block), modal);
+}
+
 /// Add/edit entry modal.
 pub fn draw_entry(f: &mut Frame, app: &App, area: Rect) {
     let e = &app.vault_entry;

@@ -112,7 +112,15 @@ pub fn run_ssh_inline(
 
 /// A short human-facing summary of an inline ssh exit status.
 pub fn describe_exit(status: &std::process::ExitStatus) -> Option<(String, bool)> {
-    match status.code() {
+    describe_exit_code(status.code())
+}
+
+/// The exit-code half of [`describe_exit`], split out so the connect-time auto-fill
+/// outcome toast can reuse the exact same wording from a raw code without
+/// constructing a platform-specific `ExitStatus` (and so it is unit-testable on
+/// every OS). `None` means "no toast" (a clean exit 0).
+pub fn describe_exit_code(code: Option<i32>) -> Option<(String, bool)> {
+    match code {
         Some(0) => None,
         Some(255) => Some(("ssh: connection or authentication failed".into(), true)),
         Some(code) => Some((format!("ssh exited with code {code}"), false)),

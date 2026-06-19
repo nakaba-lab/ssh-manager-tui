@@ -162,8 +162,6 @@ pub struct VaultEntry {
 }
 
 /// Which secret kinds a host has stored, for the auto-fill candidacy predicate.
-// TODO(phase3): consumed by App::vault_secret_kinds + the indicator.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MatchedKinds {
     pub password: bool,
@@ -171,8 +169,6 @@ pub struct MatchedKinds {
 }
 
 impl MatchedKinds {
-    // TODO(phase3): consumed by App::vault_secret_kinds + the indicator.
-    #[allow(dead_code)]
     pub fn any(self) -> bool {
         self.password || self.passphrase
     }
@@ -183,8 +179,6 @@ impl MatchedKinds {
 /// pattern. Returns the kinds present, or `None` if nothing matches. This is the
 /// host<->entry match only — it is NOT the listener's prompt/identity-binding
 /// release logic (see `os/askpass.rs`).
-// TODO(phase3): consumed by App::vault_secret_kinds + the indicator.
-#[allow(dead_code)]
 pub fn match_vault_kinds(patterns: &[String], entries: &[VaultEntry]) -> Option<MatchedKinds> {
     let mut m = MatchedKinds::default();
     for pat in patterns {
@@ -365,8 +359,6 @@ impl Vault {
     /// All stored secrets whose `host` field equals `host` (case-sensitive — the
     /// verbatim ssh destination). This is the connect-time *candidacy* lookup;
     /// the listener's identity binding (`os/askpass.rs`) decides actual release.
-    // TODO(phase3): consumed by connect dispatch (connect_by_alias).
-    #[allow(dead_code)]
     pub fn secrets_for_host(&self, host: &str) -> Vec<&VaultEntry> {
         self.entries.iter().filter(|e| e.host == host).collect()
     }

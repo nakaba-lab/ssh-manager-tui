@@ -24,9 +24,11 @@ use crate::app::{App, GenOrigin, Screen};
 /// modal overlay).
 fn base_screen(app: &App) -> Screen {
     match &app.screen {
-        Screen::Help | Screen::Confirm(_) | Screen::ActionMenu(_) | Screen::VaultUnlock => {
-            app.prev_screen.clone().unwrap_or(Screen::List)
-        }
+        Screen::Help
+        | Screen::Confirm(_)
+        | Screen::ActionMenu(_)
+        | Screen::VaultUnlock
+        | Screen::PasswordConfirm { .. } => app.prev_screen.clone().unwrap_or(Screen::List),
         Screen::PickKey { editing } | Screen::PickJump { editing } => {
             Screen::Edit { editing: *editing }
         }
@@ -71,6 +73,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Screen::PickJump { .. } => list::draw_jump_picker(f, app, body_a),
         Screen::VaultUnlock => vault::draw_unlock(f, app, body_a),
         Screen::VaultEntry { .. } => vault::draw_entry(f, app, body_a),
+        Screen::PasswordConfirm { target, kinds, .. } => {
+            vault::draw_password_confirm(f, target, *kinds, body_a)
+        }
         _ => {}
     }
 

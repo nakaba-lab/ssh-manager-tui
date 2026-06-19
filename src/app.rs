@@ -94,6 +94,18 @@ pub enum Screen {
     VaultEntry {
         editing: Option<usize>,
     },
+    /// One-time connect-time **password** consent modal, shown before arming a
+    /// stored password the first time the resolved `<user@host>` is targeted this
+    /// session. Carries **no secret** — only the resolved `target` (for display),
+    /// the armed `kinds`, and the `alias`/`mode` needed to resume the connect.
+    /// Enter confirms (arm the password); Esc/`n` declines (passphrase stays
+    /// armed, password withheld). A consent/typo guard, not a redirect defense.
+    PasswordConfirm {
+        alias: String,
+        mode: ConnectMode,
+        kinds: MatchedKinds,
+        target: String,
+    },
 }
 
 /// Where the generate-key wizard was opened from — drives where it returns and
@@ -331,6 +343,9 @@ pub struct App {
     // TODO(phase3): read by connect dispatch (T8).
     #[allow(dead_code)]
     pub confirmed_password_targets: HashSet<String>,
+    /// Whether the one-time-per-session "this host has a stored password — enable
+    /// auto-fill" discoverability nudge has already fired (shown at most once).
+    pub password_hint_shown: bool,
     /// When a vault secret was copied, the deadline to auto-clear the clipboard,
     /// plus a (non-reversible) hash of the copied secret so the clear only fires
     /// if the clipboard still holds it — never the plaintext, which stays sealed.
@@ -389,6 +404,7 @@ impl App {
             vault_reveal: false,
             password_autofill_enabled: false,
             confirmed_password_targets: HashSet::new(),
+            password_hint_shown: false,
             clipboard_clear_at: None,
             clipboard_hash: 0,
             clipboard_hash_key: {
@@ -439,8 +455,6 @@ impl App {
     /// `password_autofill_enabled` is off the Password kind is masked out (so a
     /// password-only host yields `None` and a both-kinds host downgrades to
     /// passphrase-only). `None` when the vault is locked. Reads `vault` live.
-    // TODO(phase3): called by connect dispatch (T8) + the list indicator (T11).
-    #[allow(dead_code)]
     pub fn vault_secret_kinds(&self, host: &HostView) -> Option<MatchedKinds> {
         let vault = self.vault.as_ref()?;
         let matched = match_vault_kinds(&host.patterns, &vault.entries);
@@ -778,8 +792,6 @@ pub fn view_from_form(form: &EditForm) -> HostView {
 /// password auto-fill is off, the Password kind is dropped: a password-only host
 /// then yields `None`, a both-kinds host downgrades to passphrase-only.
 /// Passphrase is never gated. Pure, so the masking is unit-tested directly.
-// TODO(phase3): consumed by App::vault_secret_kinds.
-#[allow(dead_code)]
 fn mask_password_kinds(
     matched: Option<MatchedKinds>,
     password_enabled: bool,

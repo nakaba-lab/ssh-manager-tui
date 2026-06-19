@@ -20,13 +20,20 @@ use crate::app::{
     VaultUnlock, form_from_view, form_idx, is_multi, view_from_form,
 };
 use crate::config::model::HostView;
+use crate::os::askpass::{DeclineReason, Outcome, arm_connect, os_tokens, resolved_identity};
 use crate::os::connect::{
-    ConnectOverrides, build_ssh_args, command_line, connect_new_tab, describe_exit, run_ssh_inline,
+    ConnectOverrides, build_ssh_args, command_line, connect_new_tab, describe_exit,
+    describe_exit_code, run_ssh_inline,
 };
 use crate::os::keys::{generate_key, read_public_key};
 use crate::os::known_hosts::remove_entry;
+use crate::os::resolve::{
+    ResolvedConfig, has_match_exec, is_host_known, resolve_config, tofu_lookup_key,
+};
 use crate::os::ssh_dir;
-use crate::os::vault::{self, MatchedKinds, Vault, VaultEntry};
+use crate::os::vault::{
+    self, MatchedKinds, Secret, SecretKind, Vault, VaultEntry, match_vault_kinds,
+};
 use crate::ui::confirm::ACTION_LABELS;
 
 pub fn handle_key(app: &mut App, key: KeyEvent, terminal: &mut DefaultTerminal) -> Result<()> {
@@ -49,6 +56,34 @@ pub fn handle_key(app: &mut App, key: KeyEvent, terminal: &mut DefaultTerminal) 
         Screen::Vault => handle_vault(app, key),
         Screen::VaultUnlock => handle_vault_unlock(app, key),
         Screen::VaultEntry { editing } => handle_vault_entry(app, key, editing),
+        Screen::PasswordConfirm { alias, mode, .. } => {
+            handle_password_confirm(app, key, alias, mode, terminal)?
+        }
+    }
+    Ok(())
+}
+
+/// The one-time password-confirm modal: Enter/`y` confirms (re-enter the connect
+/// arming the password), Esc/`n` declines (re-enter withholding it — passphrase
+/// still arms). Closing the overlay first returns to the base screen (List) so the
+/// inline connect suspends/restores over it.
+fn handle_password_confirm(
+    app: &mut App,
+    key: KeyEvent,
+    alias: String,
+    mode: ConnectMode,
+    terminal: &mut DefaultTerminal,
+) -> Result<()> {
+    match key.code {
+        KeyCode::Enter | KeyCode::Char('y') => {
+            close_overlay(app);
+            connect_by_alias(app, terminal, &alias, mode, PasswordChoice::Confirmed)?;
+        }
+        KeyCode::Esc | KeyCode::Char('n') => {
+            close_overlay(app);
+            connect_by_alias(app, terminal, &alias, mode, PasswordChoice::Withheld)?;
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -298,8 +333,6 @@ fn select_index(app: &mut App, idx: usize) {
 /// locked→unlock→auto-fill is deferred because candidacy cannot be known while
 /// locked without prompting for the master password on *every* connect (even
 /// keyless hosts).
-// TODO(phase3): executed by connect_by_alias.
-#[allow(dead_code)]
 #[derive(Debug, PartialEq, Eq)]
 enum ConnectPlan {
     /// Connect normally, no auto-fill. `Some(msg)` = emit this non-error toast
@@ -317,8 +350,6 @@ enum ConnectPlan {
 /// password-confirm gate → arm. Every miss degrades to a normal connect (fails
 /// safe — never arms). `candidacy` is the opt-in-masked `vault_secret_kinds`
 /// result (so password is already dropped when disabled / vault locked).
-// TODO(phase3): executed by connect_by_alias.
-#[allow(dead_code)]
 fn connect_plan(
     candidacy: Option<MatchedKinds>,
     host_has_match_exec: bool,
@@ -345,6 +376,24 @@ fn connect_plan(
     ConnectPlan::Arm(kinds)
 }
 
+/// Whether connect dispatch may release a stored **password** this attempt — the
+/// state carried across the one-time password-confirm modal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PasswordChoice {
+    /// First dispatch: defer to the confirm modal when a password is a candidate
+    /// and the resolved target is not already session-confirmed.
+    Ask,
+    /// The modal was accepted (or the target is already confirmed) — arm it.
+    Confirmed,
+    /// The modal was declined — withhold the password; passphrase still arms.
+    Withheld,
+}
+
+/// `t` (new-tab) auto-fill stays OFF until the `wt.exe -w 0` env-inheritance spike
+/// passes (Phase 3 plan, Step 0). While false a new-tab connect skips the whole
+/// resolve+arm machinery and connects plainly with no askpass env.
+const NEW_TAB_AUTOFILL: bool = false;
+
 fn connect_selected(
     app: &mut App,
     terminal: &mut DefaultTerminal,
@@ -353,29 +402,306 @@ fn connect_selected(
     let Some(idx) = app.selected_host() else {
         return Ok(());
     };
-    let host = app.hosts[idx].clone();
+    let alias = app.hosts[idx].alias().to_string();
+    connect_by_alias(app, terminal, &alias, mode, PasswordChoice::Ask)
+}
+
+/// The re-entrant connect executor (spec "Connect-time flow"): resolve the alias →
+/// gate (candidacy → Match-exec → `ssh -G` → proxy → TOFU) → decide via
+/// [`connect_plan`] → execute. Inline owns its askpass listener in a scope-guard;
+/// every gate miss degrades to a plain connect (fails safe — never arms). `choice`
+/// threads the password-confirm decision back in after the modal re-enters here.
+fn connect_by_alias(
+    app: &mut App,
+    terminal: &mut DefaultTerminal,
+    alias: &str,
+    mode: ConnectMode,
+    choice: PasswordChoice,
+) -> Result<()> {
+    // The host can vanish if the config changed under a deferred confirm — degrade
+    // to a message rather than panic.
+    let Some(host) = app.hosts.iter().find(|h| h.alias() == alias).cloned() else {
+        app.toast(format!("host '{alias}' is no longer in the config"), true);
+        return Ok(());
+    };
     let args = build_ssh_args(&host, &ConnectOverrides::default());
 
+    // v1 auto-fills the inline path only; a mode that won't auto-fill skips the
+    // candidacy + resolve machinery entirely (no `ssh -G`, no env).
+    let autofill_mode = match mode {
+        ConnectMode::Inline => true,
+        ConnectMode::NewWtTab => NEW_TAB_AUTOFILL,
+    };
+    if !autofill_mode {
+        return connect_plain(app, terminal, &host, &args, mode);
+    }
+
+    // One-time discoverability nudge for a stored password while auto-fill is off
+    // (computed from the *raw*, unmasked match so the opt-in mask can't hide it).
+    maybe_password_discoverability(app, &host);
+
+    // Candidacy (opt-in-masked). A decline additionally drops the Password kind.
+    let candidacy = app.vault_secret_kinds(&host).and_then(|mut k| {
+        if choice == PasswordChoice::Withheld {
+            k.password = false;
+        }
+        k.any().then_some(k)
+    });
+    // No candidate secret → a plain connect (skip `ssh -G` for the common case).
+    if candidacy.is_none() {
+        return connect_plain(app, terminal, &host, &args, mode);
+    }
+
+    // A `Match exec` anywhere in the config would make `ssh -G` execute a
+    // predicate, so skip the resolve entirely and degrade.
+    let host_has_match_exec = has_match_exec(&app.config.render());
+    let rc = (!host_has_match_exec)
+        .then(|| resolve_config(alias).ok())
+        .flatten();
+    let resolved = rc.is_some();
+    let is_proxied = host.is_proxied()
+        || rc
+            .as_ref()
+            .is_some_and(|rc| rc.proxy_jump.is_some() || rc.proxy_command.is_some());
+    let is_known = match rc.as_ref() {
+        Some(rc) => {
+            tofu_lookup_key(rc).is_some_and(|key| is_host_known(&key, &known_hosts_files(rc)))
+        }
+        None => false,
+    };
+
+    // Resolve the confirm target + fold in the session set / explicit choice.
+    let target = rc.as_ref().map(resolved_target);
+    let password_confirmed = match choice {
+        PasswordChoice::Confirmed => {
+            if let Some(t) = &target {
+                app.confirmed_password_targets.insert(t.clone());
+            }
+            true
+        }
+        PasswordChoice::Withheld => false,
+        PasswordChoice::Ask => target
+            .as_ref()
+            .is_some_and(|t| app.confirmed_password_targets.contains(t)),
+    };
+
+    match connect_plan(
+        candidacy,
+        host_has_match_exec,
+        resolved,
+        is_proxied,
+        is_known,
+        password_confirmed,
+        alias,
+    ) {
+        ConnectPlan::Normal(msg) => {
+            if let Some(m) = msg {
+                app.toast(m, false);
+            }
+            connect_plain(app, terminal, &host, &args, mode)
+        }
+        ConnectPlan::DeferPasswordConfirm(kinds) => {
+            // Show the one-time consent modal; its Enter/Esc re-enters here with
+            // Confirmed/Withheld. Only reachable from `Ask`.
+            let target = target.unwrap_or_else(|| alias.to_string());
+            open_overlay(
+                app,
+                Screen::PasswordConfirm {
+                    alias: alias.to_string(),
+                    mode,
+                    kinds,
+                    target,
+                },
+            );
+            Ok(())
+        }
+        ConnectPlan::Arm(kinds) => {
+            // `Arm` implies `resolved`, so `rc` is Some; new-tab returned early.
+            let rc = rc.expect("Arm implies a resolved config");
+            arm_and_connect_inline(app, terminal, &host, &args, alias, &rc, kinds)
+        }
+    }
+}
+
+/// Connect with no auto-fill: the non-candidate path and every gate-miss degrade.
+fn connect_plain(
+    app: &mut App,
+    terminal: &mut DefaultTerminal,
+    host: &HostView,
+    args: &[String],
+    mode: ConnectMode,
+) -> Result<()> {
     match mode {
         ConnectMode::Inline => {
             suspend_tui(terminal)?;
-            let status = run_ssh_inline(&args, &[]);
+            let status = run_ssh_inline(args, &[]);
             restore_tui(terminal)?;
-            match status {
-                Ok(s) => {
-                    if let Some((msg, is_err)) = describe_exit(&s) {
-                        app.toast(msg, is_err);
-                    }
-                }
-                Err(e) => app.toast(format!("failed to launch ssh: {e}"), true),
-            }
+            report_plain_exit(app, status);
         }
-        ConnectMode::NewWtTab => match connect_new_tab(host.alias(), &args, &[]) {
+        ConnectMode::NewWtTab => match connect_new_tab(host.alias(), args, &[]) {
             Ok(()) => app.toast(format!("opened new tab: ssh {}", host.alias()), false),
             Err(e) => app.toast(format!("{e}"), true),
         },
     }
     Ok(())
+}
+
+/// Arm the askpass listener, run `ssh` inline with the force env, tear the listener
+/// down (zeroizing secrets) and surface the combined exit+outcome toast. The
+/// listener is a scope-guard: its `Drop` stops+joins+zeroizes even on an early
+/// return or panic before `stop_and_join`.
+fn arm_and_connect_inline(
+    app: &mut App,
+    terminal: &mut DefaultTerminal,
+    host: &HostView,
+    args: &[String],
+    alias: &str,
+    rc: &ResolvedConfig,
+    kinds: MatchedKinds,
+) -> Result<()> {
+    let (password, passphrase) = gather_secrets(app, host, kinds);
+    // Nothing actually resolved to a servable secret → just connect plainly.
+    if password.is_none() && passphrase.is_none() {
+        return connect_plain(app, terminal, host, args, ConnectMode::Inline);
+    }
+    let identity = resolved_identity(rc, alias, &os_tokens());
+
+    match arm_connect(identity, password, passphrase) {
+        Ok((listener, env)) => {
+            suspend_tui(terminal)?;
+            let status = run_ssh_inline(args, &env);
+            restore_tui(terminal)?;
+            let outcome = listener.stop_and_join();
+            let toast = match status {
+                Ok(s) => connect_toast(s.code(), &outcome),
+                Err(e) => Some((format!("failed to launch ssh: {e}"), true)),
+            };
+            if let Some((msg, is_err)) = toast {
+                app.toast(msg, is_err);
+            }
+        }
+        Err(e) => {
+            // Arming failed (e.g. listener bind) → degrade to a plain connect.
+            app.toast(
+                format!("auto-fill unavailable ({e}); connecting without it"),
+                false,
+            );
+            connect_plain(app, terminal, host, args, ConnectMode::Inline)?;
+        }
+    }
+    Ok(())
+}
+
+/// Pull the armed secret material out of the unlocked vault for `host`, limited to
+/// the `kinds` the plan armed and matched by the SAME candidacy logic as
+/// [`match_vault_kinds`] (non-glob patterns, exact host). Returns owned `Secret`s
+/// (they zeroize on drop); the listener still enforces the identity binding before
+/// any of it is released.
+fn gather_secrets(
+    app: &App,
+    host: &HostView,
+    kinds: MatchedKinds,
+) -> (Option<Secret>, Option<Secret>) {
+    let Some(vault) = app.vault.as_ref() else {
+        return (None, None);
+    };
+    let (mut password, mut passphrase) = (None, None);
+    for pat in &host.patterns {
+        if pat.contains(['*', '?', '!']) {
+            continue;
+        }
+        for e in vault.secrets_for_host(pat) {
+            match e.kind {
+                SecretKind::Password if kinds.password && password.is_none() => {
+                    password = Some(e.secret.clone());
+                }
+                SecretKind::Passphrase if kinds.passphrase && passphrase.is_none() => {
+                    passphrase = Some(e.secret.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+    (password, passphrase)
+}
+
+/// The resolved `<user@host>` the password-confirm consent is keyed on — the same
+/// host token OpenSSH puts in the prompt (HostKeyAlias verbatim, else the resolved
+/// hostname).
+fn resolved_target(rc: &ResolvedConfig) -> String {
+    let user = rc.user.as_deref().unwrap_or("");
+    let host = rc
+        .host_key_alias
+        .as_deref()
+        .or(rc.hostname.as_deref())
+        .unwrap_or("");
+    format!("{user}@{host}")
+}
+
+/// The known_hosts files `ssh -G` reported for a resolved host (user + global).
+fn known_hosts_files(rc: &ResolvedConfig) -> Vec<String> {
+    let mut files = rc.user_known_hosts_files.clone();
+    files.extend(rc.global_known_hosts_files.iter().cloned());
+    files
+}
+
+/// One-time-per-session nudge: a host has a stored password but connect-time
+/// password auto-fill is off, so the user might not realize they could use it.
+fn maybe_password_discoverability(app: &mut App, host: &HostView) {
+    if app.password_autofill_enabled || app.password_hint_shown {
+        return;
+    }
+    let Some(vault) = app.vault.as_ref() else {
+        return;
+    };
+    let has_password =
+        match_vault_kinds(&host.patterns, &vault.entries).is_some_and(|k| k.password);
+    if has_password {
+        app.password_hint_shown = true;
+        app.toast(
+            "this host has a stored password — press P then p to enable password auto-fill",
+            false,
+        );
+    }
+}
+
+/// Surface a plain (no auto-fill) inline ssh exit as a toast.
+fn report_plain_exit(app: &mut App, status: std::io::Result<std::process::ExitStatus>) {
+    match status {
+        Ok(s) => {
+            if let Some((msg, is_err)) = describe_exit(&s) {
+                app.toast(msg, is_err);
+            }
+        }
+        Err(e) => app.toast(format!("failed to launch ssh: {e}"), true),
+    }
+}
+
+/// The connect-time auto-fill outcome toast: combine the ssh exit `code` with the
+/// listener `outcome`. `None` = no toast (a clean exit 0 with nothing notable).
+fn connect_toast(code: Option<i32>, outcome: &Outcome) -> Option<(String, bool)> {
+    match outcome {
+        Outcome::Served { kind } => {
+            let k = kind.label().to_ascii_lowercase();
+            match code {
+                Some(0) => Some((format!("auto-filled {k} · connected"), false)),
+                Some(255) => Some((
+                    format!("auto-filled {k}, but ssh authentication/connection failed"),
+                    true,
+                )),
+                _ => describe_exit_code(code),
+            }
+        }
+        Outcome::Declined {
+            reason: DeclineReason::KeyboardInteractive,
+        } => Some((
+            "server used keyboard-interactive — stored password withheld; type it manually".into(),
+            false,
+        )),
+        Outcome::Declined { .. } | Outcome::TimedOut | Outcome::NotAttempted => {
+            describe_exit_code(code)
+        }
+    }
 }
 
 fn suspend_tui(terminal: &mut DefaultTerminal) -> Result<()> {
@@ -1702,5 +2028,72 @@ mod tests {
             connect_plan(Some(pp_only), false, true, false, true, false, "h"),
             ConnectPlan::Arm(pp_only)
         );
+    }
+
+    #[test]
+    fn resolved_target_uses_host_key_alias_then_hostname() {
+        // HostKeyAlias wins (verbatim) — it is what OpenSSH's prompt carries.
+        let rc = ResolvedConfig {
+            user: Some("deploy".into()),
+            hostname: Some("10.0.0.5".into()),
+            host_key_alias: Some("prod-db".into()),
+            ..Default::default()
+        };
+        assert_eq!(resolved_target(&rc), "deploy@prod-db");
+        // No alias -> the resolved hostname.
+        let rc = ResolvedConfig {
+            user: Some("deploy".into()),
+            hostname: Some("web1.example.com".into()),
+            ..Default::default()
+        };
+        assert_eq!(resolved_target(&rc), "deploy@web1.example.com");
+        // Missing user/host degrade to empty halves (still a stable key).
+        assert_eq!(resolved_target(&ResolvedConfig::default()), "@");
+    }
+
+    #[test]
+    fn known_hosts_files_concatenates_user_then_global() {
+        let rc = ResolvedConfig {
+            user_known_hosts_files: vec!["u1".into(), "u2".into()],
+            global_known_hosts_files: vec!["g1".into()],
+            ..Default::default()
+        };
+        assert_eq!(known_hosts_files(&rc), vec!["u1", "u2", "g1"]);
+    }
+
+    #[test]
+    fn connect_toast_maps_outcome_and_exit() {
+        use crate::os::askpass::{DeclineReason, Outcome};
+        // Served + clean exit -> a success toast naming the kind.
+        let t = connect_toast(
+            Some(0),
+            &Outcome::Served {
+                kind: SecretKind::Passphrase,
+            },
+        );
+        assert_eq!(
+            t,
+            Some(("auto-filled passphrase · connected".into(), false))
+        );
+        // Served + 255 -> served-but-auth-failed (error).
+        let t = connect_toast(
+            Some(255),
+            &Outcome::Served {
+                kind: SecretKind::Password,
+            },
+        );
+        assert!(t.is_some_and(|(m, e)| e && m.contains("auto-filled password")));
+        // Keyboard-interactive decline -> an informational withheld toast.
+        let t = connect_toast(
+            Some(255),
+            &Outcome::Declined {
+                reason: DeclineReason::KeyboardInteractive,
+            },
+        );
+        assert!(t.is_some_and(|(m, e)| !e && m.contains("keyboard-interactive")));
+        // Nothing served, clean exit (key auth never prompted) -> no toast.
+        assert_eq!(connect_toast(Some(0), &Outcome::NotAttempted), None);
+        // Nothing served, 255 -> the plain connection/auth-failed summary.
+        assert!(connect_toast(Some(255), &Outcome::NotAttempted).is_some_and(|(_, e)| e));
     }
 }
