@@ -4,6 +4,7 @@
 //! we write — the file is the single source of truth. Flags are emitted only for
 //! ad-hoc, unsaved [`ConnectOverrides`].
 
+use std::ffi::OsString;
 use std::io;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -96,9 +97,13 @@ pub fn command_line(host: &HostView, ov: &ConnectOverrides) -> String {
 
 /// Run `ssh` with inherited stdio in the current console and wait for it. The
 /// caller is responsible for suspending/restoring the TUI around this call.
-pub fn run_ssh_inline(args: &[String]) -> io::Result<std::process::ExitStatus> {
+pub fn run_ssh_inline(
+    args: &[String],
+    env: &[(OsString, OsString)],
+) -> io::Result<std::process::ExitStatus> {
     Command::new(&tools().ssh)
         .args(args)
+        .envs(env.iter().map(|(k, v)| (k, v)))
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -142,7 +147,11 @@ pub fn escape_wt_arg(s: &str) -> String {
 /// the TUI keeps running. Returns an error to surface as a toast if `wt.exe` is
 /// unavailable.
 #[cfg(windows)]
-pub fn connect_new_tab(alias: &str, args: &[String]) -> io::Result<()> {
+pub fn connect_new_tab(
+    alias: &str,
+    args: &[String],
+    env: &[(OsString, OsString)],
+) -> io::Result<()> {
     let wt =
         find_wt().ok_or_else(|| io::Error::other("wt.exe not found — use Enter for inline"))?;
     let ssh = tools().ssh.to_string_lossy().to_string();
@@ -157,12 +166,20 @@ pub fn connect_new_tab(alias: &str, args: &[String]) -> io::Result<()> {
     for a in args {
         cmd.arg(escape_wt_arg(a));
     }
+    // Whether the tab's ssh inherits this env from wt.exe is the open spike
+    // question; connect dispatch passes &[] for new-tab in v1 (auto-fill gated
+    // off), so this is a no-op until the spike confirms inheritance.
+    cmd.envs(env.iter().map(|(k, v)| (k, v)));
     cmd.spawn().map(|_| ())
 }
 
 /// Best-effort new-window connect on non-Windows hosts.
 #[cfg(not(windows))]
-pub fn connect_new_tab(_alias: &str, args: &[String]) -> io::Result<()> {
+pub fn connect_new_tab(
+    _alias: &str,
+    args: &[String],
+    env: &[(OsString, OsString)],
+) -> io::Result<()> {
     let terminals = [
         "x-terminal-emulator",
         "wezterm",
@@ -179,6 +196,7 @@ pub fn connect_new_tab(_alias: &str, args: &[String]) -> io::Result<()> {
         }
         cmd.arg("ssh");
         cmd.args(args);
+        cmd.envs(env.iter().map(|(k, v)| (k, v)));
         if cmd.spawn().is_ok() {
             return Ok(());
         }

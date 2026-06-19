@@ -304,7 +304,7 @@ fn connect_selected(
     match mode {
         ConnectMode::Inline => {
             suspend_tui(terminal)?;
-            let status = run_ssh_inline(&args);
+            let status = run_ssh_inline(&args, &[]);
             restore_tui(terminal)?;
             match status {
                 Ok(s) => {
@@ -315,7 +315,7 @@ fn connect_selected(
                 Err(e) => app.toast(format!("failed to launch ssh: {e}"), true),
             }
         }
-        ConnectMode::NewWtTab => match connect_new_tab(host.alias(), &args) {
+        ConnectMode::NewWtTab => match connect_new_tab(host.alias(), &args, &[]) {
             Ok(()) => app.toast(format!("opened new tab: ssh {}", host.alias()), false),
             Err(e) => app.toast(format!("{e}"), true),
         },
