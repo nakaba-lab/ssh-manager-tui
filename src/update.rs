@@ -56,32 +56,48 @@ pub fn handle_key(app: &mut App, key: KeyEvent, terminal: &mut DefaultTerminal) 
         Screen::Vault => handle_vault(app, key),
         Screen::VaultUnlock => handle_vault_unlock(app, key),
         Screen::VaultEntry { editing } => handle_vault_entry(app, key, editing),
-        Screen::PasswordConfirm { alias, mode, .. } => {
-            handle_password_confirm(app, key, alias, mode, terminal)?
-        }
+        Screen::PasswordConfirm {
+            alias, mode, rc, ..
+        } => handle_password_confirm(app, key, alias, mode, rc, terminal)?,
     }
     Ok(())
 }
 
 /// The one-time password-confirm modal: Enter/`y` confirms (re-enter the connect
 /// arming the password), Esc/`n` declines (re-enter withholding it — passphrase
-/// still arms). Closing the overlay first returns to the base screen (List) so the
-/// inline connect suspends/restores over it.
+/// still arms). The cached `rc` from the first pass is handed back so the re-entry
+/// reuses it instead of running `ssh -G` again. Closing the overlay first returns
+/// to the base screen (List) so the inline connect suspends/restores over it.
 fn handle_password_confirm(
     app: &mut App,
     key: KeyEvent,
     alias: String,
     mode: ConnectMode,
+    rc: Box<ResolvedConfig>,
     terminal: &mut DefaultTerminal,
 ) -> Result<()> {
     match key.code {
         KeyCode::Enter | KeyCode::Char('y') => {
             close_overlay(app);
-            connect_by_alias(app, terminal, &alias, mode, PasswordChoice::Confirmed)?;
+            connect_by_alias(
+                app,
+                terminal,
+                &alias,
+                mode,
+                PasswordChoice::Confirmed,
+                Some(*rc),
+            )?;
         }
         KeyCode::Esc | KeyCode::Char('n') => {
             close_overlay(app);
-            connect_by_alias(app, terminal, &alias, mode, PasswordChoice::Withheld)?;
+            connect_by_alias(
+                app,
+                terminal,
+                &alias,
+                mode,
+                PasswordChoice::Withheld,
+                Some(*rc),
+            )?;
         }
         _ => {}
     }
@@ -442,7 +458,7 @@ fn connect_selected(
         return Ok(());
     };
     let alias = app.hosts[idx].alias().to_string();
-    connect_by_alias(app, terminal, &alias, mode, PasswordChoice::Ask)
+    connect_by_alias(app, terminal, &alias, mode, PasswordChoice::Ask, None)
 }
 
 /// The re-entrant connect executor (spec "Connect-time flow"): resolve the alias →
@@ -456,6 +472,7 @@ fn connect_by_alias(
     alias: &str,
     mode: ConnectMode,
     choice: PasswordChoice,
+    cached_rc: Option<ResolvedConfig>,
 ) -> Result<()> {
     // The host can vanish if the config changed under a deferred confirm — degrade
     // to a message rather than panic.
@@ -486,12 +503,19 @@ fn connect_by_alias(
         return connect_plain(app, terminal, &host, &args, mode);
     }
 
-    // A `Match exec` anywhere in the config would make `ssh -G` execute a
-    // predicate, so skip the resolve entirely and degrade.
-    let host_has_match_exec = has_match_exec(&app.config.render());
-    let rc = (!host_has_match_exec)
-        .then(|| resolve_config(alias).ok())
-        .flatten();
+    // Reuse the first-pass resolution if the modal handed it back, so the
+    // Confirmed/Withheld re-entry does not run `ssh -G` (and any `Match exec`
+    // predicate) a second time. Otherwise resolve now — but a `Match exec`
+    // anywhere in the config would make `ssh -G` execute a predicate, so skip the
+    // resolve entirely and degrade.
+    let (host_has_match_exec, rc) = match cached_rc {
+        Some(rc) => (false, Some(rc)),
+        None => {
+            let mex = has_match_exec(&app.config.render());
+            let rc = (!mex).then(|| resolve_config(alias).ok()).flatten();
+            (mex, rc)
+        }
+    };
     let resolved = rc.is_some();
     let is_proxied = host.is_proxied()
         || rc
@@ -533,7 +557,9 @@ fn connect_by_alias(
         }
         ConnectPlan::DeferPasswordConfirm(kinds) => {
             // Show the one-time consent modal; its Enter/Esc re-enters here with
-            // Confirmed/Withheld. Only reachable from `Ask`.
+            // Confirmed/Withheld, reusing the cached `rc` so we don't resolve twice.
+            // Only reachable from `Ask`, and DeferPasswordConfirm implies resolved.
+            let rc = rc.expect("DeferPasswordConfirm implies a resolved config");
             let target = target.unwrap_or_else(|| alias.to_string());
             open_overlay(
                 app,
@@ -542,6 +568,7 @@ fn connect_by_alias(
                     mode,
                     kinds,
                     target,
+                    rc: Box::new(rc),
                 },
             );
             Ok(())
