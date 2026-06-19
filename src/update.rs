@@ -366,6 +366,14 @@ fn connect_plan(
         return ConnectPlan::Normal(None); // degrade silently (no env)
     }
     if !is_known {
+        // BLANKET gate, load-bearing for BOTH kinds — not just the server-facing
+        // password. Arming sets `SSH_ASKPASS_REQUIRE=force`, which routes the
+        // host-key "Are you sure you want to continue connecting" prompt to our
+        // helper too; the helper classifies it as `Other` and replies empty, so an
+        // unknown host would fail with "Host key verification failed" before any
+        // secret prompt (validated by the Step 0 spike). So we must NOT arm an
+        // unknown host even for a (local) passphrase: leave the first connect
+        // un-armed so the user accepts the key on the TTY, then auto-fill on reconnect.
         return ConnectPlan::Normal(Some(format!(
             "host key not yet trusted for {alias} — accept it at the prompt, then reconnect to auto-fill the stored secret"
         )));
@@ -2036,6 +2044,13 @@ mod tests {
         match connect_plan(Some(both), false, true, false, false, false, "h") {
             ConnectPlan::Normal(Some(msg)) => assert!(msg.contains("not yet trusted")),
             other => panic!("expected Normal(Some), got {other:?}"),
+        }
+        // passphrase-only + not known -> STILL normal+nudge, never armed. The TOFU
+        // gate is blanket because arming sets force, which hijacks the host-key
+        // prompt; an unknown host must not be armed even for a local passphrase.
+        match connect_plan(Some(pp_only), false, true, false, false, false, "h") {
+            ConnectPlan::Normal(Some(msg)) => assert!(msg.contains("not yet trusted")),
+            other => panic!("expected Normal(Some) for passphrase-only/not-known, got {other:?}"),
         }
         // password armed + known + not yet confirmed -> defer to the confirm modal.
         assert_eq!(
