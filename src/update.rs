@@ -2261,5 +2261,9 @@ mod tests {
         assert!(t.is_some_and(|(m, e)| e && m.contains("web1") && m.contains("never requested")));
         // Nothing served, clean exit (key auth never prompted) -> no toast.
         assert_eq!(connect_toast("h", Some(0), &Outcome::NotAttempted), None);
+        // A detached/stalled teardown (TimedOut) folds into the exit summary:
+        // 255 -> error toast, clean exit -> no toast.
+        assert!(connect_toast("h", Some(255), &Outcome::TimedOut).is_some_and(|(_, e)| e));
+        assert_eq!(connect_toast("h", Some(0), &Outcome::TimedOut), None);
     }
 }
