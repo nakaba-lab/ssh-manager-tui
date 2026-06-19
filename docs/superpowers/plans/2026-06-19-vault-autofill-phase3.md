@@ -30,6 +30,49 @@ sections "Connect-time flow", "Deferred unlock → confirm → connect state mac
 
 ---
 
+## DECISION LOG (2026-06-19): locked-vault connect = **Option A** (user-approved)
+
+The spec (rev 4) step 4 mandates **Option B**: a locked vault on connect prompts
+for the master password, then auto-fills. The implemented keystone `connect_plan`
+instead does **Option A**: while locked, `App::vault_secret_kinds` returns `None`
+(candidacy is unknowable without decrypting the whole AEAD vault — you cannot tell
+whether *this* host has a stored secret while locked), so the connect degrades to a
+normal `ssh` with no prompt. The user enables auto-fill by unlocking the vault once
+per session (`P`). **The user approved Option A** (deviation from spec step 4) on
+2026-06-19, to avoid a master-password prompt on every connect to secretless /
+key-only hosts.
+
+**Consequence — T8/T9 simplify.** Option B needed `PendingConnect` + an `Awaiting`
+state machine + an `event_loop` terminal-bearing drain + a `submit_vault_unlock`
+special case ONLY to bridge the async *unlock→resume* hop across the `VaultUnlock`
+modal's Enter. Option A has **no unlock-on-connect leg**, so the only deferral is the
+password-confirm modal — and `handle_key` already carries the terminal (today's
+`connect_selected` proves it), so confirm/decline can run the inline connect
+**synchronously**. Therefore, in place of T7's `pending_connect`/`Awaiting` and all
+of T9's drain machinery, this build uses a single re-entrant executor:
+
+```rust
+enum PasswordChoice { Ask, Confirmed, Withheld }
+fn connect_by_alias(app, terminal, alias, mode, choice) -> Result<()>
+```
+
+- `connect_selected` / `handle_action_menu` call it with `Ask`.
+- `Ask` + password-candidate not in `confirmed_password_targets` → open
+  `Screen::PasswordConfirm`; its Enter re-enters with `Confirmed` (insert the
+  resolved `<user@host>`, then arm both), its Esc/`n` re-enters with `Withheld`
+  (mask Password off candidacy → arm passphrase-only or degrade to Normal).
+- The re-entrant call can never re-open the modal (Confirmed ⇒ confirmed=true ⇒
+  `Arm`; Withheld ⇒ password masked ⇒ `Arm`/`Normal`), so no loop.
+
+`pending_connect`, `enum Awaiting`, the `event_loop` connect-drain, and the
+`submit_vault_unlock` deferred branch are **not built** (Option A removes their
+reason to exist). `askpass_listeners` + `drain_askpass` are likewise deferred to the
+new-tab auto-fill task (inline owns its listener in a `Drop`/`stop_and_join`
+scope-guard; nothing outlives a connect in v1). The user-facing two-keypress hop and
+every gate/outcome behavior the spec lists are preserved.
+
+---
+
 ## Step 0 — manual spike (GATING; not a code task)
 
 The spec gates ship/degrade on a manual spike that this plan does **not** automate.
