@@ -1,7 +1,7 @@
 //! Central application state plus the screen/mode enums that drive both
 //! rendering ([`crate::ui`]) and input dispatch ([`crate::update`]).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -320,9 +320,17 @@ pub struct App {
     /// Session opt-in for connect-time **password** auto-fill (off by default:
     /// the password method is server-facing and can burn an auth attempt under
     /// `force`). Passphrase auto-fill is unaffected. Not persisted across restart.
-    // TODO(phase3): read by connect dispatch + the indicator; toggled from the vault screen.
-    #[allow(dead_code)]
+    /// Toggled with `p` on the vault screen; read by connect dispatch + the
+    /// indicator (via [`App::vault_secret_kinds`]).
     pub password_autofill_enabled: bool,
+    /// Resolved `<user@host>` targets the user has confirmed for connect-time
+    /// **password** auto-fill this session (the one-time password-confirm modal's
+    /// memory). Holds no secret — only the resolved identity string. Session-
+    /// scoped: cleared on lock, on `rebuild_hosts` (a host edit could change what
+    /// a target resolves to), and never persisted.
+    // TODO(phase3): read by connect dispatch (T8).
+    #[allow(dead_code)]
+    pub confirmed_password_targets: HashSet<String>,
     /// When a vault secret was copied, the deadline to auto-clear the clipboard,
     /// plus a (non-reversible) hash of the copied secret so the clear only fires
     /// if the clipboard still holds it — never the plaintext, which stays sealed.
@@ -380,6 +388,7 @@ impl App {
             vault_entry: VaultEntryForm::default(),
             vault_reveal: false,
             password_autofill_enabled: false,
+            confirmed_password_targets: HashSet::new(),
             clipboard_clear_at: None,
             clipboard_hash: 0,
             clipboard_hash_key: {
@@ -416,6 +425,9 @@ impl App {
         self.hosts = views.into_iter().map(|(_, v)| v).collect();
         self.liveness.clear();
         self.rtt.clear();
+        // A host edit can change what a confirmed target resolves to, so the
+        // session-scoped password-confirm memory must not outlive a rebuild.
+        self.confirmed_password_targets.clear();
         self.refilter();
         self.clamp_selection();
     }

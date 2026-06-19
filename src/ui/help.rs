@@ -63,6 +63,7 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
             lines.push(key("y / c", "copy secret to clipboard"));
             lines.push(key("d", "delete secret"));
             lines.push(key("Space", "reveal / mask secrets"));
+            lines.push(key("p", "toggle connect-time password auto-fill"));
             lines.push(key("L", "lock vault (forget master password)"));
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(

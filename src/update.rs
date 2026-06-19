@@ -1076,14 +1076,36 @@ fn handle_vault(app: &mut App, key: KeyEvent) {
                 open_confirm(app, ConfirmAction::DeleteVaultEntry(sel));
             }
         }
+        KeyCode::Char('p') => toggle_password_autofill(app),
         KeyCode::Char('L') => {
-            // Lock: drop the decrypted vault from memory.
+            // Lock: drop the decrypted vault from memory, and forget the session's
+            // password-confirm consents (they must not survive a re-unlock).
             app.vault = None;
             app.vault_reveal = false;
+            app.confirmed_password_targets.clear();
             app.screen = Screen::List;
             app.toast("vault locked", false);
         }
         _ => {}
+    }
+}
+
+/// Flip the session-scoped connect-time **password** auto-fill opt-in. Off by
+/// default because the password method is server-facing under `SSH_ASKPASS=force`
+/// and a server offering keyboard-interactive (not `password`) would burn an auth
+/// attempt; passphrase auto-fill is always on and unaffected. Enabling also still
+/// requires a one-time per-target confirm at connect time.
+fn toggle_password_autofill(app: &mut App) {
+    app.password_autofill_enabled = !app.password_autofill_enabled;
+    if app.password_autofill_enabled {
+        app.toast(
+            "password auto-fill ON — armed per-host after a one-time confirm; passphrases were already on",
+            false,
+        );
+    } else {
+        // Disabling drops any consents so re-enabling re-asks per target.
+        app.confirmed_password_targets.clear();
+        app.toast("password auto-fill OFF", false);
     }
 }
 

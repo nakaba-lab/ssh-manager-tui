@@ -102,13 +102,17 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
         })
         .collect();
 
-    let title = if app.vault_reveal {
-        "Passwords  (revealed)"
-    } else {
-        "Passwords"
-    };
+    let title = format!(
+        "Passwords{}  ·  pw-autofill {}",
+        if app.vault_reveal { "  (revealed)" } else { "" },
+        if app.password_autofill_enabled {
+            "on"
+        } else {
+            "off"
+        },
+    );
     let list = List::new(items)
-        .block(panel(title, true))
+        .block(panel(&title, true))
         .highlight_style(theme::selection())
         .highlight_symbol(theme::SELECT_SYMBOL);
     f.render_stateful_widget(list, area, &mut app.vault_state);

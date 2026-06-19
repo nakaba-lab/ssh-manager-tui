@@ -197,6 +197,7 @@ fn draw_footer(f: &mut Frame, app: &App, base: &Screen, area: Rect) {
             ("y", "copy"),
             ("d", "del"),
             ("Space", "reveal"),
+            ("p", "pw-autofill"),
             ("L", "lock"),
             ("Esc", "back"),
         ]),
