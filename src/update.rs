@@ -26,7 +26,7 @@ use crate::os::connect::{
 use crate::os::keys::{generate_key, read_public_key};
 use crate::os::known_hosts::remove_entry;
 use crate::os::ssh_dir;
-use crate::os::vault::{self, Vault, VaultEntry};
+use crate::os::vault::{self, MatchedKinds, Vault, VaultEntry};
 use crate::ui::confirm::ACTION_LABELS;
 
 pub fn handle_key(app: &mut App, key: KeyEvent, terminal: &mut DefaultTerminal) -> Result<()> {
@@ -289,6 +289,61 @@ fn select_index(app: &mut App, idx: usize) {
 // ---------------------------------------------------------------------------
 // Connecting
 // ---------------------------------------------------------------------------
+
+/// What connect dispatch should do for a host, once the candidacy + gate inputs
+/// are known. Pure decision (computed by [`connect_plan`]); the caller executes
+/// it. v1 NOTE: a locked vault yields `candidacy == None` upstream (see
+/// `App::vault_secret_kinds`), so there is deliberately no unlock-on-connect
+/// branch — the user unlocks first to arm auto-fill. The spec's
+/// locked→unlock→auto-fill is deferred because candidacy cannot be known while
+/// locked without prompting for the master password on *every* connect (even
+/// keyless hosts).
+// TODO(phase3): executed by connect_by_alias.
+#[allow(dead_code)]
+#[derive(Debug, PartialEq, Eq)]
+enum ConnectPlan {
+    /// Connect normally, no auto-fill. `Some(msg)` = emit this non-error toast
+    /// (the TOFU not-yet-trusted nudge); `None` = silent (no candidacy match, a
+    /// proxied host, a failed resolve, or a Match-exec degrade).
+    Normal(Option<String>),
+    /// Show the one-time password-confirm modal first, then connect.
+    DeferPasswordConfirm(MatchedKinds),
+    /// Arm these kinds and connect with auto-fill.
+    Arm(MatchedKinds),
+}
+
+/// The pure connect-dispatch gate sequence (spec "Connect-time flow" steps 1–5):
+/// candidacy → Match-exec degrade → resolve → proxy skip → TOFU known-host gate →
+/// password-confirm gate → arm. Every miss degrades to a normal connect (fails
+/// safe — never arms). `candidacy` is the opt-in-masked `vault_secret_kinds`
+/// result (so password is already dropped when disabled / vault locked).
+// TODO(phase3): executed by connect_by_alias.
+#[allow(dead_code)]
+fn connect_plan(
+    candidacy: Option<MatchedKinds>,
+    host_has_match_exec: bool,
+    resolved: bool,
+    is_proxied: bool,
+    is_known: bool,
+    password_confirmed: bool,
+    alias: &str,
+) -> ConnectPlan {
+    let Some(kinds) = candidacy else {
+        return ConnectPlan::Normal(None); // no match (or vault locked) — silent
+    };
+    if host_has_match_exec || !resolved || is_proxied {
+        return ConnectPlan::Normal(None); // degrade silently (no env)
+    }
+    if !is_known {
+        return ConnectPlan::Normal(Some(format!(
+            "host key not yet trusted for {alias} — accept it at the prompt, then reconnect to auto-fill the stored secret"
+        )));
+    }
+    if kinds.password && !password_confirmed {
+        return ConnectPlan::DeferPasswordConfirm(kinds);
+    }
+    ConnectPlan::Arm(kinds)
+}
 
 fn connect_selected(
     app: &mut App,
@@ -1572,5 +1627,58 @@ mod tests {
         assert_eq!(s, "value");
         // Capacity preserved so subsequent edits do not immediately realloc.
         assert!(s.capacity() >= "secret-value".len());
+    }
+
+    #[test]
+    fn connect_plan_gates() {
+        let both = MatchedKinds {
+            password: true,
+            passphrase: true,
+        };
+        let pp_only = MatchedKinds {
+            password: false,
+            passphrase: true,
+        };
+
+        // No candidacy (no match, or vault locked) -> normal, silent.
+        assert_eq!(
+            connect_plan(None, false, true, false, true, false, "h"),
+            ConnectPlan::Normal(None)
+        );
+        // Match-exec on the host -> degrade silently (no ssh -G side effects).
+        assert_eq!(
+            connect_plan(Some(both), true, true, false, true, false, "h"),
+            ConnectPlan::Normal(None)
+        );
+        // resolve failed/timed out -> degrade silently.
+        assert_eq!(
+            connect_plan(Some(both), false, false, false, true, false, "h"),
+            ConnectPlan::Normal(None)
+        );
+        // proxied -> degrade silently (permanent skip).
+        assert_eq!(
+            connect_plan(Some(both), false, true, true, true, false, "h"),
+            ConnectPlan::Normal(None)
+        );
+        // not yet known (TOFU) -> normal WITH the nudge toast.
+        match connect_plan(Some(both), false, true, false, false, false, "h") {
+            ConnectPlan::Normal(Some(msg)) => assert!(msg.contains("not yet trusted")),
+            other => panic!("expected Normal(Some), got {other:?}"),
+        }
+        // password armed + known + not yet confirmed -> defer to the confirm modal.
+        assert_eq!(
+            connect_plan(Some(both), false, true, false, true, false, "h"),
+            ConnectPlan::DeferPasswordConfirm(both)
+        );
+        // password armed + already confirmed -> arm.
+        assert_eq!(
+            connect_plan(Some(both), false, true, false, true, true, "h"),
+            ConnectPlan::Arm(both)
+        );
+        // passphrase only (no password kind) -> arm directly, no confirm.
+        assert_eq!(
+            connect_plan(Some(pp_only), false, true, false, true, false, "h"),
+            ConnectPlan::Arm(pp_only)
+        );
     }
 }
