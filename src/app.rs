@@ -15,6 +15,7 @@ use crate::config::model::HostView;
 use crate::os::keys::KeyInfo;
 use crate::os::known_hosts::{HostSpec, KnownHostEntry};
 use crate::os::liveness::{Liveness, LivenessProbe, ProbeTarget};
+use crate::os::resolve::ResolvedConfig;
 use crate::os::vault::{MatchedKinds, SecretKind, Vault, match_vault_kinds};
 use crate::os::{self, keys, known_hosts};
 
@@ -105,6 +106,11 @@ pub enum Screen {
         mode: ConnectMode,
         kinds: MatchedKinds,
         target: String,
+        /// The `ssh -G` resolution from the first (Ask) pass, cached so the
+        /// Confirmed/Withheld re-entry need not re-run `ssh -G` (which would
+        /// execute any `Match exec` predicate a second time). Boxed to keep the
+        /// `Screen` enum small.
+        rc: Box<ResolvedConfig>,
     },
 }
 

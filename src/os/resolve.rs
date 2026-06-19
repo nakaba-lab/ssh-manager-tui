@@ -5,11 +5,6 @@
 //! Zero ratatui / zero `App` dependency. Phase 2 of vault auto-fill; the values
 //! resolved here are consumed by the connect wiring in Phase 3.
 
-// Phase 2 builds this module standalone; its items are wired into the connect
-// path in Phase 3. Until then the binary (non-test) build sees them as unused.
-// TODO(phase3): remove this once the connect path references this module.
-#![allow(dead_code)]
-
 use std::io;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};

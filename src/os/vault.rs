@@ -533,11 +533,27 @@ fn restrict_acl(path: &Path) {
         .status();
 }
 
+/// Best-effort directory fsync so a rename is persisted, not just buffered. On
+/// unix this is the documented way to make a rename durable; on Windows a directory
+/// flush needs backup-semantics not exposed by `std`, so NTFS metadata journaling
+/// is relied on. Deliberately best-effort (never propagated): the rename has
+/// already succeeded by this point, so failing the whole `save` here would
+/// desync the in-memory vault from disk via the caller's rollback.
+fn fsync_parent_dir(dir: &Path) {
+    #[cfg(unix)]
+    if let Ok(d) = fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+}
+
 /// Write `bytes` to `path` atomically and durably. The temp file is created
 /// exclusively with a unique name, locked down to the owner (0o600 on unix,
-/// owner-only ACL on Windows), then swapped in via a rename — moving the existing
-/// vault to a `.bak` first so a crash mid-swap always leaves a recoverable copy
-/// (the vault holds the only copy of irreplaceable secrets).
+/// owner-only ACL on Windows), fsynced, then swapped in via a rename — moving the
+/// existing vault to a `.bak` first so a crash mid-swap always leaves a recoverable
+/// copy (the vault holds the only copy of irreplaceable secrets). The temp file is
+/// removed on every failure path so a failed save never leaks an encrypted orphan.
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     if !dir.exists() {
@@ -550,7 +566,11 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     }
 
     let tmp = dir.join(temp_name()?);
-    {
+    // Write + fsync the temp; on ANY failure remove it so we never leak an
+    // encrypted orphan, and propagate the fsync result so a flush failure
+    // (EIO/ENOSPC) aborts BEFORE the destructive swap rather than renaming
+    // incomplete data over the good vault.
+    let write_res = (|| -> Result<()> {
         use std::io::Write;
         let mut opts = fs::OpenOptions::new();
         opts.write(true).create_new(true);
@@ -561,7 +581,12 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         }
         let mut f = opts.open(&tmp)?;
         f.write_all(bytes)?;
-        let _ = f.sync_all();
+        f.sync_all()?;
+        Ok(())
+    })();
+    if let Err(e) = write_res {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
     }
     #[cfg(windows)]
     restrict_acl(&tmp);
@@ -572,10 +597,14 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         // drop. Back it up, swap in the temp, then drop the backup — at every
         // crash point either `path` or `.bak` holds a complete vault.
         let _ = fs::remove_file(&bak);
-        fs::rename(path, &bak)?;
+        if let Err(e) = fs::rename(path, &bak) {
+            let _ = fs::remove_file(&tmp);
+            return Err(e.into());
+        }
         match fs::rename(&tmp, path) {
             Ok(()) => {
                 let _ = fs::remove_file(&bak);
+                fsync_parent_dir(dir);
                 Ok(())
             }
             Err(e) => {
@@ -591,7 +620,11 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         // No vault at `path`. NEVER touch a surviving `.bak` here — it may be a
         // crash-orphaned real vault that recovery (not this create) must restore.
         // Deleting it would destroy the only copy of the user's secrets.
-        fs::rename(&tmp, path)?;
+        if let Err(e) = fs::rename(&tmp, path) {
+            let _ = fs::remove_file(&tmp);
+            return Err(e.into());
+        }
+        fsync_parent_dir(dir);
         Ok(())
     }
 }
@@ -759,6 +792,32 @@ mod tests {
             ),
         }
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_draws_a_fresh_nonce_each_time() {
+        // XChaCha20-Poly1305 nonce reuse under the fixed per-vault key would be
+        // catastrophic (it breaks confidentiality + authenticity). Guard that two
+        // saves of the same in-memory vault emit a different nonce (and therefore a
+        // different ciphertext), so a future refactor that hoisted/cached the nonce
+        // can't slip through.
+        let mut v = Vault::create("m").unwrap();
+        v.upsert(None, entry("web1", SecretKind::Password, "p"));
+        let a = temp_vault_path("nonce-a");
+        let b = temp_vault_path("nonce-b");
+        v.save(&a).unwrap();
+        v.save(&b).unwrap();
+
+        let fa: VaultFile = serde_json::from_str(&fs::read_to_string(&a).unwrap()).unwrap();
+        let fb: VaultFile = serde_json::from_str(&fs::read_to_string(&b).unwrap()).unwrap();
+        assert_ne!(fa.nonce, fb.nonce, "each save must draw a fresh nonce");
+        assert_ne!(
+            fa.ciphertext, fb.ciphertext,
+            "a fresh nonce must change the ciphertext"
+        );
+
+        let _ = fs::remove_file(&a);
+        let _ = fs::remove_file(&b);
     }
 
     #[test]

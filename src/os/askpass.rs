@@ -9,15 +9,11 @@
 //!
 //! Zero ratatui dependency (see CLAUDE.md layering).
 
-// Phase 1 builds this module standalone; its items are wired into the connect
-// path in Phase 3. Until then the binary (non-test) build sees them as unused.
-// TODO(phase3): remove this once the connect path references this module.
-#![allow(dead_code)]
-
 use std::collections::HashSet;
 use std::io::{self, Read, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use zeroize::Zeroizing;
 
@@ -535,9 +531,12 @@ pub enum Outcome {
     Declined {
         reason: DeclineReason,
     },
-    /// Reserved for the detached new-tab path (it tears down on
-    /// `NEW_TAB_ASKPASS_TIMEOUT`); the inline serve loop only stops, never times
-    /// out, so this is never produced in v1.
+    /// Returned by `AskpassListener::shutdown` when the worker does not acknowledge
+    /// stop within `SHUTDOWN_GRACE` and is detached — a peer parked mid-handshake in
+    /// a blocking read the accept-wake can't reach. On unix the per-connection read
+    /// timeout still lets the worker self-exit (and zeroize) shortly after; on
+    /// windows it lingers until process exit. (Also the reap signal reserved for the
+    /// deferred new-tab teardown path.)
     TimedOut,
     NotAttempted,
 }
@@ -584,8 +583,9 @@ fn serve_result(prompt: &str, released: bool) -> ServeResult {
 /// this connect's auth flow). `Served` wins; else if no token-valid request ever
 /// arrived → `NotAttempted`; else if a password was armed and a
 /// keyboard-interactive prompt was seen → `Declined { KeyboardInteractive }`;
-/// else `Declined { NoMatch }`. The `TimedOut` case is decided by the listener
-/// loop (timeout fired with nothing served), not here.
+/// else `Declined { NoMatch }`. `TimedOut` is never produced here — it is
+/// `shutdown`'s detach result and supersedes this worker Outcome when the bounded
+/// teardown gives up on a stalled worker.
 pub fn outcome_from(results: &[ServeResult], password_armed: bool) -> Outcome {
     let mut last_served: Option<SecretKind> = None;
     let mut saw_kbd_interactive = false;
@@ -615,34 +615,64 @@ pub fn outcome_from(results: &[ServeResult], password_armed: bool) -> Outcome {
     }
 }
 
+/// How long teardown waits for the worker to acknowledge stop before giving up on
+/// the join and detaching it. The normal path (worker parked in `accept`, woken by
+/// the self-connect) exits in well under a millisecond; this bound only bites if a
+/// peer is parked mid-handshake in a blocking read the self-connect can't reach —
+/// in which case we return [`Outcome::TimedOut`] rather than freeze the UI thread.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+
+/// Per-connection handshake read budget (unix): a client that connects but never
+/// sends its `[token][prompt]` yields a timeout `Err` instead of parking the worker
+/// forever. The real helper writes immediately on connect, so this is generous.
+#[cfg(unix)]
+const HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// A live connect-time askpass listener: the serve-loop worker thread, its stop
-/// flag, and the channel address (needed to unblock the worker's pending accept
-/// at teardown). The worker owns the [`ConnectSecrets`], so the secrets are
-/// zeroized when it returns — `stop_and_join`/`Drop` both guarantee that.
+/// flag, the channel address (to unblock the worker's pending accept at teardown),
+/// and a completion signal. The worker owns the [`ConnectSecrets`], so the secrets
+/// are zeroized when it returns; teardown joins it but is **bounded** so a peer
+/// stalled mid-handshake can never hang the UI thread.
 pub struct AskpassListener {
     handle: Option<std::thread::JoinHandle<Outcome>>,
+    /// The worker sends its terminal `Outcome` here right before it returns, so
+    /// teardown can wait on it with a timeout instead of an unbounded `join`.
+    done: std::sync::mpsc::Receiver<Outcome>,
     stop: Arc<AtomicBool>,
     addr: String,
 }
 
 impl AskpassListener {
     /// Stop the loop, unblock its pending accept (via a throwaway self-connect),
-    /// join the worker, and return the connect's terminal [`Outcome`]. The worker
-    /// has dropped its `ConnectSecrets` by the time `join` returns.
+    /// and return the connect's terminal [`Outcome`]. On the normal path the worker
+    /// has dropped (zeroized) its `ConnectSecrets` by the time this returns; on a
+    /// stalled worker it returns [`Outcome::TimedOut`] after a bounded wait rather
+    /// than blocking the UI forever (the worker is detached; a unix read timeout
+    /// still lets it self-exit and zeroize shortly after).
     pub fn stop_and_join(mut self) -> Outcome {
         self.shutdown().unwrap_or(Outcome::NotAttempted)
     }
 
-    /// Signal stop, wake the blocking accept, and join. Returns the worker's
-    /// Outcome if it was still running. Idempotent: a second call is a no-op.
+    /// Signal stop, wake the blocking accept, and wait (bounded) for the worker to
+    /// finish. Idempotent: a second call (e.g. from `Drop`) is a no-op.
     fn shutdown(&mut self) -> Option<Outcome> {
         let handle = self.handle.take()?;
         self.stop.store(true, Ordering::SeqCst);
         // Unblock the worker's blocking accept with a throwaway connection: it
-        // wakes, sees the stop flag, and breaks. Best-effort — a failed connect
-        // just means the worker already broke on its own.
-        let _ = connect_client(&self.addr);
-        Some(handle.join().unwrap_or(Outcome::NotAttempted))
+        // wakes, sees the stop flag, and breaks. NON-retrying (unlike the helper's
+        // `connect_client`): if a stalled peer squats the channel, retrying here
+        // would block the UI thread for seconds before `recv_timeout` could detach.
+        wake_connect(&self.addr);
+        // Bounded wait: if the worker acknowledges within the grace window, join it
+        // (instant) and return its Outcome. Otherwise it is parked in a blocking
+        // read the wake couldn't reach — detach rather than freeze the UI.
+        match self.done.recv_timeout(SHUTDOWN_GRACE) {
+            Ok(outcome) => {
+                let _ = handle.join();
+                Some(outcome)
+            }
+            Err(_) => Some(Outcome::TimedOut),
+        }
     }
 }
 
@@ -673,11 +703,20 @@ pub fn arm_connect(
 
     let listener = Listener::bind(token)?;
     let addr = listener.address().to_string();
+    // A non-representable (e.g. non-UTF-8) address would arm the env with an empty
+    // channel the helper could never reach (and teardown could never wake) — fail
+    // closed so the caller degrades to a clean plain connect instead.
+    if addr.is_empty() {
+        return Err(io::Error::other(
+            "askpass channel address is not representable",
+        ));
+    }
     let env = arm_env(&addr, &token)?;
 
     let password_armed = password.is_some();
     let stop = Arc::new(AtomicBool::new(false));
     let stop_worker = Arc::clone(&stop);
+    let (done_tx, done) = std::sync::mpsc::channel();
 
     let handle = std::thread::spawn(move || {
         let mut secrets = ConnectSecrets::new(identity, password, passphrase);
@@ -692,22 +731,29 @@ pub fn arm_connect(
                 }
                 Err(_) => {
                     // The stop self-connect surfaces here (EOF on read); a real
-                    // short-read/malformed client also lands here — per spec we do
-                    // NOT tear down for that, we loop back to accept. Stop is the
-                    // only exit.
+                    // short-read/malformed client (or a unix handshake read timeout)
+                    // also lands here — per spec we do NOT tear down for that, we
+                    // loop back to accept. Stop is the only exit.
                     if stop_worker.load(Ordering::SeqCst) {
                         break;
                     }
+                    // Back off so a persistent, immediately-returning accept() error
+                    // (e.g. fd exhaustion) can't busy-spin a CPU core.
+                    std::thread::sleep(Duration::from_millis(50));
                 }
             }
         }
-        // `secrets` drops here -> all Secret material zeroized before join returns.
-        outcome_from(&results, password_armed)
+        // `secrets` drops here -> all Secret material zeroized.
+        let outcome = outcome_from(&results, password_armed);
+        // Signal completion so a bounded teardown need not block on join.
+        let _ = done_tx.send(outcome.clone());
+        outcome
     });
 
     Ok((
         AskpassListener {
             handle: Some(handle),
+            done,
             stop,
             addr,
         },
@@ -761,6 +807,11 @@ mod chan {
         /// no reply), else `Served`/`NoMatch` for a token-valid client.
         pub fn serve_one(&self, secrets: &mut ConnectSecrets) -> io::Result<ServeResult> {
             let (mut conn, _) = self.inner.accept()?;
+            // Bound the handshake: a peer that connects then stalls before sending
+            // its request must not park the worker forever (teardown's accept-wake
+            // can't reach a thread blocked in read). A timed-out read returns Err,
+            // looping the worker back to the stop check.
+            conn.set_read_timeout(Some(HANDSHAKE_READ_TIMEOUT))?;
             let (token, prompt) = read_request(&mut conn)?;
             if !ct_eq(&token, &self.token) {
                 return Ok(ServeResult::BadToken); // drop without reply
@@ -787,11 +838,18 @@ mod chan {
     pub fn connect_client(addr: &str) -> io::Result<UnixStream> {
         UnixStream::connect(addr)
     }
+
+    /// Teardown side: a single throwaway connect to wake the worker's blocking
+    /// accept. Returns immediately (no retry); a failed wake just means the worker
+    /// already broke on its own.
+    pub fn wake_connect(addr: &str) {
+        let _ = UnixStream::connect(addr);
+    }
 }
 
 #[cfg(unix)]
 #[allow(unused_imports)]
-pub use chan::{Listener, connect_client};
+pub use chan::{Listener, connect_client, wake_connect};
 
 #[cfg(windows)]
 mod chan {
@@ -829,8 +887,8 @@ mod chan {
         FILE_FLAG_FIRST_PIPE_INSTANCE, FlushFileBuffers, PIPE_ACCESS_DUPLEX,
     };
     use windows_sys::Win32::System::Pipes::{
-        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_TYPE_BYTE, PIPE_WAIT,
-        WaitNamedPipeW,
+        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_REJECT_REMOTE_CLIENTS,
+        PIPE_TYPE_BYTE, PIPE_WAIT, WaitNamedPipeW,
     };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -978,7 +1036,9 @@ mod chan {
                 CreateNamedPipeW(
                     name.as_ptr(),
                     PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
-                    PIPE_TYPE_BYTE | PIPE_WAIT,
+                    // Reject remote (SMB) clients at the kernel level so the secret
+                    // channel is local-only, matching the unix socket's confinement.
+                    PIPE_TYPE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
                     1, // nMaxInstances: exactly one
                     PIPE_BUF,
                     PIPE_BUF,
@@ -1117,11 +1177,21 @@ mod chan {
         // Final attempt; surface whatever error it yields.
         OpenOptions::new().read(true).write(true).open(addr)
     }
+
+    /// Teardown side: a single non-retrying open to wake the worker's blocking
+    /// `ConnectNamedPipe`. Unlike [`connect_client`], it does NOT retry on
+    /// `ERROR_PIPE_BUSY`: if a stalled peer is squatting the single pipe instance,
+    /// retrying would block the calling (UI) thread for seconds — and a failed wake
+    /// is harmless because the bounded `recv_timeout` then detaches the worker.
+    pub fn wake_connect(addr: &str) {
+        use std::fs::OpenOptions;
+        let _ = OpenOptions::new().read(true).write(true).open(addr);
+    }
 }
 
 #[cfg(windows)]
 #[allow(unused_imports)]
-pub use chan::{Listener, connect_client};
+pub use chan::{Listener, connect_client, wake_connect};
 
 #[cfg(test)]
 mod tests {
@@ -1310,6 +1380,45 @@ mod tests {
                 kind: SecretKind::Password
             }
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn teardown_is_bounded_when_a_peer_stalls_mid_handshake() {
+        use super::{CHANNEL_ENV, Outcome, ResolvedIdentity, arm_connect, connect_client};
+        use crate::os::vault::Secret;
+        use std::time::{Duration, Instant};
+
+        let id = ResolvedIdentity {
+            user: "u".into(),
+            host: "h".into(),
+            host_key_alias: None,
+            identity_paths: vec![],
+        };
+        let (listener, env) = arm_connect(id, None, Some(Secret::from("pp"))).unwrap();
+        let addr = env
+            .iter()
+            .find(|(n, _)| n == CHANNEL_ENV)
+            .map(|(_, v)| v.to_string_lossy().into_owned())
+            .unwrap();
+
+        // A peer connects but sends nothing and HOLDS the connection open, parking
+        // the worker in read_request (past accept, where the teardown wake can't
+        // reach). Give the worker a moment to accept and enter the read.
+        let held = connect_client(&addr).unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+
+        // Teardown must still return promptly (~SHUTDOWN_GRACE) with TimedOut,
+        // detaching the stalled worker rather than blocking the caller forever.
+        let start = Instant::now();
+        let outcome = listener.stop_and_join();
+        let elapsed = start.elapsed();
+        assert_eq!(outcome, Outcome::TimedOut);
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "teardown must be bounded near SHUTDOWN_GRACE, took {elapsed:?}"
+        );
+        drop(held);
     }
 
     #[test]

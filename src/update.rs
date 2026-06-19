@@ -56,32 +56,48 @@ pub fn handle_key(app: &mut App, key: KeyEvent, terminal: &mut DefaultTerminal) 
         Screen::Vault => handle_vault(app, key),
         Screen::VaultUnlock => handle_vault_unlock(app, key),
         Screen::VaultEntry { editing } => handle_vault_entry(app, key, editing),
-        Screen::PasswordConfirm { alias, mode, .. } => {
-            handle_password_confirm(app, key, alias, mode, terminal)?
-        }
+        Screen::PasswordConfirm {
+            alias, mode, rc, ..
+        } => handle_password_confirm(app, key, alias, mode, rc, terminal)?,
     }
     Ok(())
 }
 
 /// The one-time password-confirm modal: Enter/`y` confirms (re-enter the connect
 /// arming the password), Esc/`n` declines (re-enter withholding it — passphrase
-/// still arms). Closing the overlay first returns to the base screen (List) so the
-/// inline connect suspends/restores over it.
+/// still arms). The cached `rc` from the first pass is handed back so the re-entry
+/// reuses it instead of running `ssh -G` again. Closing the overlay first returns
+/// to the base screen (List) so the inline connect suspends/restores over it.
 fn handle_password_confirm(
     app: &mut App,
     key: KeyEvent,
     alias: String,
     mode: ConnectMode,
+    rc: Box<ResolvedConfig>,
     terminal: &mut DefaultTerminal,
 ) -> Result<()> {
     match key.code {
         KeyCode::Enter | KeyCode::Char('y') => {
             close_overlay(app);
-            connect_by_alias(app, terminal, &alias, mode, PasswordChoice::Confirmed)?;
+            connect_by_alias(
+                app,
+                terminal,
+                &alias,
+                mode,
+                PasswordChoice::Confirmed,
+                Some(*rc),
+            )?;
         }
         KeyCode::Esc | KeyCode::Char('n') => {
             close_overlay(app);
-            connect_by_alias(app, terminal, &alias, mode, PasswordChoice::Withheld)?;
+            connect_by_alias(
+                app,
+                terminal,
+                &alias,
+                mode,
+                PasswordChoice::Withheld,
+                Some(*rc),
+            )?;
         }
         _ => {}
     }
@@ -366,6 +382,14 @@ fn connect_plan(
         return ConnectPlan::Normal(None); // degrade silently (no env)
     }
     if !is_known {
+        // BLANKET gate, load-bearing for BOTH kinds — not just the server-facing
+        // password. Arming sets `SSH_ASKPASS_REQUIRE=force`, which routes the
+        // host-key "Are you sure you want to continue connecting" prompt to our
+        // helper too; the helper classifies it as `Other` and replies empty, so an
+        // unknown host would fail with "Host key verification failed" before any
+        // secret prompt (validated by the Step 0 spike). So we must NOT arm an
+        // unknown host even for a (local) passphrase: leave the first connect
+        // un-armed so the user accepts the key on the TTY, then auto-fill on reconnect.
         return ConnectPlan::Normal(Some(format!(
             "host key not yet trusted for {alias} — accept it at the prompt, then reconnect to auto-fill the stored secret"
         )));
@@ -374,6 +398,37 @@ fn connect_plan(
         return ConnectPlan::DeferPasswordConfirm(kinds);
     }
     ConnectPlan::Arm(kinds)
+}
+
+/// Apply the per-connect password decision to the opt-in-masked candidacy: a
+/// `Withheld` decline drops the Password kind (so a password-only host degrades to
+/// `None` and a both-kinds host keeps only the passphrase); `Ask`/`Confirmed` pass
+/// through. Pure, so the release-gating mask is unit-tested directly.
+fn apply_password_choice(
+    kinds: Option<MatchedKinds>,
+    choice: PasswordChoice,
+) -> Option<MatchedKinds> {
+    let mut k = kinds?;
+    if choice == PasswordChoice::Withheld {
+        k.password = false;
+    }
+    k.any().then_some(k)
+}
+
+/// Whether a stored **password** may arm this attempt: `Confirmed` always (the
+/// modal was accepted), `Withheld` never, `Ask` only if the resolved target is
+/// already in the session-consent set. Pure; the actual insert on `Confirmed`
+/// (which persists the consent) is the caller's side effect.
+fn password_confirmed(
+    choice: PasswordChoice,
+    target: Option<&str>,
+    confirmed: &std::collections::HashSet<String>,
+) -> bool {
+    match choice {
+        PasswordChoice::Confirmed => true,
+        PasswordChoice::Withheld => false,
+        PasswordChoice::Ask => target.is_some_and(|t| confirmed.contains(t)),
+    }
 }
 
 /// Whether connect dispatch may release a stored **password** this attempt — the
@@ -403,7 +458,7 @@ fn connect_selected(
         return Ok(());
     };
     let alias = app.hosts[idx].alias().to_string();
-    connect_by_alias(app, terminal, &alias, mode, PasswordChoice::Ask)
+    connect_by_alias(app, terminal, &alias, mode, PasswordChoice::Ask, None)
 }
 
 /// The re-entrant connect executor (spec "Connect-time flow"): resolve the alias →
@@ -417,6 +472,7 @@ fn connect_by_alias(
     alias: &str,
     mode: ConnectMode,
     choice: PasswordChoice,
+    cached_rc: Option<ResolvedConfig>,
 ) -> Result<()> {
     // The host can vanish if the config changed under a deferred confirm — degrade
     // to a message rather than panic.
@@ -441,23 +497,25 @@ fn connect_by_alias(
     maybe_password_discoverability(app, &host);
 
     // Candidacy (opt-in-masked). A decline additionally drops the Password kind.
-    let candidacy = app.vault_secret_kinds(&host).and_then(|mut k| {
-        if choice == PasswordChoice::Withheld {
-            k.password = false;
-        }
-        k.any().then_some(k)
-    });
+    let candidacy = apply_password_choice(app.vault_secret_kinds(&host), choice);
     // No candidate secret → a plain connect (skip `ssh -G` for the common case).
     if candidacy.is_none() {
         return connect_plain(app, terminal, &host, &args, mode);
     }
 
-    // A `Match exec` anywhere in the config would make `ssh -G` execute a
-    // predicate, so skip the resolve entirely and degrade.
-    let host_has_match_exec = has_match_exec(&app.config.render());
-    let rc = (!host_has_match_exec)
-        .then(|| resolve_config(alias).ok())
-        .flatten();
+    // Reuse the first-pass resolution if the modal handed it back, so the
+    // Confirmed/Withheld re-entry does not run `ssh -G` (and any `Match exec`
+    // predicate) a second time. Otherwise resolve now — but a `Match exec`
+    // anywhere in the config would make `ssh -G` execute a predicate, so skip the
+    // resolve entirely and degrade.
+    let (host_has_match_exec, rc) = match cached_rc {
+        Some(rc) => (false, Some(rc)),
+        None => {
+            let mex = has_match_exec(&app.config.render());
+            let rc = (!mex).then(|| resolve_config(alias).ok()).flatten();
+            (mex, rc)
+        }
+    };
     let resolved = rc.is_some();
     let is_proxied = host.is_proxied()
         || rc
@@ -470,20 +528,17 @@ fn connect_by_alias(
         None => false,
     };
 
-    // Resolve the confirm target + fold in the session set / explicit choice.
+    // Resolve the confirm target + fold in the session set / explicit choice. A
+    // Confirmed choice persists the consent so a later Ask connect to the same
+    // resolved target skips the modal.
     let target = rc.as_ref().map(resolved_target);
-    let password_confirmed = match choice {
-        PasswordChoice::Confirmed => {
-            if let Some(t) = &target {
-                app.confirmed_password_targets.insert(t.clone());
-            }
-            true
-        }
-        PasswordChoice::Withheld => false,
-        PasswordChoice::Ask => target
-            .as_ref()
-            .is_some_and(|t| app.confirmed_password_targets.contains(t)),
-    };
+    if choice == PasswordChoice::Confirmed
+        && let Some(t) = &target
+    {
+        app.confirmed_password_targets.insert(t.clone());
+    }
+    let password_confirmed =
+        password_confirmed(choice, target.as_deref(), &app.confirmed_password_targets);
 
     match connect_plan(
         candidacy,
@@ -502,7 +557,9 @@ fn connect_by_alias(
         }
         ConnectPlan::DeferPasswordConfirm(kinds) => {
             // Show the one-time consent modal; its Enter/Esc re-enters here with
-            // Confirmed/Withheld. Only reachable from `Ask`.
+            // Confirmed/Withheld, reusing the cached `rc` so we don't resolve twice.
+            // Only reachable from `Ask`, and DeferPasswordConfirm implies resolved.
+            let rc = rc.expect("DeferPasswordConfirm implies a resolved config");
             let target = target.unwrap_or_else(|| alias.to_string());
             open_overlay(
                 app,
@@ -511,6 +568,7 @@ fn connect_by_alias(
                     mode,
                     kinds,
                     target,
+                    rc: Box::new(rc),
                 },
             );
             Ok(())
@@ -753,7 +811,10 @@ fn copy_command(app: &mut App) {
 
 fn copy_to_clipboard(text: &str) -> Result<()> {
     let mut cb = arboard::Clipboard::new()?;
-    cb.set_text(text.to_string())?;
+    // Pass the borrowed text through (Cow::Borrowed) so we don't make an extra
+    // owned, un-zeroized String copy of a vault secret on our own heap — arboard
+    // borrows it straight into the OS clipboard buffer.
+    cb.set_text(std::borrow::Cow::Borrowed(text))?;
     Ok(())
 }
 
@@ -2034,6 +2095,13 @@ mod tests {
             ConnectPlan::Normal(Some(msg)) => assert!(msg.contains("not yet trusted")),
             other => panic!("expected Normal(Some), got {other:?}"),
         }
+        // passphrase-only + not known -> STILL normal+nudge, never armed. The TOFU
+        // gate is blanket because arming sets force, which hijacks the host-key
+        // prompt; an unknown host must not be armed even for a local passphrase.
+        match connect_plan(Some(pp_only), false, true, false, false, false, "h") {
+            ConnectPlan::Normal(Some(msg)) => assert!(msg.contains("not yet trusted")),
+            other => panic!("expected Normal(Some) for passphrase-only/not-known, got {other:?}"),
+        }
         // password armed + known + not yet confirmed -> defer to the confirm modal.
         assert_eq!(
             connect_plan(Some(both), false, true, false, true, false, "h"),
@@ -2049,6 +2117,70 @@ mod tests {
             connect_plan(Some(pp_only), false, true, false, true, false, "h"),
             ConnectPlan::Arm(pp_only)
         );
+    }
+
+    #[test]
+    fn apply_password_choice_drops_password_only_on_withhold() {
+        let both = MatchedKinds {
+            password: true,
+            passphrase: true,
+        };
+        let pw_only = MatchedKinds {
+            password: true,
+            passphrase: false,
+        };
+        let pp_only = MatchedKinds {
+            password: false,
+            passphrase: true,
+        };
+        // Ask / Confirmed pass the candidacy through unchanged.
+        assert_eq!(
+            apply_password_choice(Some(both), PasswordChoice::Ask),
+            Some(both)
+        );
+        assert_eq!(
+            apply_password_choice(Some(both), PasswordChoice::Confirmed),
+            Some(both)
+        );
+        // Withheld drops the password: both -> passphrase-only, password-only -> None.
+        assert_eq!(
+            apply_password_choice(Some(both), PasswordChoice::Withheld),
+            Some(pp_only)
+        );
+        assert_eq!(
+            apply_password_choice(Some(pw_only), PasswordChoice::Withheld),
+            None
+        );
+        assert_eq!(
+            apply_password_choice(Some(pp_only), PasswordChoice::Withheld),
+            Some(pp_only)
+        );
+        assert_eq!(apply_password_choice(None, PasswordChoice::Ask), None);
+    }
+
+    #[test]
+    fn password_confirmed_reads_the_session_consent_set() {
+        let mut set = std::collections::HashSet::new();
+        set.insert("deploy@web1".to_string());
+        // Confirmed always; Withheld never (regardless of the set).
+        assert!(password_confirmed(PasswordChoice::Confirmed, None, &set));
+        assert!(!password_confirmed(
+            PasswordChoice::Withheld,
+            Some("deploy@web1"),
+            &set
+        ));
+        // Ask: only when the resolved target is already consented this session.
+        assert!(password_confirmed(
+            PasswordChoice::Ask,
+            Some("deploy@web1"),
+            &set
+        ));
+        assert!(!password_confirmed(
+            PasswordChoice::Ask,
+            Some("deploy@other"),
+            &set
+        ));
+        assert!(!password_confirmed(PasswordChoice::Ask, None, &set));
     }
 
     #[test]
@@ -2129,5 +2261,9 @@ mod tests {
         assert!(t.is_some_and(|(m, e)| e && m.contains("web1") && m.contains("never requested")));
         // Nothing served, clean exit (key auth never prompted) -> no toast.
         assert_eq!(connect_toast("h", Some(0), &Outcome::NotAttempted), None);
+        // A detached/stalled teardown (TimedOut) folds into the exit summary:
+        // 255 -> error toast, clean exit -> no toast.
+        assert!(connect_toast("h", Some(255), &Outcome::TimedOut).is_some_and(|(_, e)| e));
+        assert_eq!(connect_toast("h", Some(0), &Outcome::TimedOut), None);
     }
 }
