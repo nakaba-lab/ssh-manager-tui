@@ -15,7 +15,7 @@ use crate::config::model::HostView;
 use crate::os::keys::KeyInfo;
 use crate::os::known_hosts::KnownHostEntry;
 use crate::os::liveness::{Liveness, LivenessProbe, ProbeTarget};
-use crate::os::vault::{SecretKind, Vault};
+use crate::os::vault::{MatchedKinds, SecretKind, Vault, match_vault_kinds};
 use crate::os::{self, keys, known_hosts};
 
 /// Ordered labels of the edit-form fields. Indices are referenced by name in
@@ -317,6 +317,12 @@ pub struct App {
     pub vault_entry: VaultEntryForm,
     /// When true, secrets are shown in the clear instead of masked.
     pub vault_reveal: bool,
+    /// Session opt-in for connect-time **password** auto-fill (off by default:
+    /// the password method is server-facing and can burn an auth attempt under
+    /// `force`). Passphrase auto-fill is unaffected. Not persisted across restart.
+    // TODO(phase3): read by connect dispatch + the indicator; toggled from the vault screen.
+    #[allow(dead_code)]
+    pub password_autofill_enabled: bool,
     /// When a vault secret was copied, the deadline to auto-clear the clipboard,
     /// plus a (non-reversible) hash of the copied secret so the clear only fires
     /// if the clipboard still holds it — never the plaintext, which stays sealed.
@@ -373,6 +379,7 @@ impl App {
             vault_unlock: VaultUnlock::default(),
             vault_entry: VaultEntryForm::default(),
             vault_reveal: false,
+            password_autofill_enabled: false,
             clipboard_clear_at: None,
             clipboard_hash: 0,
             clipboard_hash_key: {
@@ -411,6 +418,21 @@ impl App {
         self.rtt.clear();
         self.refilter();
         self.clamp_selection();
+    }
+
+    /// The shared connect-time **candidacy** predicate: which secret kinds a host
+    /// would auto-fill with — used by both the pre-connect indicator and connect
+    /// dispatch so they never disagree. A pure host↔vault-entry match (NOT the
+    /// listener's release logic), with the password opt-in folded in: while
+    /// `password_autofill_enabled` is off the Password kind is masked out (so a
+    /// password-only host yields `None` and a both-kinds host downgrades to
+    /// passphrase-only). `None` when the vault is locked. Reads `vault` live.
+    // TODO(phase3): called by connect dispatch (T8) + the list indicator (T11).
+    #[allow(dead_code)]
+    pub fn vault_secret_kinds(&self, host: &HostView) -> Option<MatchedKinds> {
+        let vault = self.vault.as_ref()?;
+        let matched = match_vault_kinds(&host.patterns, &vault.entries);
+        mask_password_kinds(matched, self.password_autofill_enabled)
     }
 
     /// Recompute `filtered` from `search` (fuzzy ranked; identity when empty).
@@ -737,5 +759,54 @@ pub fn view_from_form(form: &EditForm) -> HostView {
         remote_forwards: rows(&f[form_idx::REMOTE_FWD]),
         dynamic_forwards: rows(&f[form_idx::DYNAMIC_FWD]),
         extras,
+    }
+}
+
+/// Apply the password-autofill opt-in mask to a raw candidacy match. While
+/// password auto-fill is off, the Password kind is dropped: a password-only host
+/// then yields `None`, a both-kinds host downgrades to passphrase-only.
+/// Passphrase is never gated. Pure, so the masking is unit-tested directly.
+// TODO(phase3): consumed by App::vault_secret_kinds.
+#[allow(dead_code)]
+fn mask_password_kinds(
+    matched: Option<MatchedKinds>,
+    password_enabled: bool,
+) -> Option<MatchedKinds> {
+    let mut kinds = matched?;
+    if !password_enabled {
+        kinds.password = false;
+    }
+    kinds.any().then_some(kinds)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mask_password_kinds_applies_opt_in() {
+        let both = MatchedKinds {
+            password: true,
+            passphrase: true,
+        };
+        let pw_only = MatchedKinds {
+            password: true,
+            passphrase: false,
+        };
+        let pp_only = MatchedKinds {
+            password: false,
+            passphrase: true,
+        };
+
+        // Enabled: the match passes through unchanged.
+        assert_eq!(mask_password_kinds(Some(both), true), Some(both));
+        assert_eq!(mask_password_kinds(Some(pw_only), true), Some(pw_only));
+        // Disabled: the Password kind is masked out.
+        assert_eq!(mask_password_kinds(Some(both), false), Some(pp_only)); // both -> passphrase-only
+        assert_eq!(mask_password_kinds(Some(pw_only), false), None); // password-only -> None
+        assert_eq!(mask_password_kinds(Some(pp_only), false), Some(pp_only)); // passphrase unaffected
+        // No candidacy match stays None regardless.
+        assert_eq!(mask_password_kinds(None, true), None);
+        assert_eq!(mask_password_kinds(None, false), None);
     }
 }
