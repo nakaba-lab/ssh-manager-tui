@@ -76,6 +76,10 @@ layout that stacks the panes on narrow terminals.
   `IdentityFile`, or delete a key pair.
 - **known_hosts viewer** — browse and search `known_hosts` (including hashed entries)
   and remove a stale entry safely.
+- **Password vault** — store per-host **login passwords** and **identity-key
+  passphrases** in an encrypted file (`~/.ssh/sshm-vault.json`), protected by a master
+  password (Argon2id + XChaCha20-Poly1305). Secrets are masked by default and copied to
+  the clipboard on demand — they are **never** written to your SSH config.
 - **Live reachability** — a background worker pool TCP-probes hosts without ever
   blocking the UI; round-trip time is shown in the detail pane.
 
@@ -166,7 +170,7 @@ sshm --help          print help and exit
 | `e` / `a` | edit / add a host |
 | `d` | delete the host (with confirm) |
 | `r` / `R` | refresh liveness for all / the selected host |
-| `K` | key manager · `H` known_hosts viewer |
+| `K` | key manager · `H` known_hosts viewer · `P` password vault |
 | `?` | help · `q` / `Ctrl-C` quit (`Esc` clears an active search filter first, else quits) |
 
 While searching: type to filter, `Enter` keep the filter, `Esc` clear it, `↑`/`↓` move.
@@ -203,6 +207,30 @@ remove, `Enter` commit, `Esc` revert the field.
 | `j` / `k`, `↓` / `↑` | move · `g` / `G` top / bottom |
 | `/` | search (substring: host / key type) |
 | `d` | remove the entry (with confirm) · `r` reload · `Esc` back |
+
+### Password vault
+
+Open it with `P` from the host list. The first time, you set a **master password**
+that creates the vault; afterwards you unlock it with that password (held in memory only
+for the session — `L` locks it again).
+
+| Key | Action |
+|-----|--------|
+| `j` / `k`, `↓` / `↑` | move · `g` / `G` top / bottom |
+| `a` | add a secret (host · kind · secret · note) |
+| `e` / `Enter` | edit the selected secret |
+| `y` / `c` | copy the secret to the clipboard |
+| `d` | delete the secret (with confirm) |
+| `Space` | reveal / mask all secrets |
+| `L` | lock the vault (forget the master password) · `Esc` back |
+
+In the add/edit form: `Tab` moves between fields, `Space` toggles the secret **kind**
+(login password vs. key passphrase), `Enter` saves, `Esc` cancels.
+
+> **Clipboard note:** `y` / `c` copies the secret to the system clipboard and
+> **auto-clears it after ~20 seconds** (only if you haven't copied something else in the
+> meantime). Clipboard-history managers (e.g. Windows Clipboard History) may still
+> retain a copy.
 
 ### Modals
 
@@ -249,6 +277,11 @@ On top of that:
 - **known_hosts edits are content-addressed** — an entry is removed by matching its
   verbatim line (a `.old` backup is written), so a stale index can't delete the wrong
   key after an external change.
+- **Vault secrets are encrypted at rest** — the master password is stretched with
+  Argon2id and never stored; entries are sealed with XChaCha20-Poly1305, so a wrong
+  password fails the authentication tag rather than yielding garbage. Secrets live only
+  in `~/.ssh/sshm-vault.json`, are zeroized from memory on lock/exit, and are kept out
+  of the SSH config entirely.
 
 ## Notes & limitations
 
@@ -278,7 +311,8 @@ Three layers with a strict, one-way dependency direction:
 - **`config/`** — the lossless `~/.ssh/config` parser and surgical writer. Zero UI
   dependency; this is the most heavily tested module.
 - **`os/`** — all outside-world integration: spawning `ssh` / `ssh-keygen`, TCP
-  liveness probing, `known_hosts` parsing, clipboard, binary resolution.
+  liveness probing, `known_hosts` parsing, clipboard, binary resolution, and the
+  encrypted password vault.
 - **`ui/`** — pure rendering only; never mutates domain state.
 
 State flow is Elm-ish: `event_loop.rs` draws then polls, `update.rs` routes every

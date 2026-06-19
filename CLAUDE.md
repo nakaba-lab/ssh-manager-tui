@@ -50,7 +50,11 @@ Three layers with a strict, enforced dependency direction:
   most-tested module.
 - **`os/`** — all external-world integration: spawning `ssh`/`ssh-keygen`,
   TCP liveness probing, SSH key discovery + fingerprint-based pairing,
-  `known_hosts` parsing/rewriting, clipboard, binary resolution. **Zero ratatui
+  `known_hosts` parsing/rewriting, clipboard, binary resolution, and the
+  encrypted password vault (`os/vault.rs`: Argon2id + XChaCha20-Poly1305 over
+  `~/.ssh/sshm-vault.json`, holding per-host login passwords and key passphrases
+  — secrets never touch the SSH config, are zeroized on drop, and the file
+  header is AEAD-authenticated with range-checked KDF params). **Zero ratatui
   dependency.**
 - **`ui/`** — pure rendering only. **Never mutates domain state** (only widget
   scroll/selection state).

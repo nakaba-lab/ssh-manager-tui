@@ -9,6 +9,7 @@ pub mod keys;
 pub mod known_hosts;
 pub mod list;
 pub mod theme;
+pub mod vault;
 pub mod widgets;
 
 use ratatui::Frame;
@@ -23,9 +24,11 @@ use crate::app::{App, GenOrigin, Screen};
 /// modal overlay).
 fn base_screen(app: &App) -> Screen {
     match &app.screen {
-        Screen::Help | Screen::Confirm(_) | Screen::ActionMenu(_) => {
-            app.prev_screen.clone().unwrap_or(Screen::List)
-        }
+        Screen::Help
+        | Screen::Confirm(_)
+        | Screen::ActionMenu(_)
+        | Screen::VaultUnlock
+        | Screen::PasswordConfirm { .. } => app.prev_screen.clone().unwrap_or(Screen::List),
         Screen::PickKey { editing } | Screen::PickJump { editing } => {
             Screen::Edit { editing: *editing }
         }
@@ -33,6 +36,7 @@ fn base_screen(app: &App) -> Screen {
             GenOrigin::KeyManager => Screen::KeyManager,
             GenOrigin::EditForm { editing } => Screen::Edit { editing: *editing },
         },
+        Screen::VaultEntry { .. } => Screen::Vault,
         other => other.clone(),
     }
 }
@@ -54,6 +58,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Screen::Edit { .. } => edit::draw(f, app, body_a),
         Screen::KeyManager => keys::draw(f, app, body_a),
         Screen::KnownHosts => known_hosts::draw(f, app, body_a),
+        Screen::Vault => vault::draw(f, app, body_a),
         _ => list::draw(f, app, body_a),
     }
     draw_footer(f, app, &base, footer_a);
@@ -66,6 +71,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Screen::GenerateKey { .. } => keys::draw_wizard(f, app, body_a),
         Screen::PickKey { .. } => keys::draw_picker(f, app, body_a),
         Screen::PickJump { .. } => list::draw_jump_picker(f, app, body_a),
+        Screen::VaultUnlock => vault::draw_unlock(f, app, body_a),
+        Screen::VaultEntry { .. } => vault::draw_entry(f, app, body_a),
+        Screen::PasswordConfirm { target, kinds, .. } => {
+            vault::draw_password_confirm(f, target, *kinds, body_a)
+        }
         _ => {}
     }
 
@@ -79,12 +89,17 @@ fn draw_title(f: &mut Frame, app: &App, base: &Screen, area: Rect) {
         Screen::Edit { editing: None } => "Add host",
         Screen::KeyManager => "Keys",
         Screen::KnownHosts => "Known hosts",
+        Screen::Vault => "Passwords",
         _ => "SSH Manager",
     };
     let count = match base {
         Screen::List => format!("  {}/{} ", app.filtered.len(), app.hosts.len()),
         Screen::KeyManager => format!("  {} keys ", app.keys.len()),
         Screen::KnownHosts => format!("  {} entries ", app.known_hosts.len()),
+        Screen::Vault => format!(
+            "  {} secrets ",
+            app.vault.as_ref().map(|v| v.entries.len()).unwrap_or(0)
+        ),
         _ => String::new(),
     };
     let mut spans = vec![
@@ -133,6 +148,7 @@ fn draw_footer(f: &mut Frame, app: &App, base: &Screen, area: Rect) {
             ("a", "add"),
             ("d", "del"),
             ("K", "keys"),
+            ("P", "passwords"),
             ("?", "help"),
         ]),
         (Screen::Edit { .. }, a) if a.form.mode == crate::app::FormMode::Editing => {
@@ -177,6 +193,17 @@ fn draw_footer(f: &mut Frame, app: &App, base: &Screen, area: Rect) {
             ("j/k", "move"),
             ("/", "search"),
             ("d", "delete"),
+            ("Esc", "back"),
+        ]),
+        (Screen::Vault, _) => widgets::footer_hints(&[
+            ("j/k", "move"),
+            ("a", "add"),
+            ("e", "edit"),
+            ("y", "copy"),
+            ("d", "del"),
+            ("Space", "reveal"),
+            ("p", "pw-autofill"),
+            ("L", "lock"),
             ("Esc", "back"),
         ]),
         _ => widgets::footer_hints(&[("?", "help"), ("q", "quit")]),

@@ -13,10 +13,20 @@ use crate::{ui, update};
 const TICK: Duration = Duration::from_millis(200);
 
 pub fn run(mut terminal: DefaultTerminal, mut app: App) -> Result<()> {
+    let result = event_loop(&mut terminal, &mut app);
+    // Best-effort: never leave a copied vault secret in the clipboard on exit —
+    // including an error-driven exit that bypasses the normal quit handler.
+    if app.clipboard_clear_at.is_some() {
+        update::force_clear_clipboard(&mut app);
+    }
+    result
+}
+
+fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
     let mut last_tick = Instant::now();
 
     while !app.should_quit {
-        terminal.draw(|f| ui::draw(f, &mut app))?;
+        terminal.draw(|f| ui::draw(f, app))?;
 
         let timeout = TICK.saturating_sub(last_tick.elapsed());
         if event::poll(timeout)? {
@@ -25,13 +35,14 @@ pub fn run(mut terminal: DefaultTerminal, mut app: App) -> Result<()> {
             if let Event::Key(key) = event::read()?
                 && key.kind == KeyEventKind::Press
             {
-                update::handle_key(&mut app, key, &mut terminal)?;
+                update::handle_key(app, key, terminal)?;
             }
         }
 
         if last_tick.elapsed() >= TICK {
             app.on_tick();
             app.drain_liveness();
+            update::tick_clipboard(app);
             last_tick = Instant::now();
         }
     }

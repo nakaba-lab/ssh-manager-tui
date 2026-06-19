@@ -55,6 +55,26 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
             lines.push(key("d", "delete entry"));
             lines.push(key("r", "reload"));
         }
+        Screen::Vault => {
+            lines.push(section("Password vault"));
+            lines.push(key("j / k", "move"));
+            lines.push(key("a", "add secret"));
+            lines.push(key("e / Enter", "edit secret"));
+            lines.push(key("y / c", "copy secret to clipboard"));
+            lines.push(key("d", "delete secret"));
+            lines.push(key("Space", "reveal / mask secrets"));
+            lines.push(key("p", "toggle connect-time password auto-fill"));
+            lines.push(key("L", "lock vault (forget master password)"));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  Secrets are encrypted with your master password in",
+                Style::default().fg(theme::FAINT),
+            )));
+            lines.push(Line::from(Span::styled(
+                "  ~/.ssh/sshm-vault.json — never written to the SSH config.",
+                Style::default().fg(theme::FAINT),
+            )));
+        }
         _ => {
             lines.push(section("Host list"));
             lines.push(key("j / k, ↑ / ↓", "move selection"));

@@ -92,7 +92,11 @@ pub fn input_line(value: &str, cursor: usize, editing: bool) -> Line<'static> {
     if !editing {
         return Line::from(Span::styled(value.to_string(), text));
     }
-    let cursor = cursor.min(value.len());
+    // Clamp to a real char boundary so a stray cursor never panics the split.
+    let mut cursor = cursor.min(value.len());
+    while cursor > 0 && !value.is_char_boundary(cursor) {
+        cursor -= 1;
+    }
     let (before, after) = value.split_at(cursor);
     let (cur_ch, rest) = match after.chars().next() {
         Some(c) => (c.to_string(), after[c.len_utf8()..].to_string()),
@@ -100,6 +104,32 @@ pub fn input_line(value: &str, cursor: usize, editing: bool) -> Line<'static> {
     };
     Line::from(vec![
         Span::styled(before.to_string(), text),
+        Span::styled(cur_ch, text.add_modifier(Modifier::REVERSED)),
+        Span::styled(rest, text),
+    ])
+}
+
+/// Like [`input_line`] but **borrows** `value` instead of cloning it into owned
+/// spans. Use for a sensitive value (a revealed secret): the plaintext stays in
+/// the caller's already-scrubbed buffer rather than being copied onto the heap
+/// each frame where the per-frame copy would be freed un-zeroized.
+pub fn input_line_borrowed(value: &str, cursor: usize, editing: bool) -> Line<'_> {
+    let text = Style::default().fg(theme::TEXT);
+    if !editing {
+        return Line::from(Span::styled(value, text));
+    }
+    // Clamp to a real char boundary so a stray cursor never panics the split.
+    let mut cursor = cursor.min(value.len());
+    while cursor > 0 && !value.is_char_boundary(cursor) {
+        cursor -= 1;
+    }
+    let (before, after) = value.split_at(cursor);
+    let (cur_ch, rest) = match after.chars().next() {
+        Some(c) => after.split_at(c.len_utf8()),
+        None => (" ", ""),
+    };
+    Line::from(vec![
+        Span::styled(before, text),
         Span::styled(cur_ch, text.add_modifier(Modifier::REVERSED)),
         Span::styled(rest, text),
     ])

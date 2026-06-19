@@ -1,19 +1,21 @@
 //! Central application state plus the screen/mode enums that drive both
 //! rendering ([`crate::ui`]) and input dispatch ([`crate::update`]).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 use ratatui::widgets::{ListState, TableState};
+use zeroize::Zeroize;
 
 use crate::config::SshConfig;
 use crate::config::model::HostView;
 use crate::os::keys::KeyInfo;
-use crate::os::known_hosts::KnownHostEntry;
+use crate::os::known_hosts::{HostSpec, KnownHostEntry};
 use crate::os::liveness::{Liveness, LivenessProbe, ProbeTarget};
+use crate::os::vault::{MatchedKinds, SecretKind, Vault, match_vault_kinds};
 use crate::os::{self, keys, known_hosts};
 
 /// Ordered labels of the edit-form fields. Indices are referenced by name in
@@ -84,6 +86,26 @@ pub enum Screen {
     PickJump {
         editing: Option<usize>,
     },
+    /// Password vault: list of stored secrets (login passwords / passphrases).
+    Vault,
+    /// Master-password prompt modal — unlock an existing vault, or create one.
+    VaultUnlock,
+    /// Add / edit a vault entry. `editing = Some(idx)` edits in place.
+    VaultEntry {
+        editing: Option<usize>,
+    },
+    /// One-time connect-time **password** consent modal, shown before arming a
+    /// stored password the first time the resolved `<user@host>` is targeted this
+    /// session. Carries **no secret** — only the resolved `target` (for display),
+    /// the armed `kinds`, and the `alias`/`mode` needed to resume the connect.
+    /// Enter confirms (arm the password); Esc/`n` declines (passphrase stays
+    /// armed, password withheld). A consent/typo guard, not a redirect defense.
+    PasswordConfirm {
+        alias: String,
+        mode: ConnectMode,
+        kinds: MatchedKinds,
+        target: String,
+    },
 }
 
 /// Where the generate-key wizard was opened from — drives where it returns and
@@ -106,6 +128,8 @@ pub enum ConfirmAction {
         raw: String,
     },
     DiscardEdit,
+    /// Delete the vault entry at this index.
+    DeleteVaultEntry(usize),
     Quit,
 }
 
@@ -182,6 +206,74 @@ impl Default for GenWizard {
     }
 }
 
+/// Master-password prompt state (modal). Doubles as the "create vault" form,
+/// in which case the confirm field is also shown. The typed password is scrubbed
+/// on drop and redacted in `Debug` so it never lingers or leaks.
+#[derive(Default, Clone)]
+pub struct VaultUnlock {
+    /// True when no vault file exists yet — collect + confirm a new password.
+    pub creating: bool,
+    pub password: String,
+    pub confirm: String,
+    /// 0 = password, 1 = confirm (only reachable while `creating`).
+    pub field: usize,
+    pub cursor: usize,
+}
+
+impl Drop for VaultUnlock {
+    fn drop(&mut self) {
+        self.password.zeroize();
+        self.confirm.zeroize();
+    }
+}
+
+impl std::fmt::Debug for VaultUnlock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VaultUnlock")
+            .field("creating", &self.creating)
+            .field("password", &"***")
+            .field("confirm", &"***")
+            .field("field", &self.field)
+            .field("cursor", &self.cursor)
+            .finish()
+    }
+}
+
+/// Add/edit form for a single vault entry (modal over the vault list). The typed
+/// secret is scrubbed on drop and redacted in `Debug`.
+#[derive(Default, Clone)]
+pub struct VaultEntryForm {
+    /// Index into the vault being edited, or `None` when adding.
+    pub editing: Option<usize>,
+    pub host: String,
+    pub kind: SecretKind,
+    pub secret: String,
+    pub note: String,
+    /// 0 = host, 1 = kind, 2 = secret, 3 = note.
+    pub field: usize,
+    pub cursor: usize,
+}
+
+impl Drop for VaultEntryForm {
+    fn drop(&mut self) {
+        self.secret.zeroize();
+    }
+}
+
+impl std::fmt::Debug for VaultEntryForm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VaultEntryForm")
+            .field("editing", &self.editing)
+            .field("host", &self.host)
+            .field("kind", &self.kind)
+            .field("secret", &"***")
+            .field("note", &self.note)
+            .field("field", &self.field)
+            .field("cursor", &self.cursor)
+            .finish()
+    }
+}
+
 pub struct App {
     pub should_quit: bool,
     pub screen: Screen,
@@ -229,6 +321,38 @@ pub struct App {
     // --- O3 action menu ---
     pub menu_sel: usize,
 
+    // --- vault (password manager) ---
+    /// The unlocked vault, held in memory for the session (`None` when locked).
+    pub vault: Option<Vault>,
+    pub vault_state: ListState,
+    pub vault_unlock: VaultUnlock,
+    pub vault_entry: VaultEntryForm,
+    /// When true, secrets are shown in the clear instead of masked.
+    pub vault_reveal: bool,
+    /// Session opt-in for connect-time **password** auto-fill (off by default:
+    /// the password method is server-facing and can burn an auth attempt under
+    /// `force`). Passphrase auto-fill is unaffected. Not persisted across restart.
+    /// Toggled with `p` on the vault screen; read by connect dispatch + the
+    /// indicator (via [`App::vault_secret_kinds`]).
+    pub password_autofill_enabled: bool,
+    /// Resolved `<user@host>` targets the user has confirmed for connect-time
+    /// **password** auto-fill this session (the one-time password-confirm modal's
+    /// memory). Holds no secret — only the resolved identity string. Session-
+    /// scoped: cleared on lock, on `rebuild_hosts` (a host edit could change what
+    /// a target resolves to), and never persisted.
+    pub confirmed_password_targets: HashSet<String>,
+    /// Whether the one-time-per-session "this host has a stored password — enable
+    /// auto-fill" discoverability nudge has already fired (shown at most once).
+    pub password_hint_shown: bool,
+    /// When a vault secret was copied, the deadline to auto-clear the clipboard,
+    /// plus a (non-reversible) hash of the copied secret so the clear only fires
+    /// if the clipboard still holds it — never the plaintext, which stays sealed.
+    pub clipboard_clear_at: Option<Instant>,
+    pub clipboard_hash: u64,
+    /// Per-session key mixed into `clipboard_hash`, so the value held in memory is
+    /// not a stand-alone, precomputable digest of the secret.
+    pub clipboard_hash_key: u64,
+
     // --- chrome ---
     pub toast: Toast,
     pub ssh_path_warning: bool,
@@ -271,6 +395,21 @@ impl App {
             kh_search: String::new(),
             kh_searching: false,
             menu_sel: 0,
+            vault: None,
+            vault_state: ListState::default(),
+            vault_unlock: VaultUnlock::default(),
+            vault_entry: VaultEntryForm::default(),
+            vault_reveal: false,
+            password_autofill_enabled: false,
+            confirmed_password_targets: HashSet::new(),
+            password_hint_shown: false,
+            clipboard_clear_at: None,
+            clipboard_hash: 0,
+            clipboard_hash_key: {
+                let mut b = [0u8; 8];
+                let _ = getrandom::getrandom(&mut b);
+                u64::from_le_bytes(b)
+            },
             toast: Toast::default(),
             ssh_path_warning: !os::tools().is_system32,
             include_note: false,
@@ -300,8 +439,47 @@ impl App {
         self.hosts = views.into_iter().map(|(_, v)| v).collect();
         self.liveness.clear();
         self.rtt.clear();
+        // A host edit can change what a confirmed target resolves to, so the
+        // session-scoped password-confirm memory must not outlive a rebuild.
+        self.confirmed_password_targets.clear();
         self.refilter();
         self.clamp_selection();
+    }
+
+    /// The shared connect-time **candidacy** predicate: which secret kinds a host
+    /// would auto-fill with — used by both the pre-connect indicator and connect
+    /// dispatch so they never disagree. A pure host↔vault-entry match (NOT the
+    /// listener's release logic), with the password opt-in folded in: while
+    /// `password_autofill_enabled` is off the Password kind is masked out (so a
+    /// password-only host yields `None` and a both-kinds host downgrades to
+    /// passphrase-only). `None` when the vault is locked. Reads `vault` live.
+    pub fn vault_secret_kinds(&self, host: &HostView) -> Option<MatchedKinds> {
+        let vault = self.vault.as_ref()?;
+        let matched = match_vault_kinds(&host.patterns, &vault.entries);
+        mask_password_kinds(matched, self.password_autofill_enabled)
+    }
+
+    /// A cheap, in-memory approximation of "this host has a plain `known_hosts`
+    /// pin", used ONLY to render the connect-time secret indicator active (a known
+    /// pin → auto-fill will fire) vs muted (a candidate not yet trusted). This is
+    /// deliberately NOT the authoritative connect-time TOFU gate
+    /// (`os::resolve::is_host_known`, which resolves via `ssh -G` + `ssh-keygen -F`
+    /// and so cannot run per render frame): it settles for a hostname match against
+    /// the already-parsed `known_hosts`. Marker entries (`@revoked`/`@cert-authority`)
+    /// don't count, mirroring the real gate. A hashed `known_hosts` can't be matched
+    /// by name, so every candidate then shows muted (a safe, conservative hint).
+    pub fn host_known_hint(&self, host: &HostView) -> bool {
+        let target = host
+            .host_name
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| host.alias());
+        if target.is_empty() {
+            return false;
+        }
+        self.known_hosts
+            .iter()
+            .any(|e| e.marker.is_none() && known_host_spec_matches(&e.host, target))
     }
 
     /// Recompute `filtered` from `search` (fuzzy ranked; identity when empty).
@@ -628,5 +806,87 @@ pub fn view_from_form(form: &EditForm) -> HostView {
         remote_forwards: rows(&f[form_idx::REMOTE_FWD]),
         dynamic_forwards: rows(&f[form_idx::DYNAMIC_FWD]),
         extras,
+    }
+}
+
+/// Whether a `known_hosts` host field matches `target` by name (the cheap
+/// indicator probe — see [`App::host_known_hint`]). Only `Plain` specs match;
+/// each comma-separated token is compared case-insensitively after stripping a
+/// `[host]:port` bracket. Hashed specs never match by name.
+fn known_host_spec_matches(spec: &HostSpec, target: &str) -> bool {
+    let HostSpec::Plain(list) = spec else {
+        return false;
+    };
+    list.split(',').any(|tok| {
+        let host = tok
+            .strip_prefix('[')
+            .and_then(|t| t.split("]:").next())
+            .unwrap_or(tok);
+        host.eq_ignore_ascii_case(target)
+    })
+}
+
+/// Apply the password-autofill opt-in mask to a raw candidacy match. While
+/// password auto-fill is off, the Password kind is dropped: a password-only host
+/// then yields `None`, a both-kinds host downgrades to passphrase-only.
+/// Passphrase is never gated. Pure, so the masking is unit-tested directly.
+fn mask_password_kinds(
+    matched: Option<MatchedKinds>,
+    password_enabled: bool,
+) -> Option<MatchedKinds> {
+    let mut kinds = matched?;
+    if !password_enabled {
+        kinds.password = false;
+    }
+    kinds.any().then_some(kinds)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mask_password_kinds_applies_opt_in() {
+        let both = MatchedKinds {
+            password: true,
+            passphrase: true,
+        };
+        let pw_only = MatchedKinds {
+            password: true,
+            passphrase: false,
+        };
+        let pp_only = MatchedKinds {
+            password: false,
+            passphrase: true,
+        };
+
+        // Enabled: the match passes through unchanged.
+        assert_eq!(mask_password_kinds(Some(both), true), Some(both));
+        assert_eq!(mask_password_kinds(Some(pw_only), true), Some(pw_only));
+        // Disabled: the Password kind is masked out.
+        assert_eq!(mask_password_kinds(Some(both), false), Some(pp_only)); // both -> passphrase-only
+        assert_eq!(mask_password_kinds(Some(pw_only), false), None); // password-only -> None
+        assert_eq!(mask_password_kinds(Some(pp_only), false), Some(pp_only)); // passphrase unaffected
+        // No candidacy match stays None regardless.
+        assert_eq!(mask_password_kinds(None, true), None);
+        assert_eq!(mask_password_kinds(None, false), None);
+    }
+
+    #[test]
+    fn known_host_spec_matches_plain_and_bracketed() {
+        let plain = HostSpec::Plain("web1.example.com".into());
+        assert!(known_host_spec_matches(&plain, "web1.example.com"));
+        assert!(known_host_spec_matches(&plain, "WEB1.EXAMPLE.COM")); // case-insensitive
+        assert!(!known_host_spec_matches(&plain, "web2.example.com"));
+        // Comma-separated list with a bracketed [host]:port token.
+        let list = HostSpec::Plain("alias,[10.0.0.5]:2222".into());
+        assert!(known_host_spec_matches(&list, "alias"));
+        assert!(known_host_spec_matches(&list, "10.0.0.5"));
+        assert!(!known_host_spec_matches(&list, "2222"));
+        // Hashed specs never match by name (so they always render muted).
+        assert!(!known_host_spec_matches(
+            &HostSpec::Hashed("|1|abc=|def=".into()),
+            "web1.example.com"
+        ));
     }
 }
