@@ -19,6 +19,8 @@ use std::io::{self, Read, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use zeroize::Zeroizing;
+
 use crate::os::vault::{Secret, SecretKind};
 
 /// Length of the per-connect authentication token (256 bits).
@@ -75,15 +77,17 @@ pub fn write_reply(w: &mut impl Write, secret: Option<&str>) -> io::Result<()> {
     w.flush()
 }
 
-/// Helper: read the reply. A zero-length reply is `None` (send nothing).
-pub fn read_reply(r: &mut impl Read) -> io::Result<Option<String>> {
-    let bytes = read_lp(r)?;
+/// Helper: read the reply. A zero-length reply is `None` (send nothing). The
+/// secret is wrapped in `Zeroizing` so this transient plaintext copy is scrubbed
+/// on drop rather than left in the helper's freed heap.
+pub fn read_reply(r: &mut impl Read) -> io::Result<Option<Zeroizing<String>>> {
+    let bytes = Zeroizing::new(read_lp(r)?);
     if bytes.is_empty() {
         return Ok(None);
     }
-    let s = String::from_utf8(bytes)
+    let s = String::from_utf8(bytes.to_vec())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "reply not UTF-8"))?;
-    Ok(Some(s))
+    Ok(Some(Zeroizing::new(s)))
 }
 
 /// The shape of a prompt OpenSSH passed to the helper, decided by text only.
@@ -320,9 +324,12 @@ impl ConnectSecrets {
         }
     }
 
-    /// Decide what to send for `prompt`, recording single-shot state. Returns
-    /// the secret bytes to send (as a `String`), or `None` to send nothing.
-    pub fn decide(&mut self, prompt: &str) -> Option<String> {
+    /// Decide what to send for `prompt`, recording single-shot state. Returns the
+    /// secret to send, or `None` to send nothing. The chosen value is copied into a
+    /// `Zeroizing<String>` so this transient plaintext (a distinct allocation from
+    /// the armed `Secret`, which the worker zeroizes separately) is scrubbed on drop
+    /// rather than left in the long-running listener's freed heap.
+    pub fn decide(&mut self, prompt: &str) -> Option<Zeroizing<String>> {
         match classify(prompt) {
             Classified::Password { user, host } => {
                 let pw = self.password.as_ref()?;
@@ -336,7 +343,7 @@ impl ConnectSecrets {
                     return None;
                 }
                 self.password_served = true;
-                Some(pw.as_str().to_string())
+                Some(Zeroizing::new(pw.as_str().to_string()))
             }
             Classified::Passphrase { key_path } => {
                 let pp = self.passphrase.as_ref()?;
@@ -351,7 +358,7 @@ impl ConnectSecrets {
                 if !self.served_paths.insert(key_path) {
                     return None; // per-path single-shot
                 }
-                Some(pp.as_str().to_string())
+                Some(Zeroizing::new(pp.as_str().to_string()))
             }
             Classified::Other => None,
         }
@@ -477,27 +484,29 @@ pub fn askpass_exe_path() -> io::Result<String> {
 /// - `None` — not in askpass mode (no `SSHM_ASKPASS_CHANNEL`); the caller should
 ///   continue normal CLI parsing.
 /// - `Some(bytes)` — askpass mode succeeded; print `bytes` to stdout and exit 0.
-///   (Bytes already include the single trailing `\n`.)
-/// - `Some(empty)` is never returned; a no-match/error yields `Some(Vec::new())`
-///   meaning "exit non-zero, no stdout" — the caller distinguishes by emptiness.
+///   (Bytes already include the single trailing `\n`.) The buffer is `Zeroizing`
+///   so it scrubs on drop; the caller must still scrub explicitly before
+///   `process::exit` (which runs no destructors).
+/// - `Some(empty)` is never returned; a no-match/error yields a zero-length
+///   buffer meaning "exit non-zero, no stdout" — the caller distinguishes by emptiness.
 ///
 /// Contract for the caller (Phase 3 main.rs): if this returns `Some(b)` with
 /// `b` non-empty, write `b` to stdout and exit 0; if `Some(b)` empty, exit
 /// non-zero with no stdout; if `None`, fall through to normal arg parsing.
-pub fn run_helper<F>(prompt: Option<String>, get_env: F) -> Option<Vec<u8>>
+pub fn run_helper<F>(prompt: Option<String>, get_env: F) -> Option<Zeroizing<Vec<u8>>>
 where
     F: Fn(&str) -> Option<String>,
 {
     let addr = get_env(CHANNEL_ENV)?; // PRESENCE selects askpass mode
     // From here we are committed to askpass mode: always Some(...), never None.
-    let fail = || Some(Vec::new());
+    let fail = || Some(Zeroizing::new(Vec::new()));
 
     let Some(prompt) = prompt else { return fail() };
     let Some(token) = get_env(TOKEN_ENV).as_deref().and_then(parse_token_hex) else {
         return fail();
     };
 
-    let result = (|| -> io::Result<Option<String>> {
+    let result = (|| -> io::Result<Option<Zeroizing<String>>> {
         let mut conn = connect_client(&addr)?;
         write_request(&mut conn, &token, &prompt)?;
         read_reply(&mut conn)
@@ -505,7 +514,10 @@ where
 
     match result {
         Ok(Some(secret)) if secret_is_one_line(&secret) => {
-            let mut bytes = secret.into_bytes();
+            // Copy into a zeroizing buffer + append the newline; the source
+            // `Zeroizing<String>` scrubs when this fn returns.
+            let mut bytes = Zeroizing::new(Vec::with_capacity(secret.len() + 1));
+            bytes.extend_from_slice(secret.as_bytes());
             bytes.push(b'\n');
             Some(bytes)
         }
@@ -517,19 +529,26 @@ where
 /// and used as the detached-listener reap signal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
-    Served { kind: SecretKind },
-    Declined { reason: DeclineReason },
+    Served {
+        kind: SecretKind,
+    },
+    Declined {
+        reason: DeclineReason,
+    },
+    /// Reserved for the detached new-tab path (it tears down on
+    /// `NEW_TAB_ASKPASS_TIMEOUT`); the inline serve loop only stops, never times
+    /// out, so this is never produced in v1.
     TimedOut,
     NotAttempted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeclineReason {
-    /// The user declined the password-confirm modal.
-    PasswordDeclined,
     /// The server used keyboard-interactive, so a stored password was withheld.
     KeyboardInteractive,
-    /// Channel/token/identity mismatch or an unclassifiable prompt.
+    /// Channel/token/identity mismatch, an unclassifiable prompt, or a secret the
+    /// user withheld at the confirm modal (the password is dropped before arming,
+    /// so the listener simply never matches it).
     NoMatch,
 }
 
@@ -752,7 +771,7 @@ mod chan {
                 Some(s) if secret_is_one_line(&s) => Some(s),
                 _ => None,
             };
-            write_reply(&mut conn, to_send.as_deref())?;
+            write_reply(&mut conn, to_send.as_deref().map(String::as_str))?;
             Ok(serve_result(&prompt, to_send.is_some()))
         }
     }
@@ -1027,7 +1046,7 @@ mod chan {
                     Some(s) if secret_is_one_line(&s) => Some(s),
                     _ => None,
                 };
-                write_reply(&mut io, to_send.as_deref())?;
+                write_reply(&mut io, to_send.as_deref().map(String::as_str))?;
                 Ok(serve_result(&prompt, to_send.is_some()))
             })();
 
@@ -1276,7 +1295,10 @@ mod tests {
         // A helper presents the matching prompt and gets the password.
         let mut c = connect_client(&addr).unwrap();
         write_request(&mut c, &token, "deploy@web1's password: ").unwrap();
-        assert_eq!(read_reply(&mut c).unwrap().as_deref(), Some("hunter2"));
+        assert_eq!(
+            read_reply(&mut c).unwrap().as_deref().map(String::as_str),
+            Some("hunter2")
+        );
         drop(c);
 
         // Teardown unblocks the loop, joins, and reports Served{Password}; the
@@ -1433,17 +1455,20 @@ mod tests {
         let mut cs = ConnectSecrets::new(ident(), Some(Secret::from("hunter2")), None);
         // First matching password prompt -> served.
         let r = cs.decide("deploy@web1's password: ");
-        assert_eq!(r.as_deref(), Some("hunter2"));
+        assert_eq!(r.as_deref().map(String::as_str), Some("hunter2"));
         // Second password prompt on the same connect -> nothing (single-shot).
-        assert_eq!(cs.decide("deploy@web1's password: "), None);
+        assert!(cs.decide("deploy@web1's password: ").is_none());
     }
 
     #[test]
     fn withholds_password_for_wrong_host_or_user() {
         let mut cs = ConnectSecrets::new(ident(), Some(Secret::from("hunter2")), None);
-        assert_eq!(cs.decide("deploy@evil's password: "), None);
-        assert_eq!(cs.decide("root@web1's password: "), None);
-        assert_eq!(cs.decide("(deploy@web1) deploy@web1's password: "), None);
+        assert!(cs.decide("deploy@evil's password: ").is_none());
+        assert!(cs.decide("root@web1's password: ").is_none());
+        assert!(
+            cs.decide("(deploy@web1) deploy@web1's password: ")
+                .is_none()
+        );
     }
 
     #[test]
@@ -1459,33 +1484,35 @@ mod tests {
         // key A: served, then refused on retry of the SAME path.
         assert_eq!(
             cs.decide("Enter passphrase for key '/home/u/.ssh/id_a': ")
-                .as_deref(),
+                .as_deref()
+                .map(String::as_str),
             Some("pp")
         );
-        assert_eq!(
-            cs.decide("Enter passphrase for key '/home/u/.ssh/id_a': "),
-            None
+        assert!(
+            cs.decide("Enter passphrase for key '/home/u/.ssh/id_a': ")
+                .is_none()
         );
         // key B: a DIFFERENT expected path is still served (multi-IdentityFile fallback).
         assert_eq!(
             cs.decide("Enter passphrase for key '/home/u/.ssh/id_b': ")
-                .as_deref(),
+                .as_deref()
+                .map(String::as_str),
             Some("pp")
         );
         // an unexpected path is never served.
-        assert_eq!(
-            cs.decide("Enter passphrase for key '/home/u/.ssh/id_x': "),
-            None
+        assert!(
+            cs.decide("Enter passphrase for key '/home/u/.ssh/id_x': ")
+                .is_none()
         );
     }
 
     #[test]
     fn no_secret_armed_returns_none() {
         let mut cs = ConnectSecrets::new(ident(), None, None);
-        assert_eq!(cs.decide("deploy@web1's password: "), None);
-        assert_eq!(
-            cs.decide("Enter passphrase for key '/home/u/.ssh/id_ed25519': "),
-            None
+        assert!(cs.decide("deploy@web1's password: ").is_none());
+        assert!(
+            cs.decide("Enter passphrase for key '/home/u/.ssh/id_ed25519': ")
+                .is_none()
         );
     }
 
@@ -1509,13 +1536,16 @@ mod tests {
         let mut buf = Vec::new();
         write_reply(&mut buf, Some("hunter2")).unwrap();
         let mut cur = Cursor::new(buf);
-        assert_eq!(read_reply(&mut cur).unwrap().as_deref(), Some("hunter2"));
+        assert_eq!(
+            read_reply(&mut cur).unwrap().as_deref().map(String::as_str),
+            Some("hunter2")
+        );
 
         // A zero-length (no-match) reply.
         let mut buf = Vec::new();
         write_reply(&mut buf, None).unwrap();
         let mut cur = Cursor::new(buf);
-        assert_eq!(read_reply(&mut cur).unwrap(), None);
+        assert!(read_reply(&mut cur).unwrap().is_none());
     }
 
     #[test]
@@ -1558,7 +1588,7 @@ mod tests {
         let mut conn = connect_client(&addr).unwrap();
         write_request(&mut conn, &token, "deploy@web1's password: ").unwrap();
         let reply = read_reply(&mut conn).unwrap();
-        assert_eq!(reply.as_deref(), Some("hunter2"));
+        assert_eq!(reply.as_deref().map(String::as_str), Some("hunter2"));
 
         handle.join().unwrap();
     }
@@ -1628,7 +1658,10 @@ mod tests {
 
         let mut c1 = connect_client(&addr).unwrap();
         write_request(&mut c1, &token, "deploy@web1's password: ").unwrap();
-        assert_eq!(read_reply(&mut c1).unwrap().as_deref(), Some("hunter2"));
+        assert_eq!(
+            read_reply(&mut c1).unwrap().as_deref().map(String::as_str),
+            Some("hunter2")
+        );
         drop(c1);
 
         let mut c2 = connect_client(&addr).unwrap();
@@ -1638,7 +1671,10 @@ mod tests {
             "Enter passphrase for key 'C:/Users/u/.ssh/id_ed25519': ",
         )
         .unwrap();
-        assert_eq!(read_reply(&mut c2).unwrap().as_deref(), Some("pp"));
+        assert_eq!(
+            read_reply(&mut c2).unwrap().as_deref().map(String::as_str),
+            Some("pp")
+        );
 
         handle.join().unwrap();
     }
@@ -1675,7 +1711,7 @@ mod tests {
             TOKEN_ENV => Some(hextok.clone()),
             _ => None,
         });
-        assert_eq!(out.unwrap(), b"hunter2\n");
+        assert_eq!(out.unwrap().as_slice(), b"hunter2\n");
         handle.join().unwrap();
     }
 

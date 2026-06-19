@@ -340,8 +340,6 @@ pub struct App {
     /// memory). Holds no secret — only the resolved identity string. Session-
     /// scoped: cleared on lock, on `rebuild_hosts` (a host edit could change what
     /// a target resolves to), and never persisted.
-    // TODO(phase3): read by connect dispatch (T8).
-    #[allow(dead_code)]
     pub confirmed_password_targets: HashSet<String>,
     /// Whether the one-time-per-session "this host has a stored password — enable
     /// auto-fill" discoverability nudge has already fired (shown at most once).
@@ -811,9 +809,6 @@ pub fn view_from_form(form: &EditForm) -> HostView {
     }
 }
 
-/// Apply the password-autofill opt-in mask to a raw candidacy match. While
-/// password auto-fill is off, the Password kind is dropped: a password-only host
-/// then yields `None`, a both-kinds host downgrades to passphrase-only.
 /// Whether a `known_hosts` host field matches `target` by name (the cheap
 /// indicator probe — see [`App::host_known_hint`]). Only `Plain` specs match;
 /// each comma-separated token is compared case-insensitively after stripping a
@@ -831,6 +826,9 @@ fn known_host_spec_matches(spec: &HostSpec, target: &str) -> bool {
     })
 }
 
+/// Apply the password-autofill opt-in mask to a raw candidacy match. While
+/// password auto-fill is off, the Password kind is dropped: a password-only host
+/// then yields `None`, a both-kinds host downgrades to passphrase-only.
 /// Passphrase is never gated. Pure, so the masking is unit-tested directly.
 fn mask_password_kinds(
     matched: Option<MatchedKinds>,

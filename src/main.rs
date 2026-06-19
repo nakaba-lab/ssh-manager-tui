@@ -43,15 +43,21 @@ fn main() -> Result<()> {
     // runs BEFORE any arg parsing, so a prompt beginning with `-` is never
     // misparsed as a flag and never reaches the `other => exit(2)` arm, and before
     // ratatui/config init so the helper stays a thin, side-effect-free relay.
-    if let Some(bytes) =
+    if let Some(mut bytes) =
         crate::os::askpass::run_helper(std::env::args().nth(1), |k| std::env::var(k).ok())
     {
         use std::io::Write;
+        use zeroize::Zeroize;
         if bytes.is_empty() {
             // No match / channel error: exit non-zero with no stdout.
             std::process::exit(1);
         }
-        let _ = std::io::stdout().write_all(&bytes);
+        let mut out = std::io::stdout();
+        let _ = out.write_all(&bytes);
+        let _ = out.flush();
+        // `process::exit` runs no destructors, so the `Zeroizing` Drop would be
+        // skipped — scrub the printed plaintext explicitly before exiting.
+        bytes.zeroize();
         std::process::exit(0);
     }
 

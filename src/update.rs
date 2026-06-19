@@ -573,7 +573,7 @@ fn arm_and_connect_inline(
             restore_tui(terminal)?;
             let outcome = listener.stop_and_join();
             let toast = match status {
-                Ok(s) => connect_toast(s.code(), &outcome),
+                Ok(s) => connect_toast(alias, s.code(), &outcome),
                 Err(e) => Some((format!("failed to launch ssh: {e}"), true)),
             };
             if let Some((msg, is_err)) = toast {
@@ -677,9 +677,11 @@ fn report_plain_exit(app: &mut App, status: std::io::Result<std::process::ExitSt
     }
 }
 
-/// The connect-time auto-fill outcome toast: combine the ssh exit `code` with the
-/// listener `outcome`. `None` = no toast (a clean exit 0 with nothing notable).
-fn connect_toast(code: Option<i32>, outcome: &Outcome) -> Option<(String, bool)> {
+/// The connect-time auto-fill outcome toast for `alias`: combine the ssh exit
+/// `code` with the listener `outcome`, exhaustively over the reachable outcomes so
+/// a failed connect is diagnosable. `None` = no toast (a clean exit 0 with nothing
+/// notable, e.g. key auth that never prompted).
+fn connect_toast(alias: &str, code: Option<i32>, outcome: &Outcome) -> Option<(String, bool)> {
     match outcome {
         Outcome::Served { kind } => {
             let k = kind.label().to_ascii_lowercase();
@@ -697,6 +699,25 @@ fn connect_toast(code: Option<i32>, outcome: &Outcome) -> Option<(String, bool)>
         } => Some((
             "server used keyboard-interactive — stored password withheld; type it manually".into(),
             false,
+        )),
+        // A stored secret was a candidate but never released (withheld at the
+        // confirm modal, or no prompt matched the resolved identity), and auth
+        // failed — under `force` ssh gives no manual prompt this connect.
+        Outcome::Declined {
+            reason: DeclineReason::NoMatch,
+        } if code == Some(255) => Some((
+            format!(
+                "auth failed for {alias} — the stored secret was withheld or didn't match; press P to copy it, or reconnect to auto-fill"
+            ),
+            true,
+        )),
+        // The stored secret was never even requested (a key or other factor was
+        // tried first and failed).
+        Outcome::NotAttempted if code == Some(255) => Some((
+            format!(
+                "auth failed for {alias} — the stored secret was never requested (key/other factor failed)"
+            ),
+            true,
         )),
         Outcome::Declined { .. } | Outcome::TimedOut | Outcome::NotAttempted => {
             describe_exit_code(code)
@@ -2066,6 +2087,7 @@ mod tests {
         use crate::os::askpass::{DeclineReason, Outcome};
         // Served + clean exit -> a success toast naming the kind.
         let t = connect_toast(
+            "h",
             Some(0),
             &Outcome::Served {
                 kind: SecretKind::Passphrase,
@@ -2077,6 +2099,7 @@ mod tests {
         );
         // Served + 255 -> served-but-auth-failed (error).
         let t = connect_toast(
+            "h",
             Some(255),
             &Outcome::Served {
                 kind: SecretKind::Password,
@@ -2085,15 +2108,26 @@ mod tests {
         assert!(t.is_some_and(|(m, e)| e && m.contains("auto-filled password")));
         // Keyboard-interactive decline -> an informational withheld toast.
         let t = connect_toast(
+            "h",
             Some(255),
             &Outcome::Declined {
                 reason: DeclineReason::KeyboardInteractive,
             },
         );
         assert!(t.is_some_and(|(m, e)| !e && m.contains("keyboard-interactive")));
+        // Withheld / no-match + 255 -> a decline-aware, alias-named diagnostic.
+        let t = connect_toast(
+            "web1",
+            Some(255),
+            &Outcome::Declined {
+                reason: DeclineReason::NoMatch,
+            },
+        );
+        assert!(t.is_some_and(|(m, e)| e && m.contains("web1") && m.contains("withheld")));
+        // NotAttempted + 255 -> a "never requested", alias-named diagnostic.
+        let t = connect_toast("web1", Some(255), &Outcome::NotAttempted);
+        assert!(t.is_some_and(|(m, e)| e && m.contains("web1") && m.contains("never requested")));
         // Nothing served, clean exit (key auth never prompted) -> no toast.
-        assert_eq!(connect_toast(Some(0), &Outcome::NotAttempted), None);
-        // Nothing served, 255 -> the plain connection/auth-failed summary.
-        assert!(connect_toast(Some(255), &Outcome::NotAttempted).is_some_and(|(_, e)| e));
+        assert_eq!(connect_toast("h", Some(0), &Outcome::NotAttempted), None);
     }
 }
