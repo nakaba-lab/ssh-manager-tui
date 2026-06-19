@@ -795,6 +795,32 @@ mod tests {
     }
 
     #[test]
+    fn save_draws_a_fresh_nonce_each_time() {
+        // XChaCha20-Poly1305 nonce reuse under the fixed per-vault key would be
+        // catastrophic (it breaks confidentiality + authenticity). Guard that two
+        // saves of the same in-memory vault emit a different nonce (and therefore a
+        // different ciphertext), so a future refactor that hoisted/cached the nonce
+        // can't slip through.
+        let mut v = Vault::create("m").unwrap();
+        v.upsert(None, entry("web1", SecretKind::Password, "p"));
+        let a = temp_vault_path("nonce-a");
+        let b = temp_vault_path("nonce-b");
+        v.save(&a).unwrap();
+        v.save(&b).unwrap();
+
+        let fa: VaultFile = serde_json::from_str(&fs::read_to_string(&a).unwrap()).unwrap();
+        let fb: VaultFile = serde_json::from_str(&fs::read_to_string(&b).unwrap()).unwrap();
+        assert_ne!(fa.nonce, fb.nonce, "each save must draw a fresh nonce");
+        assert_ne!(
+            fa.ciphertext, fb.ciphertext,
+            "a fresh nonce must change the ciphertext"
+        );
+
+        let _ = fs::remove_file(&a);
+        let _ = fs::remove_file(&b);
+    }
+
+    #[test]
     fn header_tamper_is_detected() {
         let path = temp_vault_path("aad");
         let v = Vault::create("m").unwrap();

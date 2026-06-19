@@ -384,6 +384,37 @@ fn connect_plan(
     ConnectPlan::Arm(kinds)
 }
 
+/// Apply the per-connect password decision to the opt-in-masked candidacy: a
+/// `Withheld` decline drops the Password kind (so a password-only host degrades to
+/// `None` and a both-kinds host keeps only the passphrase); `Ask`/`Confirmed` pass
+/// through. Pure, so the release-gating mask is unit-tested directly.
+fn apply_password_choice(
+    kinds: Option<MatchedKinds>,
+    choice: PasswordChoice,
+) -> Option<MatchedKinds> {
+    let mut k = kinds?;
+    if choice == PasswordChoice::Withheld {
+        k.password = false;
+    }
+    k.any().then_some(k)
+}
+
+/// Whether a stored **password** may arm this attempt: `Confirmed` always (the
+/// modal was accepted), `Withheld` never, `Ask` only if the resolved target is
+/// already in the session-consent set. Pure; the actual insert on `Confirmed`
+/// (which persists the consent) is the caller's side effect.
+fn password_confirmed(
+    choice: PasswordChoice,
+    target: Option<&str>,
+    confirmed: &std::collections::HashSet<String>,
+) -> bool {
+    match choice {
+        PasswordChoice::Confirmed => true,
+        PasswordChoice::Withheld => false,
+        PasswordChoice::Ask => target.is_some_and(|t| confirmed.contains(t)),
+    }
+}
+
 /// Whether connect dispatch may release a stored **password** this attempt — the
 /// state carried across the one-time password-confirm modal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -449,12 +480,7 @@ fn connect_by_alias(
     maybe_password_discoverability(app, &host);
 
     // Candidacy (opt-in-masked). A decline additionally drops the Password kind.
-    let candidacy = app.vault_secret_kinds(&host).and_then(|mut k| {
-        if choice == PasswordChoice::Withheld {
-            k.password = false;
-        }
-        k.any().then_some(k)
-    });
+    let candidacy = apply_password_choice(app.vault_secret_kinds(&host), choice);
     // No candidate secret → a plain connect (skip `ssh -G` for the common case).
     if candidacy.is_none() {
         return connect_plain(app, terminal, &host, &args, mode);
@@ -478,20 +504,17 @@ fn connect_by_alias(
         None => false,
     };
 
-    // Resolve the confirm target + fold in the session set / explicit choice.
+    // Resolve the confirm target + fold in the session set / explicit choice. A
+    // Confirmed choice persists the consent so a later Ask connect to the same
+    // resolved target skips the modal.
     let target = rc.as_ref().map(resolved_target);
-    let password_confirmed = match choice {
-        PasswordChoice::Confirmed => {
-            if let Some(t) = &target {
-                app.confirmed_password_targets.insert(t.clone());
-            }
-            true
-        }
-        PasswordChoice::Withheld => false,
-        PasswordChoice::Ask => target
-            .as_ref()
-            .is_some_and(|t| app.confirmed_password_targets.contains(t)),
-    };
+    if choice == PasswordChoice::Confirmed
+        && let Some(t) = &target
+    {
+        app.confirmed_password_targets.insert(t.clone());
+    }
+    let password_confirmed =
+        password_confirmed(choice, target.as_deref(), &app.confirmed_password_targets);
 
     match connect_plan(
         candidacy,
@@ -2067,6 +2090,70 @@ mod tests {
             connect_plan(Some(pp_only), false, true, false, true, false, "h"),
             ConnectPlan::Arm(pp_only)
         );
+    }
+
+    #[test]
+    fn apply_password_choice_drops_password_only_on_withhold() {
+        let both = MatchedKinds {
+            password: true,
+            passphrase: true,
+        };
+        let pw_only = MatchedKinds {
+            password: true,
+            passphrase: false,
+        };
+        let pp_only = MatchedKinds {
+            password: false,
+            passphrase: true,
+        };
+        // Ask / Confirmed pass the candidacy through unchanged.
+        assert_eq!(
+            apply_password_choice(Some(both), PasswordChoice::Ask),
+            Some(both)
+        );
+        assert_eq!(
+            apply_password_choice(Some(both), PasswordChoice::Confirmed),
+            Some(both)
+        );
+        // Withheld drops the password: both -> passphrase-only, password-only -> None.
+        assert_eq!(
+            apply_password_choice(Some(both), PasswordChoice::Withheld),
+            Some(pp_only)
+        );
+        assert_eq!(
+            apply_password_choice(Some(pw_only), PasswordChoice::Withheld),
+            None
+        );
+        assert_eq!(
+            apply_password_choice(Some(pp_only), PasswordChoice::Withheld),
+            Some(pp_only)
+        );
+        assert_eq!(apply_password_choice(None, PasswordChoice::Ask), None);
+    }
+
+    #[test]
+    fn password_confirmed_reads_the_session_consent_set() {
+        let mut set = std::collections::HashSet::new();
+        set.insert("deploy@web1".to_string());
+        // Confirmed always; Withheld never (regardless of the set).
+        assert!(password_confirmed(PasswordChoice::Confirmed, None, &set));
+        assert!(!password_confirmed(
+            PasswordChoice::Withheld,
+            Some("deploy@web1"),
+            &set
+        ));
+        // Ask: only when the resolved target is already consented this session.
+        assert!(password_confirmed(
+            PasswordChoice::Ask,
+            Some("deploy@web1"),
+            &set
+        ));
+        assert!(!password_confirmed(
+            PasswordChoice::Ask,
+            Some("deploy@other"),
+            &set
+        ));
+        assert!(!password_confirmed(PasswordChoice::Ask, None, &set));
     }
 
     #[test]
