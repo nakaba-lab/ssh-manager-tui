@@ -16,6 +16,8 @@
 
 use std::collections::HashSet;
 use std::io::{self, Read, Write};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::os::vault::{Secret, SecretKind};
 
@@ -594,6 +596,106 @@ pub fn outcome_from(results: &[ServeResult], password_armed: bool) -> Outcome {
     }
 }
 
+/// A live connect-time askpass listener: the serve-loop worker thread, its stop
+/// flag, and the channel address (needed to unblock the worker's pending accept
+/// at teardown). The worker owns the [`ConnectSecrets`], so the secrets are
+/// zeroized when it returns — `stop_and_join`/`Drop` both guarantee that.
+pub struct AskpassListener {
+    handle: Option<std::thread::JoinHandle<Outcome>>,
+    stop: Arc<AtomicBool>,
+    addr: String,
+}
+
+impl AskpassListener {
+    /// Stop the loop, unblock its pending accept (via a throwaway self-connect),
+    /// join the worker, and return the connect's terminal [`Outcome`]. The worker
+    /// has dropped its `ConnectSecrets` by the time `join` returns.
+    pub fn stop_and_join(mut self) -> Outcome {
+        self.shutdown().unwrap_or(Outcome::NotAttempted)
+    }
+
+    /// Signal stop, wake the blocking accept, and join. Returns the worker's
+    /// Outcome if it was still running. Idempotent: a second call is a no-op.
+    fn shutdown(&mut self) -> Option<Outcome> {
+        let handle = self.handle.take()?;
+        self.stop.store(true, Ordering::SeqCst);
+        // Unblock the worker's blocking accept with a throwaway connection: it
+        // wakes, sees the stop flag, and breaks. Best-effort — a failed connect
+        // just means the worker already broke on its own.
+        let _ = connect_client(&self.addr);
+        Some(handle.join().unwrap_or(Outcome::NotAttempted))
+    }
+}
+
+impl Drop for AskpassListener {
+    fn drop(&mut self) {
+        // Guarantee teardown + secret zeroize even if the caller forgot to join.
+        let _ = self.shutdown();
+    }
+}
+
+/// Arm a connect: generate a per-connect token, bind the channel listener
+/// (so the helper can connect the instant `ssh` spawns — TOCTOU: this returns
+/// only after the listener is bound), spawn the serve-loop worker holding the
+/// armed secrets, and return the handle plus the env bundle to apply to the `ssh`
+/// `Command`. The caller spawns `ssh` only after this returns `Ok`.
+pub fn arm_connect(
+    identity: ResolvedIdentity,
+    password: Option<Secret>,
+    passphrase: Option<Secret>,
+) -> io::Result<(
+    AskpassListener,
+    Vec<(std::ffi::OsString, std::ffi::OsString)>,
+)> {
+    let mut token = [0u8; TOKEN_LEN];
+    let bytes =
+        crate::os::vault::random_bytes(TOKEN_LEN).map_err(|e| io::Error::other(e.to_string()))?;
+    token.copy_from_slice(&bytes);
+
+    let listener = Listener::bind(token)?;
+    let addr = listener.address().to_string();
+    let env = arm_env(&addr, &token)?;
+
+    let password_armed = password.is_some();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_worker = Arc::clone(&stop);
+
+    let handle = std::thread::spawn(move || {
+        let mut secrets = ConnectSecrets::new(identity, password, passphrase);
+        let mut results = Vec::new();
+        loop {
+            match listener.serve_one(&mut secrets) {
+                Ok(r) => {
+                    results.push(r);
+                    if stop_worker.load(Ordering::SeqCst) {
+                        break;
+                    }
+                }
+                Err(_) => {
+                    // The stop self-connect surfaces here (EOF on read); a real
+                    // short-read/malformed client also lands here — per spec we do
+                    // NOT tear down for that, we loop back to accept. Stop is the
+                    // only exit.
+                    if stop_worker.load(Ordering::SeqCst) {
+                        break;
+                    }
+                }
+            }
+        }
+        // `secrets` drops here -> all Secret material zeroized before join returns.
+        outcome_from(&results, password_armed)
+    });
+
+    Ok((
+        AskpassListener {
+            handle: Some(handle),
+            stop,
+            addr,
+        },
+        env,
+    ))
+}
+
 #[cfg(unix)]
 mod chan {
     use super::*;
@@ -1142,6 +1244,48 @@ mod tests {
             ),
             Outcome::Declined {
                 reason: DeclineReason::NoMatch
+            }
+        );
+    }
+
+    #[test]
+    fn arm_connect_serves_password_then_reports_served_outcome() {
+        use super::{
+            CHANNEL_ENV, Outcome, ResolvedIdentity, TOKEN_ENV, arm_connect, connect_client,
+            parse_token_hex, read_reply, write_request,
+        };
+        use crate::os::vault::{Secret, SecretKind};
+
+        let id = ResolvedIdentity {
+            user: "deploy".into(),
+            host: "web1".into(),
+            host_key_alias: None,
+            identity_paths: vec![],
+        };
+        // Arm with a password; the listener binds + the worker starts before this
+        // returns (so a client can connect immediately — the real TOCTOU order).
+        let (listener, env) = arm_connect(id, Some(Secret::from("hunter2")), None).unwrap();
+        let get = |k: &str| {
+            env.iter()
+                .find(|(n, _)| n == k)
+                .map(|(_, v)| v.to_string_lossy().into_owned())
+        };
+        let addr = get(CHANNEL_ENV).unwrap();
+        let token = parse_token_hex(&get(TOKEN_ENV).unwrap()).unwrap();
+
+        // A helper presents the matching prompt and gets the password.
+        let mut c = connect_client(&addr).unwrap();
+        write_request(&mut c, &token, "deploy@web1's password: ").unwrap();
+        assert_eq!(read_reply(&mut c).unwrap().as_deref(), Some("hunter2"));
+        drop(c);
+
+        // Teardown unblocks the loop, joins, and reports Served{Password}; the
+        // worker has dropped (zeroized) the ConnectSecrets by the time join returns.
+        let outcome = listener.stop_and_join();
+        assert_eq!(
+            outcome,
+            Outcome::Served {
+                kind: SecretKind::Password
             }
         );
     }
