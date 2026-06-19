@@ -38,6 +38,23 @@ enum Command {
 }
 
 fn main() -> Result<()> {
+    // SSH_ASKPASS helper mode is selected by the PRESENCE of SSHM_ASKPASS_CHANNEL
+    // in the environment — OpenSSH execs us as `sshm "<prompt>"` with no flag. This
+    // runs BEFORE any arg parsing, so a prompt beginning with `-` is never
+    // misparsed as a flag and never reaches the `other => exit(2)` arm, and before
+    // ratatui/config init so the helper stays a thin, side-effect-free relay.
+    if let Some(bytes) =
+        crate::os::askpass::run_helper(std::env::args().nth(1), |k| std::env::var(k).ok())
+    {
+        use std::io::Write;
+        if bytes.is_empty() {
+            // No match / channel error: exit non-zero with no stdout.
+            std::process::exit(1);
+        }
+        let _ = std::io::stdout().write_all(&bytes);
+        std::process::exit(0);
+    }
+
     let mut command = Command::Tui;
     let mut config_path: Option<PathBuf> = None;
 
