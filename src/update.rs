@@ -753,7 +753,10 @@ fn copy_command(app: &mut App) {
 
 fn copy_to_clipboard(text: &str) -> Result<()> {
     let mut cb = arboard::Clipboard::new()?;
-    cb.set_text(text.to_string())?;
+    // Pass the borrowed text through (Cow::Borrowed) so we don't make an extra
+    // owned, un-zeroized String copy of a vault secret on our own heap — arboard
+    // borrows it straight into the OS clipboard buffer.
+    cb.set_text(std::borrow::Cow::Borrowed(text))?;
     Ok(())
 }
 
