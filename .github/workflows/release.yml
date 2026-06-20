@@ -6,13 +6,40 @@ on:
 
 permissions:
   contents: write
+  id-token: write
+  attestations: write
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Single advisory/quality gate the publish job depends on, so a `git tag && push`
+  # that bypasses a PR to main still runs fmt/clippy/test + cargo audit + cargo deny.
+  gate:
+    name: quality gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --all
+      - name: Install cargo-audit and cargo-deny
+        # Pin tool majors so a surprise upstream release can't break a tagged build
+        # (Dependabot does not bump `cargo install` tools; revisit deliberately).
+        run: cargo install cargo-audit --version "^0.22" --locked && cargo install cargo-deny --version "^0.16" --locked
+      - run: cargo audit
+      - run: cargo deny check advisories bans sources
+
   release:
     name: release (${{ matrix.target }})
+    # Gate the publish on the quality job; the protected `release` environment (set
+    # up in repo Settings -> Environments with required reviewers) adds a human gate.
+    needs: gate
+    environment: release
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -33,17 +60,17 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       # Install via the matrix target so cross-target builds (e.g.
       # x86_64-apple-darwin on the arm64 macos runner) get the right std.
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           targets: ${{ matrix.target }}
 
       - name: Cache cargo registry and build artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: ${{ matrix.target }}
 
@@ -92,8 +119,13 @@ jobs:
           printf '%s  %s' "$hash" "$asset" > "${asset}.sha256"
           echo "ASSET=$asset" >> "$GITHUB_ENV"
 
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: ${{ env.ASSET }}
+
       - name: Attach assets to release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ github.ref_name }}
           files: |
