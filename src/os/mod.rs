@@ -3,6 +3,7 @@
 
 pub mod askpass;
 pub mod binaries;
+pub mod clipboard;
 pub mod connect;
 pub mod keys;
 pub mod known_hosts;

@@ -37,6 +37,8 @@ use crate::os::vault::{
 use crate::ui::confirm::ACTION_LABELS;
 
 pub fn handle_key(app: &mut App, key: KeyEvent, terminal: &mut DefaultTerminal) -> Result<()> {
+    // Refresh the idle clock so an active session never auto-locks the vault (#14).
+    app.last_activity = std::time::Instant::now();
     // Any keypress dismisses a sticky error toast.
     if app.toast.is_error {
         app.clear_toast();
@@ -497,7 +499,23 @@ fn connect_by_alias(
     maybe_password_discoverability(app, &host);
 
     // Candidacy (opt-in-masked). A decline additionally drops the Password kind.
-    let candidacy = apply_password_choice(app.vault_secret_kinds(&host), choice);
+    let mut candidacy = apply_password_choice(app.vault_secret_kinds(&host), choice);
+    // (#6) OpenSSH < 8.5 lacks the `(user@host)` keyboard-interactive prefix that
+    // classify() depends on, so never arm the server-facing *password* secret on
+    // such a client. Passphrase auto-fill is local-only and stays enabled.
+    if let Some(k) = candidacy.as_mut()
+        && k.password
+        && !crate::os::askpass::ssh_kbdint_prefix_supported()
+    {
+        k.password = false;
+        app.toast(
+            "password auto-fill off: OpenSSH < 8.5 can't isolate keyboard-interactive",
+            false,
+        );
+        if !k.any() {
+            candidacy = None;
+        }
+    }
     // No candidate secret → a plain connect (skip `ssh -G` for the common case).
     if candidacy.is_none() {
         return connect_plain(app, terminal, &host, &args, mode);
@@ -818,8 +836,9 @@ fn copy_to_clipboard(text: &str) -> Result<()> {
     Ok(())
 }
 
-/// How long a copied vault secret lingers in the clipboard before auto-clear.
-const CLIPBOARD_CLEAR_AFTER: Duration = Duration::from_secs(20);
+/// How long a copied vault secret lingers before auto-clear. Kept short because
+/// the moment a secret enters the OS clipboard it is outside our zeroized memory.
+const CLIPBOARD_CLEAR_AFTER: Duration = Duration::from_secs(12);
 
 /// Called each tick: once the auto-clear deadline passes, wipe the clipboard
 /// (only if it still holds the copied secret). Every step is best-effort.
@@ -1527,13 +1546,13 @@ fn copy_vault_secret(app: &mut App) {
     else {
         return;
     };
-    match copy_to_clipboard(secret.as_str()) {
+    match crate::os::clipboard::set_secret(secret.as_str()) {
         Ok(()) => {
             app.clipboard_hash = hash_secret(app.clipboard_hash_key, secret.as_str());
             app.clipboard_clear_at = Some(Instant::now() + CLIPBOARD_CLEAR_AFTER);
             app.toast(
                 format!(
-                    "secret copied — clipboard auto-clears in {}s",
+                    "secret copied — auto-clears in {}s (a clipboard-history manager may still retain it)",
                     CLIPBOARD_CLEAR_AFTER.as_secs()
                 ),
                 false,

@@ -42,4 +42,7 @@ windows-sys = { version = "0.60", features = [
     "Win32_System_Threading",
     "Win32_System_IO",
     "Win32_Storage_FileSystem",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
 ] }

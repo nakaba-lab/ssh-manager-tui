@@ -81,9 +81,13 @@ pub fn read_reply(r: &mut impl Read) -> io::Result<Option<Zeroizing<String>>> {
     if bytes.is_empty() {
         return Ok(None);
     }
-    let s = String::from_utf8(bytes.to_vec())
+    // Validate IN PLACE: `String::from_utf8` would hand back a non-Zeroizing Vec
+    // it owns on the error path, dropping a transient un-scrubbed plaintext copy
+    // (#13). `str::from_utf8` borrows; the only secret allocation is the Zeroizing
+    // String built from the validated &str.
+    let s = std::str::from_utf8(&bytes)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "reply not UTF-8"))?;
-    Ok(Some(Zeroizing::new(s)))
+    Ok(Some(Zeroizing::new(s.to_owned())))
 }
 
 /// The shape of a prompt OpenSSH passed to the helper, decided by text only.
@@ -131,6 +135,43 @@ pub fn classify(prompt: &str) -> Classified {
         };
     }
     Classified::Other
+}
+
+/// True when the resolved `ssh` is OpenSSH >= 8.5, where keyboard-interactive
+/// prompts carry the `(user@host) ` instance prefix that [`classify`] relies on
+/// to refuse serving a stored password to a server-driven prompt. On older
+/// clients (or when the version can't be read) returns false and the caller
+/// withholds the *password* secret (passphrase auto-fill is local-only and stays
+/// on). Probed once via `ssh -V`. (#6)
+pub fn ssh_kbdint_prefix_supported() -> bool {
+    static SSH_KBDINT_PREFIX: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SSH_KBDINT_PREFIX.get_or_init(|| ssh_version_at_least(8, 5).unwrap_or(false))
+}
+
+fn ssh_version_at_least(maj: u32, min: u32) -> Option<bool> {
+    let out = std::process::Command::new(&crate::os::binaries::tools().ssh)
+        .arg("-V")
+        .output()
+        .ok()?;
+    // OpenSSH prints the banner to stderr; fall back to stdout if empty.
+    let raw = if out.stderr.is_empty() {
+        &out.stdout
+    } else {
+        &out.stderr
+    };
+    parse_openssh_atleast(&String::from_utf8_lossy(raw), maj, min)
+}
+
+/// Pure parser for an `ssh -V` banner: returns whether it is >= maj.min. Splits
+/// after the first `OpenSSH_` token and reads the first two integer fields.
+fn parse_openssh_atleast(text: &str, maj: u32, min: u32) -> Option<bool> {
+    let after = text.split("OpenSSH_").nth(1)?;
+    let mut nums = after
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|s| !s.is_empty());
+    let got_maj: u32 = nums.next()?.parse().ok()?;
+    let got_min: u32 = nums.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    Some(got_maj > maj || (got_maj == maj && got_min >= min))
 }
 
 /// Resolved token values sourced from one `ssh -G` dump, used to expand
@@ -640,6 +681,12 @@ pub struct AskpassListener {
     done: std::sync::mpsc::Receiver<Outcome>,
     stop: Arc<AtomicBool>,
     addr: String,
+    /// Windows-only: the worker publishes a duplicated handle to ITS OWN THREAD
+    /// here so teardown can `CancelSynchronousIo` a stalled blocking pipe read.
+    /// The worker clears+closes it (under the lock) right before returning, so a
+    /// cancel never races the close. (#12)
+    #[cfg(windows)]
+    cancel_slot: Arc<std::sync::Mutex<Option<isize>>>,
 }
 
 impl AskpassListener {
@@ -671,7 +718,29 @@ impl AskpassListener {
                 let _ = handle.join();
                 Some(outcome)
             }
-            Err(_) => Some(Outcome::TimedOut),
+            Err(_) => {
+                // The worker is parked in a blocking ConnectNamedPipe/ReadFile the
+                // self-connect wake couldn't reach. Abort that SYNCHRONOUS I/O on
+                // the worker thread so the call errors out, the worker sees `stop`,
+                // returns, and zeroizes its ConnectSecrets promptly (unix already
+                // self-exits via the read timeout). The slot lock serialises this
+                // against the worker closing its thread handle. (#12)
+                #[cfg(windows)]
+                {
+                    use windows_sys::Win32::Foundation::HANDLE;
+                    use windows_sys::Win32::System::IO::CancelSynchronousIo;
+                    if let Ok(slot) = self.cancel_slot.lock()
+                        && let Some(h) = *slot
+                    {
+                        // SAFETY: while the slot holds Some, the worker has not yet
+                        // closed its duplicated thread handle, so `h` is live.
+                        unsafe {
+                            CancelSynchronousIo(h as HANDLE);
+                        }
+                    }
+                }
+                Some(Outcome::TimedOut)
+            }
         }
     }
 }
@@ -717,10 +786,39 @@ pub fn arm_connect(
     let stop = Arc::new(AtomicBool::new(false));
     let stop_worker = Arc::clone(&stop);
     let (done_tx, done) = std::sync::mpsc::channel();
+    #[cfg(windows)]
+    let cancel_slot = Arc::new(std::sync::Mutex::new(None::<isize>));
+    #[cfg(windows)]
+    let cancel_slot_worker = Arc::clone(&cancel_slot);
 
     let handle = std::thread::spawn(move || {
         let mut secrets = ConnectSecrets::new(identity, password, passphrase);
         let mut results = Vec::new();
+        // (#12, windows) publish a real handle to THIS worker thread so teardown
+        // can CancelSynchronousIo its blocking pipe read. GetCurrentThread() is a
+        // pseudo-handle valid only in this thread, so duplicate it into a real one.
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE};
+            use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentThread};
+            let mut dup: HANDLE = std::ptr::null_mut();
+            // SAFETY: pseudo-handles are valid args; DuplicateHandle writes a real
+            // handle into `dup` (or leaves it null and returns 0 on failure).
+            let ok = unsafe {
+                DuplicateHandle(
+                    GetCurrentProcess(),
+                    GetCurrentThread(),
+                    GetCurrentProcess(),
+                    &mut dup,
+                    0,
+                    0,
+                    DUPLICATE_SAME_ACCESS,
+                )
+            };
+            if ok != 0 {
+                *cancel_slot_worker.lock().unwrap() = Some(dup as isize);
+            }
+        }
         loop {
             match listener.serve_one(&mut secrets) {
                 Ok(r) => {
@@ -743,6 +841,18 @@ pub fn arm_connect(
                 }
             }
         }
+        // Clear the slot and close the duplicated thread handle BEFORE returning,
+        // so a concurrent teardown cancel can never touch a freed handle. (#12)
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+            if let Some(h) = cancel_slot_worker.lock().unwrap().take() {
+                // SAFETY: `h` is the real handle we duplicated above; closed once.
+                unsafe {
+                    CloseHandle(h as HANDLE);
+                }
+            }
+        }
         // `secrets` drops here -> all Secret material zeroized.
         let outcome = outcome_from(&results, password_armed);
         // Signal completion so a bounded teardown need not block on join.
@@ -756,6 +866,8 @@ pub fn arm_connect(
             done,
             stop,
             addr,
+            #[cfg(windows)]
+            cancel_slot,
         },
         env,
     ))
@@ -1203,6 +1315,27 @@ mod tests {
     #[test]
     fn module_compiles() {
         assert_eq!(super::TOKEN_LEN, 32);
+    }
+
+    #[test]
+    fn parse_openssh_version_gate() {
+        use super::parse_openssh_atleast as p;
+        assert_eq!(p("OpenSSH_9.6p1, OpenSSL", 8, 5), Some(true));
+        assert_eq!(p("OpenSSH_8.5p1", 8, 5), Some(true));
+        assert_eq!(p("OpenSSH_8.4p1, OpenSSL", 8, 5), Some(false));
+        assert_eq!(p("OpenSSH_for_Windows_9.5", 8, 5), Some(true));
+        assert_eq!(p("garbage", 8, 5), None);
+    }
+
+    #[test]
+    fn read_reply_rejects_non_utf8_without_panicking() {
+        // length-prefixed (u32 LE = 2) then invalid UTF-8 bytes.
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&2u32.to_le_bytes());
+        buf.extend_from_slice(&[0xff, 0xfe]);
+        let mut cur = std::io::Cursor::new(buf);
+        let err = super::read_reply(&mut cur).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[test]
