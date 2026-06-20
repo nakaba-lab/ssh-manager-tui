@@ -74,6 +74,11 @@ pub fn build_ssh_args(host: &HostView, ov: &ConnectOverrides) -> Vec<String> {
         Some(u) => format!("{u}@{}", host.alias()),
         None => host.alias().to_string(),
     };
+    // End-of-options sentinel (CWE-88): a config-controlled alias beginning with
+    // '-' must never be parsed by ssh as an option. Mirrors the hardened
+    // `ssh -G -- <alias>` resolve path (os/resolve.rs). Applies uniformly to the
+    // inline, new-tab, and "copy command" paths, which all build on this.
+    a.push("--".into());
     a.push(dest);
     a
 }
@@ -228,7 +233,21 @@ mod tests {
     #[test]
     fn default_args_is_just_alias() {
         let h = host("web1");
-        assert_eq!(build_ssh_args(&h, &ConnectOverrides::default()), ["web1"]);
+        assert_eq!(
+            build_ssh_args(&h, &ConnectOverrides::default()),
+            ["--", "web1"]
+        );
+    }
+
+    #[test]
+    fn dash_alias_is_after_end_of_options() {
+        let h = host("-oProxyCommand=calc");
+        let args = build_ssh_args(&h, &ConnectOverrides::default());
+        // The alias can only ever appear AFTER the `--` sentinel, so ssh can
+        // never parse it as an option (CWE-88).
+        let sep = args.iter().position(|a| a == "--").expect("`--` present");
+        assert_eq!(args[sep + 1], "-oProxyCommand=calc");
+        assert_eq!(sep, args.len() - 2);
     }
 
     #[test]
@@ -266,6 +285,7 @@ mod tests {
                 "-o",
                 "ForwardAgent=yes",
                 "-v",
+                "--",
                 "deploy@web1",
             ]
         );
