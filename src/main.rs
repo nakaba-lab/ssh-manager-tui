@@ -6,6 +6,7 @@ mod config;
 mod error;
 mod event_loop;
 mod os;
+mod secure_fs;
 mod ui;
 mod update;
 

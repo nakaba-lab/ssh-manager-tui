@@ -506,48 +506,6 @@ pub fn recover_backup(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// A unique, unpredictable temp filename in the vault directory, so two
-/// processes can't clobber each other and an attacker can't pre-create the path.
-fn temp_name() -> Result<String> {
-    let r = random_bytes(8)?;
-    let hex: String = r.iter().map(|b| format!("{b:02x}")).collect();
-    Ok(format!(".sshm-vault.{}.{hex}.tmp", std::process::id()))
-}
-
-/// Restrict a file to the current user only (no inheritance) on Windows, where
-/// `0o600` does not apply. Best-effort: an icacls failure must never lose the
-/// vault, so the result is intentionally ignored.
-#[cfg(windows)]
-fn restrict_acl(path: &Path) {
-    let user = std::env::var("USERNAME").unwrap_or_default();
-    if user.is_empty() {
-        return;
-    }
-    let _ = std::process::Command::new("icacls")
-        .arg(path)
-        .arg("/inheritance:r")
-        .arg("/grant:r")
-        .arg(format!("{user}:(F)"))
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-}
-
-/// Best-effort directory fsync so a rename is persisted, not just buffered. On
-/// unix this is the documented way to make a rename durable; on Windows a directory
-/// flush needs backup-semantics not exposed by `std`, so NTFS metadata journaling
-/// is relied on. Deliberately best-effort (never propagated): the rename has
-/// already succeeded by this point, so failing the whole `save` here would
-/// desync the in-memory vault from disk via the caller's rollback.
-fn fsync_parent_dir(dir: &Path) {
-    #[cfg(unix)]
-    if let Ok(d) = fs::File::open(dir) {
-        let _ = d.sync_all();
-    }
-    #[cfg(not(unix))]
-    let _ = dir;
-}
-
 /// Write `bytes` to `path` atomically and durably. The temp file is created
 /// exclusively with a unique name, locked down to the owner (0o600 on unix,
 /// owner-only ACL on Windows), fsynced, then swapped in via a rename — moving the
@@ -556,30 +514,19 @@ fn fsync_parent_dir(dir: &Path) {
 /// removed on every failure path so a failed save never leaks an encrypted orphan.
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    if !dir.exists() {
-        fs::create_dir_all(dir)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
-        }
-    }
+    // Owner-private dir on BOTH platforms (closes the Windows dir-ACL gap, #7).
+    crate::secure_fs::create_dir_private(dir)?;
 
-    let tmp = dir.join(temp_name()?);
-    // Write + fsync the temp; on ANY failure remove it so we never leak an
-    // encrypted orphan, and propagate the fsync result so a flush failure
-    // (EIO/ENOSPC) aborts BEFORE the destructive swap rather than renaming
-    // incomplete data over the good vault.
+    let tmp = dir.join(crate::secure_fs::temp_name(".sshm-vault")?);
+    // create_new_private creates O_EXCL and, on Windows, applies the owner-only
+    // ACL BEFORE any ciphertext is written into the temp (#7); on unix it is
+    // 0o600 from birth. icacls is resolved to an absolute path (#8). On ANY
+    // failure remove the temp so a failed save never leaks an encrypted orphan,
+    // and propagate the fsync result so a flush failure (EIO/ENOSPC) aborts
+    // BEFORE the destructive swap.
     let write_res = (|| -> Result<()> {
         use std::io::Write;
-        let mut opts = fs::OpenOptions::new();
-        opts.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let mut f = opts.open(&tmp)?;
+        let mut f = crate::secure_fs::create_new_private(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
         Ok(())
@@ -588,8 +535,6 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         let _ = fs::remove_file(&tmp);
         return Err(e);
     }
-    #[cfg(windows)]
-    restrict_acl(&tmp);
 
     let bak = sidecar(path, "bak");
     if path.exists() {
@@ -604,7 +549,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         match fs::rename(&tmp, path) {
             Ok(()) => {
                 let _ = fs::remove_file(&bak);
-                fsync_parent_dir(dir);
+                crate::secure_fs::fsync_parent_dir(dir);
                 Ok(())
             }
             Err(e) => {
@@ -624,7 +569,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
             let _ = fs::remove_file(&tmp);
             return Err(e.into());
         }
-        fsync_parent_dir(dir);
+        crate::secure_fs::fsync_parent_dir(dir);
         Ok(())
     }
 }
