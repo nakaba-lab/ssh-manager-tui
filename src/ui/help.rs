@@ -64,8 +64,12 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
             lines.push(key("d", "delete secret"));
             lines.push(key("Space", "reveal / mask secrets"));
             lines.push(key("p", "toggle connect-time password auto-fill"));
-            lines.push(key("L", "lock vault (forget master password)"));
+            lines.push(key("L", "lock vault now (forget master password)"));
             lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  The vault auto-locks after 15 min idle.",
+                Style::default().fg(theme::FAINT),
+            )));
             lines.push(Line::from(Span::styled(
                 "  Secrets are encrypted with your master password in",
                 Style::default().fg(theme::FAINT),

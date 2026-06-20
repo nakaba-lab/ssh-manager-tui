@@ -10,6 +10,9 @@ use nucleo_matcher::{Config, Matcher, Utf32Str};
 use ratatui::widgets::{ListState, TableState};
 use zeroize::Zeroize;
 
+/// Idle period after which an unlocked vault auto-locks (drops + zeroizes). (#14)
+pub const VAULT_IDLE_LOCK: Duration = Duration::from_secs(15 * 60);
+
 use crate::config::SshConfig;
 use crate::config::model::HostView;
 use crate::os::keys::KeyInfo;
@@ -358,6 +361,8 @@ pub struct App {
     /// Per-session key mixed into `clipboard_hash`, so the value held in memory is
     /// not a stand-alone, precomputable digest of the secret.
     pub clipboard_hash_key: u64,
+    /// Wall-clock of the last keypress; drives the vault idle auto-lock (#14).
+    pub last_activity: Instant,
 
     // --- chrome ---
     pub toast: Toast,
@@ -416,6 +421,7 @@ impl App {
                 let _ = getrandom::getrandom(&mut b);
                 u64::from_le_bytes(b)
             },
+            last_activity: Instant::now(),
             toast: Toast::default(),
             ssh_path_warning: !os::tools().is_system32,
             include_note: false,
@@ -645,14 +651,37 @@ impl App {
         changed
     }
 
-    /// Per-tick housekeeping: expire transient toasts. Returns true if changed.
+    /// Per-tick housekeeping: expire transient toasts and auto-lock an idle vault.
+    /// Returns true if anything changed (so the caller redraws).
     pub fn on_tick(&mut self) -> bool {
-        if let Some(at) = self.toast.shown_at {
-            // Success toasts auto-dismiss after 4s; errors stay until next key.
-            if !self.toast.is_error && at.elapsed() > Duration::from_secs(4) {
-                self.toast = Toast::default();
-                return true;
+        let mut changed = false;
+        // Success toasts auto-dismiss after 4s; errors stay until next key.
+        if let Some(at) = self.toast.shown_at
+            && !self.toast.is_error
+            && at.elapsed() > Duration::from_secs(4)
+        {
+            self.toast = Toast::default();
+            changed = true;
+        }
+        if self.idle_autolock() {
+            changed = true;
+        }
+        changed
+    }
+
+    /// Drop (zeroize) the vault if it has been unlocked and idle past
+    /// [`VAULT_IDLE_LOCK`]. Returns true if it locked this tick. (#14)
+    fn idle_autolock(&mut self) -> bool {
+        if self.vault.is_some() && self.last_activity.elapsed() >= VAULT_IDLE_LOCK {
+            self.vault = None;
+            self.vault_reveal = false;
+            self.confirmed_password_targets.clear();
+            // Bounce off any vault screen to the safe list view.
+            if matches!(self.screen, Screen::Vault | Screen::VaultEntry { .. }) {
+                self.screen = Screen::List;
             }
+            self.toast("vault auto-locked (idle)", false);
+            return true;
         }
         false
     }
