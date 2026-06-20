@@ -118,7 +118,7 @@ impl SshConfig {
                 // Atomic replace: no window where the config is missing, no orphan.
                 // ReplaceFileW requires the destination to exist (the `else` arm
                 // covers first-time creation). It preserves the destination's
-                // existing ACL/attributes, which is the desired behavior here.
+                // existing ACL/attributes; we re-assert owner-only after the block.
                 use std::os::windows::ffi::OsStrExt;
                 use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
                 let wide = |p: &Path| -> Vec<u16> {
@@ -154,6 +154,9 @@ impl SshConfig {
                     source,
                 })?;
             }
+            // ReplaceFileW preserves the destination's PRIOR ACL, so re-assert
+            // owner-only here to tighten a pre-existing loose config too (#3).
+            crate::secure_fs::restrict_acl(&path);
         }
         #[cfg(not(windows))]
         {

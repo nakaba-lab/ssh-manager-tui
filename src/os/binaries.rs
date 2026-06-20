@@ -40,6 +40,11 @@ fn resolve() -> SshTools {
             is_system32: true,
         };
     }
+    // Accepted residual (#8 scope): when System32 OpenSSH is absent (Git-for-
+    // Windows-only installs), fall back to bare names resolved by the OS executable
+    // search. This is surfaced to the user as the `[PATH ssh]` warning
+    // (`is_system32: false` drives `App::ssh_path_warning`); the always-on `icacls`
+    // spawn was the one absolutized. A planted ssh on the CWD/PATH is the residual.
     SshTools {
         ssh: PathBuf::from("ssh"),
         ssh_keygen: PathBuf::from("ssh-keygen"),

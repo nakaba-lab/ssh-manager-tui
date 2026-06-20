@@ -676,6 +676,10 @@ impl App {
             self.vault = None;
             self.vault_reveal = false;
             self.confirmed_password_targets.clear();
+            // Scrub any typed-but-unsaved secret in the entry/unlock forms too
+            // (both Drop-zeroize when replaced), so a lock leaves nothing behind.
+            self.vault_entry = VaultEntryForm::default();
+            self.vault_unlock = VaultUnlock::default();
             // Bounce off any vault screen to the safe list view.
             if matches!(self.screen, Screen::Vault | Screen::VaultEntry { .. }) {
                 self.screen = Screen::List;

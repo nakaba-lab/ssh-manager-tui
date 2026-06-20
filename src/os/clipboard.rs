@@ -51,10 +51,14 @@ pub fn set_secret(text: &str) -> std::io::Result<()> {
         Ok(h as HANDLE)
     }
 
-    let wide: Vec<u16> = OsStr::new(text)
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
+    // Zeroizing so this UTF-16 copy of the secret is scrubbed from our heap on
+    // drop (the OS-owned HGLOBAL is unavoidable; this extra copy is not). (#5)
+    let wide: zeroize::Zeroizing<Vec<u16>> = zeroize::Zeroizing::new(
+        OsStr::new(text)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect(),
+    );
     let text_bytes: &[u8] =
         unsafe { std::slice::from_raw_parts(wide.as_ptr() as *const u8, wide.len() * 2) };
 

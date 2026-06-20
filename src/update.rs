@@ -623,6 +623,9 @@ fn connect_plain(
             suspend_tui(terminal)?;
             let status = run_ssh_inline(args, &[]);
             restore_tui(terminal)?;
+            // A long inline session (TUI suspended, no keypresses) must not make the
+            // next on_tick spuriously idle-auto-lock the vault (#14).
+            app.last_activity = std::time::Instant::now();
             report_plain_exit(app, status);
         }
         ConnectMode::NewWtTab => match connect_new_tab(host.alias(), args, &[]) {
@@ -658,6 +661,9 @@ fn arm_and_connect_inline(
             suspend_tui(terminal)?;
             let status = run_ssh_inline(args, &env);
             restore_tui(terminal)?;
+            // See connect_plain: a long session must not trigger a spurious idle
+            // auto-lock on the next tick (#14).
+            app.last_activity = std::time::Instant::now();
             let outcome = listener.stop_and_join();
             let toast = match status {
                 Ok(s) => connect_toast(alias, s.code(), &outcome),
