@@ -680,7 +680,10 @@ impl App {
             // (both Drop-zeroize when replaced), so a lock leaves nothing behind.
             self.vault_entry = VaultEntryForm::default();
             self.vault_unlock = VaultUnlock::default();
-            // Bounce off any vault screen to the safe list view.
+            // Bounce off any vault screen to the safe list view. `Screen::VaultUnlock`
+            // is intentionally NOT matched: it is only reachable while the vault is
+            // locked (see `open_vault`), so the `vault.is_some()` guard above already
+            // excludes it — don't "fix" the apparent asymmetry.
             if matches!(self.screen, Screen::Vault | Screen::VaultEntry { .. }) {
                 self.screen = Screen::List;
             }

@@ -28,8 +28,11 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --all
       - name: Install cargo-audit and cargo-deny
-        # Pin tool majors so a surprise upstream release can't break a tagged build
-        # (Dependabot does not bump `cargo install` tools; revisit deliberately).
+        # Pin tool majors so a surprise upstream release can't break a tagged build.
+        # REMINDER: Dependabot does NOT bump `cargo install` tools, so re-pin these
+        # deliberately whenever the RustSec advisory format moves. A stale `^0.16`
+        # resolved to cargo-deny 0.16.4, which could not parse CVSS-v4.0 advisories
+        # and broke EVERY release until bumped to `^0.19`. Re-check on each major.
         run: cargo install cargo-audit --version "^0.22" --locked && cargo install cargo-deny --version "^0.19" --locked
       - run: cargo audit
       - run: cargo deny check advisories bans sources
