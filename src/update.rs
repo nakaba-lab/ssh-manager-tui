@@ -480,6 +480,17 @@ fn connect_by_alias(
         app.toast(format!("host '{alias}' is no longer in the config"), true);
         return Ok(());
     };
+    // Defense in depth (CWE-88): a config-controlled alias that is empty or begins
+    // with '-' is argv flag-smuggling bait and is not a usable ssh destination
+    // anyway. Refuse with a clear message; the `--` sentinel in build_ssh_args
+    // already neutralizes it on the wire. Mirrors os/resolve.rs's dash rejection.
+    if alias.is_empty() || alias.starts_with('-') {
+        app.toast(
+            format!("refusing to connect: unsafe host alias '{alias}'"),
+            true,
+        );
+        return Ok(());
+    }
     let args = build_ssh_args(&host, &ConnectOverrides::default());
 
     // v1 auto-fills the inline path only; a mode that won't auto-fill skips the
