@@ -1,0 +1,11 @@
+# cargo-deny config: advisory + supply-chain gate for the release pipeline.
+[advisories]
+yanked = "deny"
+ignore = []
+
+[bans]
+multiple-versions = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
