@@ -57,47 +57,113 @@ impl SshConfig {
     /// Write the document back to disk atomically, creating a one-time session
     /// backup (`config.bak`) before the first overwrite.
     pub fn save(&mut self) -> Result<(), ConfigError> {
+        use std::io::Write;
         let rendered = self.render();
         let path = self.path.clone();
+        let dir = path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
 
-        // One-time session backup.
-        if !self.bak_done && path.exists() {
-            let bak = path.with_extension("bak");
-            fs::copy(&path, &bak).map_err(|source| ConfigError::Io { path: bak, source })?;
-            self.bak_done = true;
-        }
-
-        let dir = path.parent().unwrap_or_else(|| Path::new("."));
-        if !dir.exists() {
-            fs::create_dir_all(dir).map_err(|source| ConfigError::Io {
-                path: dir.to_path_buf(),
-                source,
-            })?;
-        }
-        let tmp = dir.join(".ssh_manager_config.tmp");
-
-        fs::write(&tmp, rendered.as_bytes()).map_err(|source| ConfigError::Io {
-            path: tmp.clone(),
+        // Owner-private dir on both platforms (Windows ACL gap, #3).
+        crate::secure_fs::create_dir_private(&dir).map_err(|source| ConfigError::Io {
+            path: dir.clone(),
             source,
         })?;
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
+        // One-time session backup of the CURRENT config, made owner-private (#3).
+        if !self.bak_done && path.exists() {
+            let bak = path.with_extension("bak");
+            fs::copy(&path, &bak).map_err(|source| ConfigError::Io {
+                path: bak.clone(),
+                source,
+            })?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(&bak, fs::Permissions::from_mode(0o600));
+            }
+            #[cfg(windows)]
+            crate::secure_fs::restrict_acl(&bak);
+            self.bak_done = true;
         }
 
-        // Windows rename fails if the destination exists; remove it first.
+        // Write into an unpredictable, O_EXCL, owner-private temp, fsync it, then
+        // atomically replace the destination. No predictable temp name
+        // (symlink/pre-creation TOCTOU, CWE-377, #2). On Windows, ReplaceFileW
+        // swaps the temp over the existing config in ONE atomic OS operation — no
+        // delete-before-rename window and no orphan left behind (#4); on unix the
+        // rename is already atomic. fsync of the temp file + the parent dir makes
+        // the swap crash-durable (#4).
+        let tmp = dir.join(crate::secure_fs::temp_name(".ssh_manager_config").map_err(
+            |source| ConfigError::Io {
+                path: dir.clone(),
+                source,
+            },
+        )?);
+        let write_res = (|| -> std::io::Result<()> {
+            let mut f = crate::secure_fs::create_new_private(&tmp)?;
+            f.write_all(rendered.as_bytes())?;
+            f.sync_all()?;
+            Ok(())
+        })();
+        if let Err(source) = write_res {
+            let _ = fs::remove_file(&tmp);
+            return Err(ConfigError::Io { path: tmp, source });
+        }
+
         #[cfg(windows)]
-        if path.exists() {
-            match fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(source) => return Err(ConfigError::Io { path, source }),
+        {
+            if path.exists() {
+                // Atomic replace: no window where the config is missing, no orphan.
+                // ReplaceFileW requires the destination to exist (the `else` arm
+                // covers first-time creation). It preserves the destination's
+                // existing ACL/attributes, which is the desired behavior here.
+                use std::os::windows::ffi::OsStrExt;
+                use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
+                let wide = |p: &Path| -> Vec<u16> {
+                    p.as_os_str()
+                        .encode_wide()
+                        .chain(std::iter::once(0))
+                        .collect()
+                };
+                let (wdest, wsrc) = (wide(&path), wide(&tmp));
+                // SAFETY: both pointers are valid, NUL-terminated UTF-16 paths; the
+                // three optional params are null/zero per the Win32 contract.
+                let ok = unsafe {
+                    ReplaceFileW(
+                        wdest.as_ptr(),
+                        wsrc.as_ptr(),
+                        std::ptr::null(),
+                        0,
+                        std::ptr::null(),
+                        std::ptr::null(),
+                    )
+                };
+                if ok == 0 {
+                    let source = std::io::Error::last_os_error();
+                    let _ = fs::remove_file(&tmp);
+                    return Err(ConfigError::Io {
+                        path: path.clone(),
+                        source,
+                    });
+                }
+            } else {
+                fs::rename(&tmp, &path).map_err(|source| ConfigError::Io {
+                    path: path.clone(),
+                    source,
+                })?;
             }
         }
+        #[cfg(not(windows))]
+        {
+            fs::rename(&tmp, &path).map_err(|source| ConfigError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        }
 
-        fs::rename(&tmp, &path).map_err(|source| ConfigError::Io { path, source })?;
+        crate::secure_fs::fsync_parent_dir(&dir);
         self.dirty = false;
         Ok(())
     }

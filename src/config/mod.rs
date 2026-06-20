@@ -390,6 +390,67 @@ mod tests {
     }
 
     #[test]
+    fn save_roundtrips_content_to_a_fresh_path() {
+        let src = "Host web1\n    HostName 10.0.0.1\n    User deploy\n";
+        let dir = std::env::temp_dir().join(crate::secure_fs::temp_name(".cfgtest").unwrap());
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("config");
+        let mut cfg = parser::parse(target.clone(), src);
+        cfg.save().unwrap();
+        let written = std::fs::read_to_string(&target).unwrap();
+        assert_eq!(written, src, "save must be byte-for-byte lossless");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_config_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(crate::secure_fs::temp_name(".cfgperm").unwrap());
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("config");
+        let mut cfg = parser::parse(target.clone(), "Host a\n");
+        cfg.save().unwrap();
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Exercises the OVERWRITE/swap branch the rewrite introduces (B3): the one-time
+    // .bak, the rename/ReplaceFileW swap, and the .bak owner-only perm.
+    #[test]
+    fn save_overwrite_creates_owner_only_bak_and_swaps() {
+        let dir = std::env::temp_dir().join(crate::secure_fs::temp_name(".cfgswap").unwrap());
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("config");
+        // v1: create + first save (no .bak yet, path did not exist).
+        let mut cfg = parser::parse(target.clone(), "Host a\n");
+        cfg.save().unwrap();
+        // v2: re-parse from the now-existing target, edit, save again -> .bak + swap.
+        let v2 = "Host a\n    HostName 2.2.2.2\n";
+        let mut cfg2 = parser::parse(target.clone(), v2);
+        cfg2.save().unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), v2);
+        let bak = target.with_extension("bak");
+        assert!(
+            bak.exists(),
+            "one-time session .bak must exist after overwrite"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&bak).unwrap(),
+            "Host a\n",
+            ".bak holds the pre-edit content"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&bak).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, ".bak must be owner-only");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn edit_extra_option_is_persisted() {
         // Regression for B1: editing/removing an "extra" option on an existing
         // host must round-trip to the file, not be silently dropped.
