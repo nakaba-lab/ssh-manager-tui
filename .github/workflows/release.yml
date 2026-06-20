@@ -30,7 +30,7 @@ jobs:
       - name: Install cargo-audit and cargo-deny
         # Pin tool majors so a surprise upstream release can't break a tagged build
         # (Dependabot does not bump `cargo install` tools; revisit deliberately).
-        run: cargo install cargo-audit --version "^0.22" --locked && cargo install cargo-deny --version "^0.16" --locked
+        run: cargo install cargo-audit --version "^0.22" --locked && cargo install cargo-deny --version "^0.19" --locked
       - run: cargo audit
       - run: cargo deny check advisories bans sources
 
