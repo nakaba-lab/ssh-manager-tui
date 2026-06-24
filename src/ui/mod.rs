@@ -93,7 +93,12 @@ fn draw_title(f: &mut Frame, app: &App, base: &Screen, area: Rect) {
         _ => "SSH Manager",
     };
     let count = match base {
-        Screen::List => format!("  {}/{} ", app.filtered.len(), app.hosts.len()),
+        Screen::List => format!(
+            "  {}/{} · {} ",
+            app.filtered.len(),
+            app.hosts.len(),
+            app.sort.label()
+        ),
         Screen::KeyManager => format!("  {} keys ", app.keys.len()),
         Screen::KnownHosts => format!("  {} entries ", app.known_hosts.len()),
         Screen::Vault => format!(
@@ -147,6 +152,7 @@ fn draw_footer(f: &mut Frame, app: &App, base: &Screen, area: Rect) {
             ("e", "edit"),
             ("a", "add"),
             ("d", "del"),
+            ("s", "sort"),
             ("K", "keys"),
             ("P", "passwords"),
             ("?", "help"),

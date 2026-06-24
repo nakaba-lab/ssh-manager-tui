@@ -64,6 +64,11 @@ layout that stacks the panes on narrow terminals.
   reachability dot. Connect **inline** (suspends the TUI, runs `ssh`, restores it on
   exit) or open the session in a **new Windows Terminal tab**. Copy the equivalent
   `ssh` command to the clipboard with one key.
+- **Connection history & sorting** — press `s` to cycle the list order between **file**
+  (verbatim config order), **recent** (most-recently connected first), **name**, and
+  **status** (reachability). The detail pane shows when each host was last connected
+  ("2h ago", "yesterday", …). Timestamps live in `~/.ssh/sshm-history.json`, kept
+  separate from the config so it always round-trips losslessly.
 - **Lossless config editing** — add, edit, and delete `Host` blocks through a form:
   `HostName`, `User`, `Port`, `IdentityFile`, `ProxyJump`, `LocalForward` /
   `RemoteForward` / `DynamicForward`, plus arbitrary extra options. Everything is
@@ -170,6 +175,7 @@ sshm --help          print help and exit
 | `e` / `a` | edit / add a host |
 | `d` | delete the host (with confirm) |
 | `r` / `R` | refresh liveness for all / the selected host |
+| `s` | cycle sort: file → recent → name → status |
 | `K` | key manager · `H` known_hosts viewer · `P` password vault |
 | `?` | help · `q` / `Ctrl-C` quit (`Esc` clears an active search filter first, else quits) |
 

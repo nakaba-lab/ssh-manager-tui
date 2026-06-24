@@ -274,6 +274,7 @@ fn handle_list(app: &mut App, key: KeyEvent, terminal: &mut DefaultTerminal) -> 
                 app.refresh_one_liveness(h);
             }
         }
+        KeyCode::Char('s') => cycle_sort(app),
         KeyCode::Char('K') => {
             app.key_host_ctx = app.selected_host();
             app.screen = Screen::KeyManager;
@@ -337,6 +338,15 @@ fn select_index(app: &mut App, idx: usize) {
     }
     app.list_state.select(Some(idx.min(app.filtered.len() - 1)));
     app.detail_scroll = 0;
+}
+
+/// Advance the list sort one step and re-order, keeping the same host selected so
+/// the cursor doesn't jump to an unrelated row.
+fn cycle_sort(app: &mut App) {
+    app.sort = app.sort.next();
+    app.refilter_keeping_selection();
+    app.detail_scroll = 0;
+    app.toast(format!("sort: {}", app.sort.label()), false);
 }
 
 // ---------------------------------------------------------------------------
@@ -620,6 +630,9 @@ fn connect_plain(
 ) -> Result<()> {
     match mode {
         ConnectMode::Inline => {
+            // The inline path commits to launching ssh (it suspends the TUI and
+            // execs), so record before suspending.
+            app.record_connect(host.alias());
             suspend_tui(terminal)?;
             let status = run_ssh_inline(args, &[]);
             restore_tui(terminal)?;
@@ -629,7 +642,13 @@ fn connect_plain(
             report_plain_exit(app, status);
         }
         ConnectMode::NewWtTab => match connect_new_tab(host.alias(), args, &[]) {
-            Ok(()) => app.toast(format!("opened new tab: ssh {}", host.alias()), false),
+            // Only stamp history once the tab actually spawned — a spawn failure
+            // (e.g. wt.exe missing) launched nothing, so it must not count as a
+            // connect (it would wrongly float the host up under the Recent sort).
+            Ok(()) => {
+                app.record_connect(host.alias());
+                app.toast(format!("opened new tab: ssh {}", host.alias()), false);
+            }
             Err(e) => app.toast(format!("{e}"), true),
         },
     }
@@ -658,6 +677,7 @@ fn arm_and_connect_inline(
 
     match arm_connect(identity, password, passphrase) {
         Ok((listener, env)) => {
+            app.record_connect(host.alias());
             suspend_tui(terminal)?;
             let status = run_ssh_inline(args, &env);
             restore_tui(terminal)?;

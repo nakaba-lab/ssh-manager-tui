@@ -15,6 +15,7 @@ pub const VAULT_IDLE_LOCK: Duration = Duration::from_secs(15 * 60);
 
 use crate::config::SshConfig;
 use crate::config::model::HostView;
+use crate::os::history::History;
 use crate::os::keys::KeyInfo;
 use crate::os::known_hosts::{HostSpec, KnownHostEntry};
 use crate::os::liveness::{Liveness, LivenessProbe, ProbeTarget};
@@ -152,6 +153,95 @@ pub enum ConnectMode {
 pub enum ListFocus {
     Hosts,
     Detail,
+}
+
+/// Order the host list is sorted by while not searching (a fuzzy search supplies
+/// its own ranking, so the sort only applies to the unfiltered view). Cycled with
+/// `s` on the list screen. `Config` is the default — it preserves the verbatim
+/// order of `Host` blocks in `~/.ssh/config`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SortMode {
+    /// Verbatim `~/.ssh/config` order (no reordering).
+    #[default]
+    Config,
+    /// Most-recently connected first; never-connected hosts last.
+    Recent,
+    /// Alias, case-insensitive A→Z.
+    Name,
+    /// Reachability: up → checking → unknown → skipped → down.
+    Status,
+}
+
+impl SortMode {
+    /// Short label for the title bar / toast.
+    pub fn label(self) -> &'static str {
+        match self {
+            SortMode::Config => "file",
+            SortMode::Recent => "recent",
+            SortMode::Name => "name",
+            SortMode::Status => "status",
+        }
+    }
+
+    /// The next mode in the cycle (wraps back to `Config`).
+    pub fn next(self) -> SortMode {
+        match self {
+            SortMode::Config => SortMode::Recent,
+            SortMode::Recent => SortMode::Name,
+            SortMode::Name => SortMode::Status,
+            SortMode::Status => SortMode::Config,
+        }
+    }
+}
+
+/// Sort key for [`SortMode::Status`] — lower sorts first.
+fn liveness_rank(l: Liveness) -> u8 {
+    match l {
+        Liveness::Up => 0,
+        Liveness::Checking => 1,
+        Liveness::Unknown => 2,
+        Liveness::Skipped => 3,
+        Liveness::Down => 4,
+    }
+}
+
+/// Precomputed per-host sort key, one per entry in `App::hosts` (same index).
+struct SortKey {
+    /// Last-connected unix seconds, or `None` if never connected.
+    recency: Option<u64>,
+    /// Alias, lowercased once (so the comparator doesn't re-allocate per compare).
+    alias_lc: String,
+    /// Reachability rank (see [`liveness_rank`]).
+    rank: u8,
+}
+
+/// Order `0..keys.len()` by `sort`, tie-breaking on the original index so the
+/// result is stable and deterministic. Pure (no `App`) — directly unit-tested.
+fn order_by(sort: SortMode, keys: &[SortKey]) -> Vec<usize> {
+    use std::cmp::Ordering;
+    let mut idx: Vec<usize> = (0..keys.len()).collect();
+    match sort {
+        SortMode::Config => {}
+        SortMode::Recent => idx.sort_by(|&a, &b| match (keys[a].recency, keys[b].recency) {
+            // Both seen: most-recent (larger timestamp) first.
+            (Some(x), Some(y)) => y.cmp(&x).then(a.cmp(&b)),
+            // A seen host sorts ahead of a never-connected one.
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => a.cmp(&b),
+        }),
+        SortMode::Name => {
+            idx.sort_by(|&a, &b| keys[a].alias_lc.cmp(&keys[b].alias_lc).then(a.cmp(&b)))
+        }
+        SortMode::Status => idx.sort_by(|&a, &b| {
+            keys[a]
+                .rank
+                .cmp(&keys[b].rank)
+                .then_with(|| keys[a].alias_lc.cmp(&keys[b].alias_lc))
+                .then(a.cmp(&b))
+        }),
+    }
+    idx
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -301,6 +391,11 @@ pub struct App {
     pub search: String,
     pub searching: bool,
     pub filtered: Vec<usize>,
+    /// Active sort for the unfiltered list (cycled with `s`).
+    pub sort: SortMode,
+
+    // --- connection history (non-secret: last-connected timestamps) ---
+    pub history: History,
 
     // --- liveness (keyed by host index in `hosts`) ---
     pub liveness: HashMap<usize, Liveness>,
@@ -390,6 +485,8 @@ impl App {
             search: String::new(),
             searching: false,
             filtered: Vec::new(),
+            sort: SortMode::default(),
+            history: History::load(),
             liveness: HashMap::new(),
             rtt: HashMap::new(),
             probes: Vec::new(),
@@ -494,10 +591,11 @@ impl App {
             .any(|e| e.marker.is_none() && known_host_spec_matches(&e.host, target))
     }
 
-    /// Recompute `filtered` from `search` (fuzzy ranked; identity when empty).
+    /// Recompute `filtered` from `search` (fuzzy ranked; sorted by [`App::sort`]
+    /// when the search is empty).
     pub fn refilter(&mut self) {
         if self.search.is_empty() {
-            self.filtered = (0..self.hosts.len()).collect();
+            self.filtered = self.sorted_indices();
             self.clamp_selection();
             return;
         }
@@ -521,6 +619,60 @@ impl App {
         scored.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         self.filtered = scored.into_iter().map(|(i, _)| i).collect();
         self.clamp_selection();
+    }
+
+    /// Host indices in [`App::sort`] order (the unfiltered list). The per-host
+    /// sort keys (last-connected timestamp, lowercased alias, liveness rank) are
+    /// computed once up front, then ordered by the pure [`order_by`] — so the
+    /// ordering logic is unit-testable without building an `App`.
+    fn sorted_indices(&self) -> Vec<usize> {
+        if self.sort == SortMode::Config {
+            return (0..self.hosts.len()).collect();
+        }
+        let keys: Vec<SortKey> = (0..self.hosts.len())
+            .map(|i| {
+                let alias = self.hosts[i].alias();
+                SortKey {
+                    recency: self.history.last(alias),
+                    alias_lc: alias.to_ascii_lowercase(),
+                    rank: liveness_rank(self.liveness_by_index(i)),
+                }
+            })
+            .collect();
+        order_by(self.sort, &keys)
+    }
+
+    /// Re-run the filter/sort while keeping the cursor on the same *host* (not the
+    /// same row), so a reorder never makes the selection jump to an unrelated
+    /// entry. Shared by the `s` cycle, a recorded connect, and the per-tick
+    /// status re-sort.
+    pub fn refilter_keeping_selection(&mut self) {
+        let cur = self.selected_host();
+        self.refilter();
+        if let Some(h) = cur
+            && let Some(pos) = self.filtered.iter().position(|&i| i == h)
+        {
+            self.list_state.select(Some(pos));
+        }
+    }
+
+    /// After liveness results land, the `Status` sort's order is stale (it ranks by
+    /// reachability, which just changed). Re-sort so the rows match the dots —
+    /// only for `Status`, and never while a fuzzy search supplies its own order.
+    pub fn resort_after_liveness(&mut self) {
+        if self.sort == SortMode::Status && self.search.is_empty() {
+            self.refilter_keeping_selection();
+        }
+    }
+
+    /// Stamp `alias` as connected-now in the history (persisted best-effort). When
+    /// the list is sorted by recency the just-connected host floats to the top, so
+    /// re-sort and keep the same host selected.
+    pub fn record_connect(&mut self, alias: &str) {
+        self.history.record(alias);
+        if self.sort == SortMode::Recent && self.search.is_empty() {
+            self.refilter_keeping_selection();
+        }
     }
 
     fn clamp_selection(&mut self) {
@@ -628,7 +780,11 @@ impl App {
     }
 
     /// Non-blocking drain of liveness results from all in-flight probes; drops
-    /// probes whose channel has closed. Returns true if any results landed.
+    /// probes whose channel has closed. Returns true if any host's reachability
+    /// **rank** changed — the signal the `Status` sort needs to re-order. An
+    /// RTT-only refresh or a result that re-confirms the same state returns false,
+    /// so an unchanged list is not needlessly re-sorted. (The loop redraws every
+    /// tick regardless, so this gates only the re-sort, not the repaint.)
     pub fn drain_liveness(&mut self) -> bool {
         let mut results = Vec::new();
         let mut keep = Vec::new();
@@ -641,14 +797,17 @@ impl App {
         }
         self.probes = keep;
 
-        let changed = !results.is_empty();
+        let mut rank_changed = false;
         for r in results {
-            self.liveness.insert(r.id, r.state);
+            let prev = self.liveness.insert(r.id, r.state);
+            if prev.map(liveness_rank) != Some(liveness_rank(r.state)) {
+                rank_changed = true;
+            }
             if let Some(d) = r.rtt {
                 self.rtt.insert(r.id, d);
             }
         }
-        changed
+        rank_changed
     }
 
     /// Per-tick housekeeping: expire transient toasts and auto-lock an idle vault.
@@ -912,6 +1071,83 @@ mod tests {
         // No candidacy match stays None regardless.
         assert_eq!(mask_password_kinds(None, true), None);
         assert_eq!(mask_password_kinds(None, false), None);
+    }
+
+    #[test]
+    fn sort_mode_cycles_through_all_and_wraps() {
+        let mut m = SortMode::default();
+        assert_eq!(m, SortMode::Config);
+        m = m.next();
+        assert_eq!(m, SortMode::Recent);
+        m = m.next();
+        assert_eq!(m, SortMode::Name);
+        m = m.next();
+        assert_eq!(m, SortMode::Status);
+        m = m.next();
+        assert_eq!(m, SortMode::Config); // wraps
+    }
+
+    fn key(recency: Option<u64>, alias_lc: &str, rank: u8) -> SortKey {
+        SortKey {
+            recency,
+            alias_lc: alias_lc.to_string(),
+            rank,
+        }
+    }
+
+    #[test]
+    fn order_by_recent_newest_first_never_connected_last() {
+        // idx0 never, idx1 @100, idx2 @300, idx3 never.
+        let keys = [
+            key(None, "a", 0),
+            key(Some(100), "b", 0),
+            key(Some(300), "c", 0),
+            key(None, "d", 0),
+        ];
+        // Most-recent first (2 then 1), then never-connected in config order (0, 3).
+        assert_eq!(order_by(SortMode::Recent, &keys), vec![2, 1, 0, 3]);
+    }
+
+    #[test]
+    fn order_by_recent_equal_timestamps_break_on_config_order() {
+        let keys = [key(Some(50), "z", 0), key(Some(50), "a", 0)];
+        assert_eq!(order_by(SortMode::Recent, &keys), vec![0, 1]);
+    }
+
+    #[test]
+    fn order_by_name_is_case_insensitive_and_stable() {
+        let keys = [
+            key(None, "banana", 0),
+            key(None, "apple", 0),
+            key(None, "apple", 0), // duplicate alias -> config-order tie-break
+        ];
+        assert_eq!(order_by(SortMode::Name, &keys), vec![1, 2, 0]);
+    }
+
+    #[test]
+    fn order_by_status_ranks_then_alias() {
+        // ranks: up(0), down(4), up(0); aliases chosen so the up pair sorts by name.
+        let keys = [
+            key(None, "web", liveness_rank(Liveness::Up)),
+            key(None, "db", liveness_rank(Liveness::Down)),
+            key(None, "api", liveness_rank(Liveness::Up)),
+        ];
+        // Both up first (api < web by alias), then the down host.
+        assert_eq!(order_by(SortMode::Status, &keys), vec![2, 0, 1]);
+    }
+
+    #[test]
+    fn order_by_config_is_identity() {
+        let keys = [key(Some(9), "z", 4), key(None, "a", 0)];
+        assert_eq!(order_by(SortMode::Config, &keys), vec![0, 1]);
+    }
+
+    #[test]
+    fn liveness_rank_orders_up_before_down() {
+        assert!(liveness_rank(Liveness::Up) < liveness_rank(Liveness::Checking));
+        assert!(liveness_rank(Liveness::Checking) < liveness_rank(Liveness::Unknown));
+        assert!(liveness_rank(Liveness::Unknown) < liveness_rank(Liveness::Skipped));
+        assert!(liveness_rank(Liveness::Skipped) < liveness_rank(Liveness::Down));
     }
 
     #[test]
