@@ -95,10 +95,13 @@ impl History {
     }
 }
 
-/// Write `bytes` to `path` via a private temp + rename. Mirrors the config
-/// writer's atomic swap, including the Windows quirk that `rename` fails when the
-/// destination exists (so the old file is removed first). No `.bak` dance: a torn
-/// history file is acceptable to lose, unlike the config or the vault.
+/// Write `bytes` to `path` via a private temp file, then swap it in by
+/// **delete-then-rename** (`rename` fails on Windows if the destination exists, so
+/// the old file is removed first). This deliberately differs from the config and
+/// vault writers, which use `ReplaceFileW` / a `.bak` dance to avoid any window
+/// where the file is missing: here that window is acceptable, because a torn or
+/// lost history file is harmless (it reloads as empty) — unlike the config or the
+/// secrets, it is never worth extra machinery to protect.
 fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     use std::io::Write;
 
@@ -186,6 +189,19 @@ mod tests {
     }
 
     #[test]
+    fn relative_label_exact_boundaries() {
+        // Guards against a flipped `<`/`<=` at each bucket edge.
+        let now = 1_000_000_000;
+        assert_eq!(relative_label(now - MIN, now), "1m ago"); // 60s -> minutes
+        assert_eq!(relative_label(now - HOUR, now), "1h ago"); // exactly 1h
+        assert_eq!(relative_label(now - DAY, now), "yesterday"); // exactly 24h
+        assert_eq!(relative_label(now - 2 * DAY, now), "2d ago"); // exactly 48h -> days
+        assert_eq!(relative_label(now - 7 * DAY, now), "1w ago"); // exactly 1 week
+        assert_eq!(relative_label(now - 30 * DAY, now), "1mo ago"); // exactly 30d
+        assert_eq!(relative_label(now - 365 * DAY, now), "1y ago"); // exactly 1 year
+    }
+
+    #[test]
     fn relative_label_future_is_just_now() {
         // Clock skew: a timestamp ahead of `now` must not underflow.
         assert_eq!(relative_label(2_000, 1_000), "just now");
@@ -196,9 +212,45 @@ mod tests {
         let mut h = History::default();
         assert_eq!(h.last("web"), None);
         // Insert directly to avoid touching the real ~/.ssh during the test;
-        // `record` additionally persists (covered by manual testing).
+        // `record` additionally persists (exercised via `atomic_write` below).
         h.entries.insert("web".into(), 42);
         assert_eq!(h.last("web"), Some(42));
         assert_eq!(h.last("db"), None);
+    }
+
+    #[test]
+    fn record_ignores_empty_alias() {
+        // A pattern-less/empty Host block yields alias() == "" — it must not be
+        // recorded (and must not trigger a write to the real ~/.ssh).
+        let mut h = History::default();
+        h.record("");
+        assert_eq!(h.last(""), None);
+        assert!(h.entries.is_empty());
+    }
+
+    #[test]
+    fn atomic_write_then_parse_roundtrips() {
+        let dir = std::env::temp_dir().join(crate::secure_fs::temp_name(".sshmhist").unwrap());
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sshm-history.json");
+
+        let mut map = BTreeMap::new();
+        map.insert("web".to_string(), 123u64);
+        map.insert("db".to_string(), 456u64);
+        let json = serde_json::to_string_pretty(&HistoryFileRef {
+            last_connected: &map,
+        })
+        .unwrap();
+
+        atomic_write(&path, json.as_bytes()).unwrap();
+        // Write again so the delete-then-rename (destination exists) branch runs.
+        atomic_write(&path, json.as_bytes()).unwrap();
+
+        let data = std::fs::read_to_string(&path).unwrap();
+        let parsed: HistoryFile = serde_json::from_str(&data).unwrap();
+        assert_eq!(parsed.last_connected.get("web"), Some(&123));
+        assert_eq!(parsed.last_connected.get("db"), Some(&456));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

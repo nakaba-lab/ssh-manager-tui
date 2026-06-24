@@ -41,7 +41,10 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
 
         if last_tick.elapsed() >= TICK {
             app.on_tick();
-            app.drain_liveness();
+            if app.drain_liveness() {
+                // The Status sort ranks by reachability, so re-order when it changes.
+                app.resort_after_liveness();
+            }
             update::tick_clipboard(app);
             last_tick = Instant::now();
         }

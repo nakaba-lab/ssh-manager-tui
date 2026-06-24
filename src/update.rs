@@ -343,14 +343,8 @@ fn select_index(app: &mut App, idx: usize) {
 /// Advance the list sort one step and re-order, keeping the same host selected so
 /// the cursor doesn't jump to an unrelated row.
 fn cycle_sort(app: &mut App) {
-    let cur = app.selected_host();
     app.sort = app.sort.next();
-    app.refilter();
-    if let Some(h) = cur
-        && let Some(pos) = app.filtered.iter().position(|&i| i == h)
-    {
-        app.list_state.select(Some(pos));
-    }
+    app.refilter_keeping_selection();
     app.detail_scroll = 0;
     app.toast(format!("sort: {}", app.sort.label()), false);
 }
@@ -634,9 +628,11 @@ fn connect_plain(
     args: &[String],
     mode: ConnectMode,
 ) -> Result<()> {
-    app.record_connect(host.alias());
     match mode {
         ConnectMode::Inline => {
+            // The inline path commits to launching ssh (it suspends the TUI and
+            // execs), so record before suspending.
+            app.record_connect(host.alias());
             suspend_tui(terminal)?;
             let status = run_ssh_inline(args, &[]);
             restore_tui(terminal)?;
@@ -646,7 +642,13 @@ fn connect_plain(
             report_plain_exit(app, status);
         }
         ConnectMode::NewWtTab => match connect_new_tab(host.alias(), args, &[]) {
-            Ok(()) => app.toast(format!("opened new tab: ssh {}", host.alias()), false),
+            // Only stamp history once the tab actually spawned — a spawn failure
+            // (e.g. wt.exe missing) launched nothing, so it must not count as a
+            // connect (it would wrongly float the host up under the Recent sort).
+            Ok(()) => {
+                app.record_connect(host.alias());
+                app.toast(format!("opened new tab: ssh {}", host.alias()), false);
+            }
             Err(e) => app.toast(format!("{e}"), true),
         },
     }
