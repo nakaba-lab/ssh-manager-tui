@@ -85,6 +85,7 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
             lines.push(key("g / G", "top / bottom"));
             lines.push(key("Tab", "toggle list / detail focus"));
             lines.push(key("/", "search (alias / hostname / user)"));
+            lines.push(key("s", "cycle sort (file/recent/name/status)"));
             lines.push(key("Enter", "connect inline (same console)"));
             lines.push(key("t", "connect in new Windows Terminal tab"));
             lines.push(key("o", "action menu"));

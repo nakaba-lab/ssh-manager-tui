@@ -274,6 +274,7 @@ fn handle_list(app: &mut App, key: KeyEvent, terminal: &mut DefaultTerminal) -> 
                 app.refresh_one_liveness(h);
             }
         }
+        KeyCode::Char('s') => cycle_sort(app),
         KeyCode::Char('K') => {
             app.key_host_ctx = app.selected_host();
             app.screen = Screen::KeyManager;
@@ -337,6 +338,21 @@ fn select_index(app: &mut App, idx: usize) {
     }
     app.list_state.select(Some(idx.min(app.filtered.len() - 1)));
     app.detail_scroll = 0;
+}
+
+/// Advance the list sort one step and re-order, keeping the same host selected so
+/// the cursor doesn't jump to an unrelated row.
+fn cycle_sort(app: &mut App) {
+    let cur = app.selected_host();
+    app.sort = app.sort.next();
+    app.refilter();
+    if let Some(h) = cur
+        && let Some(pos) = app.filtered.iter().position(|&i| i == h)
+    {
+        app.list_state.select(Some(pos));
+    }
+    app.detail_scroll = 0;
+    app.toast(format!("sort: {}", app.sort.label()), false);
 }
 
 // ---------------------------------------------------------------------------
@@ -618,6 +634,7 @@ fn connect_plain(
     args: &[String],
     mode: ConnectMode,
 ) -> Result<()> {
+    app.record_connect(host.alias());
     match mode {
         ConnectMode::Inline => {
             suspend_tui(terminal)?;
@@ -658,6 +675,7 @@ fn arm_and_connect_inline(
 
     match arm_connect(identity, password, passphrase) {
         Ok((listener, env)) => {
+            app.record_connect(host.alias());
             suspend_tui(terminal)?;
             let status = run_ssh_inline(args, &env);
             restore_tui(terminal)?;

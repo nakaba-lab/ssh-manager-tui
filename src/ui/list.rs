@@ -8,6 +8,7 @@ use ratatui::widgets::{Clear, List, ListItem, Paragraph, Row, Table, Wrap};
 
 use crate::app::{App, ListFocus};
 use crate::config::model::HostView;
+use crate::os::history;
 use crate::os::liveness::Liveness;
 
 use super::theme;
@@ -280,6 +281,11 @@ fn draw_detail_pane(f: &mut Frame, app: &App, area: Rect) {
         "Port",
         h.port.clone().unwrap_or_else(|| "—".into()),
     ));
+    let last_conn = match app.history.last(h.alias()) {
+        Some(t) => history::relative_label(t, history::now_unix()),
+        None => "never".into(),
+    };
+    lines.push(kv_line("Last connected", last_conn));
     if let Some(j) = &h.proxy_jump {
         lines.push(kv_line("ProxyJump", j.clone()));
     }

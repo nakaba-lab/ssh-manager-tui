@@ -15,6 +15,7 @@ pub const VAULT_IDLE_LOCK: Duration = Duration::from_secs(15 * 60);
 
 use crate::config::SshConfig;
 use crate::config::model::HostView;
+use crate::os::history::History;
 use crate::os::keys::KeyInfo;
 use crate::os::known_hosts::{HostSpec, KnownHostEntry};
 use crate::os::liveness::{Liveness, LivenessProbe, ProbeTarget};
@@ -152,6 +153,56 @@ pub enum ConnectMode {
 pub enum ListFocus {
     Hosts,
     Detail,
+}
+
+/// Order the host list is sorted by while not searching (a fuzzy search supplies
+/// its own ranking, so the sort only applies to the unfiltered view). Cycled with
+/// `s` on the list screen. `Config` is the default — it preserves the verbatim
+/// order of `Host` blocks in `~/.ssh/config`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SortMode {
+    /// Verbatim `~/.ssh/config` order (no reordering).
+    #[default]
+    Config,
+    /// Most-recently connected first; never-connected hosts last.
+    Recent,
+    /// Alias, case-insensitive A→Z.
+    Name,
+    /// Reachability: up → checking → unknown → skipped → down.
+    Status,
+}
+
+impl SortMode {
+    /// Short label for the title bar / toast.
+    pub fn label(self) -> &'static str {
+        match self {
+            SortMode::Config => "file",
+            SortMode::Recent => "recent",
+            SortMode::Name => "name",
+            SortMode::Status => "status",
+        }
+    }
+
+    /// The next mode in the cycle (wraps back to `Config`).
+    pub fn next(self) -> SortMode {
+        match self {
+            SortMode::Config => SortMode::Recent,
+            SortMode::Recent => SortMode::Name,
+            SortMode::Name => SortMode::Status,
+            SortMode::Status => SortMode::Config,
+        }
+    }
+}
+
+/// Sort key for [`SortMode::Status`] — lower sorts first.
+fn liveness_rank(l: Liveness) -> u8 {
+    match l {
+        Liveness::Up => 0,
+        Liveness::Checking => 1,
+        Liveness::Unknown => 2,
+        Liveness::Skipped => 3,
+        Liveness::Down => 4,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -301,6 +352,11 @@ pub struct App {
     pub search: String,
     pub searching: bool,
     pub filtered: Vec<usize>,
+    /// Active sort for the unfiltered list (cycled with `s`).
+    pub sort: SortMode,
+
+    // --- connection history (non-secret: last-connected timestamps) ---
+    pub history: History,
 
     // --- liveness (keyed by host index in `hosts`) ---
     pub liveness: HashMap<usize, Liveness>,
@@ -390,6 +446,8 @@ impl App {
             search: String::new(),
             searching: false,
             filtered: Vec::new(),
+            sort: SortMode::default(),
+            history: History::load(),
             liveness: HashMap::new(),
             rtt: HashMap::new(),
             probes: Vec::new(),
@@ -494,10 +552,11 @@ impl App {
             .any(|e| e.marker.is_none() && known_host_spec_matches(&e.host, target))
     }
 
-    /// Recompute `filtered` from `search` (fuzzy ranked; identity when empty).
+    /// Recompute `filtered` from `search` (fuzzy ranked; sorted by [`App::sort`]
+    /// when the search is empty).
     pub fn refilter(&mut self) {
         if self.search.is_empty() {
-            self.filtered = (0..self.hosts.len()).collect();
+            self.filtered = self.sorted_indices();
             self.clamp_selection();
             return;
         }
@@ -521,6 +580,62 @@ impl App {
         scored.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         self.filtered = scored.into_iter().map(|(i, _)| i).collect();
         self.clamp_selection();
+    }
+
+    /// Host indices in [`App::sort`] order (the unfiltered list). Every mode
+    /// tie-breaks on the original config order so the result is deterministic.
+    fn sorted_indices(&self) -> Vec<usize> {
+        let mut idx: Vec<usize> = (0..self.hosts.len()).collect();
+        match self.sort {
+            SortMode::Config => {}
+            SortMode::Recent => idx.sort_by(|&a, &b| {
+                let ka = self.history.last(self.hosts[a].alias());
+                let kb = self.history.last(self.hosts[b].alias());
+                match (ka, kb) {
+                    // Both seen: most-recent (larger timestamp) first.
+                    (Some(x), Some(y)) => y.cmp(&x).then(a.cmp(&b)),
+                    // A seen host sorts ahead of a never-connected one.
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => a.cmp(&b),
+                }
+            }),
+            SortMode::Name => idx.sort_by(|&a, &b| {
+                self.hosts[a]
+                    .alias()
+                    .to_ascii_lowercase()
+                    .cmp(&self.hosts[b].alias().to_ascii_lowercase())
+                    .then(a.cmp(&b))
+            }),
+            SortMode::Status => idx.sort_by(|&a, &b| {
+                liveness_rank(self.liveness_by_index(a))
+                    .cmp(&liveness_rank(self.liveness_by_index(b)))
+                    .then_with(|| {
+                        self.hosts[a]
+                            .alias()
+                            .to_ascii_lowercase()
+                            .cmp(&self.hosts[b].alias().to_ascii_lowercase())
+                    })
+                    .then(a.cmp(&b))
+            }),
+        }
+        idx
+    }
+
+    /// Stamp `alias` as connected-now in the history (persisted best-effort). When
+    /// the list is sorted by recency the just-connected host floats to the top, so
+    /// re-sort and keep the same host selected.
+    pub fn record_connect(&mut self, alias: &str) {
+        self.history.record(alias);
+        if self.sort == SortMode::Recent && self.search.is_empty() {
+            let cur = self.selected_host();
+            self.refilter();
+            if let Some(h) = cur
+                && let Some(pos) = self.filtered.iter().position(|&i| i == h)
+            {
+                self.list_state.select(Some(pos));
+            }
+        }
     }
 
     fn clamp_selection(&mut self) {
@@ -912,6 +1027,28 @@ mod tests {
         // No candidacy match stays None regardless.
         assert_eq!(mask_password_kinds(None, true), None);
         assert_eq!(mask_password_kinds(None, false), None);
+    }
+
+    #[test]
+    fn sort_mode_cycles_through_all_and_wraps() {
+        let mut m = SortMode::default();
+        assert_eq!(m, SortMode::Config);
+        m = m.next();
+        assert_eq!(m, SortMode::Recent);
+        m = m.next();
+        assert_eq!(m, SortMode::Name);
+        m = m.next();
+        assert_eq!(m, SortMode::Status);
+        m = m.next();
+        assert_eq!(m, SortMode::Config); // wraps
+    }
+
+    #[test]
+    fn liveness_rank_orders_up_before_down() {
+        assert!(liveness_rank(Liveness::Up) < liveness_rank(Liveness::Checking));
+        assert!(liveness_rank(Liveness::Checking) < liveness_rank(Liveness::Unknown));
+        assert!(liveness_rank(Liveness::Unknown) < liveness_rank(Liveness::Skipped));
+        assert!(liveness_rank(Liveness::Skipped) < liveness_rank(Liveness::Down));
     }
 
     #[test]
