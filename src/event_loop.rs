@@ -42,7 +42,8 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
         if last_tick.elapsed() >= TICK {
             app.on_tick();
             if app.drain_liveness() {
-                // The Status sort ranks by reachability, so re-order when it changes.
+                // drain_liveness returns true only when a reachability rank changed,
+                // so the Status sort re-orders just when its key actually moved.
                 app.resort_after_liveness();
             }
             update::tick_clipboard(app);

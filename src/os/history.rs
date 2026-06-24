@@ -60,7 +60,14 @@ impl History {
         let Ok(data) = std::fs::read_to_string(&path) else {
             return History::default();
         };
-        match serde_json::from_str::<HistoryFile>(&data) {
+        History::from_json(&data)
+    }
+
+    /// Parse history JSON, failing soft to an empty history on any corruption.
+    /// Split out from [`History::load`] (which hardcodes the real path) so the
+    /// fail-soft contract is unit-testable against fixture strings.
+    fn from_json(data: &str) -> History {
+        match serde_json::from_str::<HistoryFile>(data) {
             Ok(file) => History {
                 entries: file.last_connected,
             },
@@ -226,6 +233,18 @@ mod tests {
         h.record("");
         assert_eq!(h.last(""), None);
         assert!(h.entries.is_empty());
+    }
+
+    #[test]
+    fn from_json_fails_soft_and_parses() {
+        // Corrupt / empty input -> empty history, never an error.
+        assert!(History::from_json("not json at all").entries.is_empty());
+        assert!(History::from_json("").entries.is_empty());
+        // Well-formed JSON missing the field -> empty (serde default).
+        assert!(History::from_json("{}").entries.is_empty());
+        // Valid payload round-trips.
+        let h = History::from_json(r#"{"last_connected":{"web":7}}"#);
+        assert_eq!(h.last("web"), Some(7));
     }
 
     #[test]

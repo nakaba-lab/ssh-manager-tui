@@ -780,7 +780,11 @@ impl App {
     }
 
     /// Non-blocking drain of liveness results from all in-flight probes; drops
-    /// probes whose channel has closed. Returns true if any results landed.
+    /// probes whose channel has closed. Returns true if any host's reachability
+    /// **rank** changed — the signal the `Status` sort needs to re-order. An
+    /// RTT-only refresh or a result that re-confirms the same state returns false,
+    /// so an unchanged list is not needlessly re-sorted. (The loop redraws every
+    /// tick regardless, so this gates only the re-sort, not the repaint.)
     pub fn drain_liveness(&mut self) -> bool {
         let mut results = Vec::new();
         let mut keep = Vec::new();
@@ -793,14 +797,17 @@ impl App {
         }
         self.probes = keep;
 
-        let changed = !results.is_empty();
+        let mut rank_changed = false;
         for r in results {
-            self.liveness.insert(r.id, r.state);
+            let prev = self.liveness.insert(r.id, r.state);
+            if prev.map(liveness_rank) != Some(liveness_rank(r.state)) {
+                rank_changed = true;
+            }
             if let Some(d) = r.rtt {
                 self.rtt.insert(r.id, d);
             }
         }
-        changed
+        rank_changed
     }
 
     /// Per-tick housekeeping: expire transient toasts and auto-lock an idle vault.
