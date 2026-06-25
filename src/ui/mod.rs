@@ -75,7 +75,13 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Screen::ActionMenu(idx) => confirm::draw_action_menu(f, app, *idx, body_a),
         Screen::GenerateKey { .. } => keys::draw_wizard(f, app, body_a),
         Screen::PickKey { .. } => keys::draw_picker(f, app, body_a),
-        Screen::PickJump { .. } => list::draw_jump_picker(f, app, body_a),
+        Screen::PickJump { origin } => {
+            // Clone so the immutable borrow of `app.screen` ends before the
+            // `&mut app` render call (the picker needs the origin to exclude the
+            // right "self" host from the candidate list).
+            let origin = origin.clone();
+            list::draw_jump_picker(f, app, &origin, body_a)
+        }
         Screen::ConnectOverride { host } => connect_override::draw(f, app, *host, body_a),
         Screen::VaultUnlock => vault::draw_unlock(f, app, body_a),
         Screen::VaultEntry { .. } => vault::draw_entry(f, app, body_a),
@@ -113,6 +119,13 @@ fn draw_title(f: &mut Frame, app: &App, base: &Screen, area: Rect) {
         ),
         _ => String::new(),
     };
+    // The override modal resolves its base to List (so the list renders behind
+    // it), but the breadcrumb should name the modal, not show stale host counts.
+    let (name, count) = if matches!(app.screen, Screen::ConnectOverride { .. }) {
+        ("Connect override", String::new())
+    } else {
+        (name, count)
+    };
     let mut spans = vec![
         Span::styled(
             " sshm",
@@ -139,6 +152,22 @@ fn draw_title(f: &mut Frame, app: &App, base: &Screen, area: Rect) {
 }
 
 fn draw_footer(f: &mut Frame, app: &App, base: &Screen, area: Rect) {
+    // The override modal resolves its base to List, so without this its chrome
+    // footer would show stale list hints; surface the modal's real chords instead.
+    if matches!(app.screen, Screen::ConnectOverride { .. }) {
+        let hints = widgets::footer_hints(&[
+            ("Tab", "field"),
+            ("Enter", "edit/pick"),
+            ("Space", "verbose"),
+            ("^O", "connect"),
+            ("^T", "new-tab"),
+            ("^Y", "copy"),
+            ("?", "help"),
+            ("Esc", "cancel"),
+        ]);
+        f.render_widget(Paragraph::new(hints), area);
+        return;
+    }
     let hints = match (base, app) {
         (Screen::List, a) if a.searching => {
             widgets::footer_hints(&[("type", "filter"), ("Enter", "keep"), ("Esc", "clear")])
@@ -155,6 +184,7 @@ fn draw_footer(f: &mut Frame, app: &App, base: &Screen, area: Rect) {
             ("/", "search"),
             ("Enter", "connect"),
             ("t", "new-tab"),
+            ("O", "overrides"),
             ("e", "edit"),
             ("a", "add"),
             ("d", "del"),
