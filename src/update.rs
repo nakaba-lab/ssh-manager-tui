@@ -35,7 +35,7 @@ use crate::os::ssh_dir;
 use crate::os::vault::{
     self, MatchedKinds, Secret, SecretKind, Vault, VaultEntry, match_vault_kinds,
 };
-use crate::ui::confirm::ACTION_LABELS;
+use crate::ui::confirm::{ACTION_LABELS, action_idx};
 
 pub fn handle_key(app: &mut App, key: KeyEvent, terminal: &mut DefaultTerminal) -> Result<()> {
     // Refresh the idle clock so an active session never auto-locks the vault (#14).
@@ -2231,18 +2231,22 @@ fn handle_action_menu(
             match sel {
                 // Delete opens its confirm WHILE the action menu is still the
                 // current screen, so cancelling the confirm returns to the menu.
-                5 => {
+                action_idx::DELETE => {
                     let item = app.host_items[host_idx];
                     open_confirm(app, ConfirmAction::DeleteHost(item));
                 }
                 _ => {
                     close_overlay(app);
                     match sel {
-                        0 => connect_selected(app, terminal, ConnectMode::Inline)?,
-                        1 => connect_selected(app, terminal, ConnectMode::NewWtTab)?,
-                        2 => open_connect_override(app, host_idx),
-                        3 => copy_command(app),
-                        4 => open_edit(app),
+                        action_idx::CONNECT_INLINE => {
+                            connect_selected(app, terminal, ConnectMode::Inline)?
+                        }
+                        action_idx::CONNECT_NEW_TAB => {
+                            connect_selected(app, terminal, ConnectMode::NewWtTab)?
+                        }
+                        action_idx::CONNECT_OVERRIDES => open_connect_override(app, host_idx),
+                        action_idx::COPY_COMMAND => copy_command(app),
+                        action_idx::EDIT => open_edit(app),
                         _ => {}
                     }
                 }
