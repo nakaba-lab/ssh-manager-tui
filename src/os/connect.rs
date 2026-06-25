@@ -16,7 +16,7 @@ use super::binaries::find_wt;
 use super::binaries::tools;
 
 /// Ad-hoc overrides applied to a single connection without touching the file.
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
 pub struct ConnectOverrides {
     pub port: Option<u16>,
     pub user: Option<String>,
@@ -98,6 +98,40 @@ pub fn command_line(host: &HostView, ov: &ConnectOverrides) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// The subset of override flags that change how `ssh -G` *resolves* an alias —
+/// user, port, identity, ProxyJump and explicit `-o` options. Forwarding (`-L`/
+/// `-R`/`-D`) and `-v` don't affect resolution and are omitted. Passing these to
+/// `ssh -G` makes the connect-time vault gates (target identity, TOFU key) key
+/// off the *effective* `user@host` of an override connect, not the saved config.
+pub fn resolve_options(ov: &ConnectOverrides) -> Vec<String> {
+    let mut a: Vec<String> = Vec::new();
+    if let Some(u) = &ov.user {
+        a.push("-l".into());
+        a.push(u.clone());
+    }
+    if let Some(p) = ov.port {
+        a.push("-p".into());
+        a.push(p.to_string());
+    }
+    if let Some(id) = &ov.identity_file {
+        a.push("-i".into());
+        a.push(id.display().to_string());
+        a.push("-o".into());
+        a.push("IdentitiesOnly=yes".into());
+    }
+    if let Some(j) = &ov.proxy_jump
+        && !j.is_empty()
+    {
+        a.push("-J".into());
+        a.push(j.clone());
+    }
+    for (k, v) in &ov.extra_options {
+        a.push("-o".into());
+        a.push(format!("{k}={v}"));
+    }
+    a
 }
 
 /// Run `ssh` with inherited stdio in the current console and wait for it. The
@@ -289,6 +323,40 @@ mod tests {
                 "deploy@web1",
             ]
         );
+    }
+
+    #[test]
+    fn resolve_options_emits_resolution_flags_only() {
+        // Forwards and verbose are irrelevant to `ssh -G` and must be omitted.
+        let ov = ConnectOverrides {
+            port: Some(2222),
+            user: Some("deploy".into()),
+            identity_file: Some(PathBuf::from("/k/id")),
+            proxy_jump: Some("bastion".into()),
+            local_forwards: vec!["8080 localhost:80".into()],
+            remote_forwards: vec!["9090 localhost:90".into()],
+            dynamic_forwards: vec!["1080".into()],
+            extra_options: vec![("ForwardAgent".into(), "yes".into())],
+            verbose: true,
+        };
+        assert_eq!(
+            resolve_options(&ov),
+            [
+                "-l",
+                "deploy",
+                "-p",
+                "2222",
+                "-i",
+                "/k/id",
+                "-o",
+                "IdentitiesOnly=yes",
+                "-J",
+                "bastion",
+                "-o",
+                "ForwardAgent=yes",
+            ]
+        );
+        assert!(resolve_options(&ConnectOverrides::default()).is_empty());
     }
 
     #[test]
