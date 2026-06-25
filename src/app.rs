@@ -15,6 +15,7 @@ pub const VAULT_IDLE_LOCK: Duration = Duration::from_secs(15 * 60);
 
 use crate::config::SshConfig;
 use crate::config::model::HostView;
+use crate::os::connect::ConnectOverrides;
 use crate::os::history::History;
 use crate::os::keys::KeyInfo;
 use crate::os::known_hosts::{HostSpec, KnownHostEntry};
@@ -65,6 +66,46 @@ pub fn is_multi(field: usize) -> bool {
     MULTI_FIELDS.contains(&field)
 }
 
+/// Ordered labels of the connect-time override form. A leaner, session-only
+/// cousin of the edit form: it never persists, so it omits Host/HostName and
+/// adds a Verbose toggle. Indices are named in [`override_idx`].
+pub const OVERRIDE_LABELS: [&str; 9] = [
+    "User",
+    "Port",
+    "IdentityFile",
+    "ProxyJump",
+    "LocalForward",
+    "RemoteForward",
+    "DynamicForward",
+    "Extra options (Key Value)",
+    "Verbose (-v)",
+];
+
+/// Symbolic indices into the override form's `fields` vector.
+pub mod override_idx {
+    pub const USER: usize = 0;
+    pub const PORT: usize = 1;
+    pub const IDENTITY: usize = 2;
+    pub const PROXYJUMP: usize = 3;
+    pub const LOCAL_FWD: usize = 4;
+    pub const REMOTE_FWD: usize = 5;
+    pub const DYNAMIC_FWD: usize = 6;
+    pub const EXTRAS: usize = 7;
+    /// A boolean toggle, not a text field — its `FormField` slot is a placeholder
+    /// and the real state lives in [`OverrideForm::verbose`].
+    pub const VERBOSE: usize = 8;
+}
+
+/// Override-form field indices holding a list of rows (the forwards + extras).
+/// IdentityFile is single-valued here (one ad-hoc key per session), unlike the
+/// edit form where it is multi.
+pub const OVERRIDE_MULTI: [usize; 4] = [
+    override_idx::LOCAL_FWD,
+    override_idx::REMOTE_FWD,
+    override_idx::DYNAMIC_FWD,
+    override_idx::EXTRAS,
+];
+
 /// Top-level screen; drives both rendering and key dispatch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Screen {
@@ -81,15 +122,21 @@ pub enum Screen {
     GenerateKey {
         origin: GenOrigin,
     },
-    /// Key picker modal, opened from the edit form's IdentityFile field.
-    /// Carries the edited host so it can return to the right form.
+    /// Key picker modal, opened from either form's IdentityFile field. The
+    /// `origin` records which form to return to and write the choice back into.
     PickKey {
-        editing: Option<usize>,
+        origin: PickOrigin,
     },
-    /// Host picker modal, opened from the edit form's ProxyJump field, to choose
+    /// Host picker modal, opened from either form's ProxyJump field, to choose
     /// a registered host as the jump host.
     PickJump {
-        editing: Option<usize>,
+        origin: PickOrigin,
+    },
+    /// Connect-time override form: a session-only modal that edits a
+    /// [`ConnectOverrides`] for one connection without touching `~/.ssh/config`.
+    /// `host` is the index into [`App::hosts`] being connected to.
+    ConnectOverride {
+        host: usize,
     },
     /// Password vault: list of stored secrets (login passwords / passphrases).
     Vault,
@@ -115,7 +162,21 @@ pub enum Screen {
         /// execute any `Match exec` predicate a second time). Boxed to keep the
         /// `Screen` enum small.
         rc: Box<ResolvedConfig>,
+        /// Ad-hoc overrides to re-apply on the resumed connect (empty for a plain
+        /// saved-host connect). Carried so the consent re-entry rebuilds the same
+        /// `ssh` args it would have without the detour through the modal.
+        ov: Box<ConnectOverrides>,
     },
+}
+
+/// Which form a key/host picker was opened from — drives where it returns and
+/// where the picked value is written back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PickOrigin {
+    /// The edit form (`editing = Some(idx)` edits an existing host).
+    Edit { editing: Option<usize> },
+    /// The connect-time override form.
+    Override,
 }
 
 /// Where the generate-key wizard was opened from — drives where it returns and
@@ -273,6 +334,16 @@ pub struct EditForm {
     pub edit_backup: String,
 }
 
+/// In-progress connect-time override form. Wraps a reused [`EditForm`] (so it
+/// shares the field-editing machinery) plus the out-of-band `verbose` toggle and
+/// the index of the host being connected to. Never written to disk.
+#[derive(Debug, Default)]
+pub struct OverrideForm {
+    pub form: EditForm,
+    pub verbose: bool,
+    pub host: usize,
+}
+
 /// Transient one-line status / toast.
 #[derive(Debug, Default, Clone)]
 pub struct Toast {
@@ -406,6 +477,9 @@ pub struct App {
     // --- S2 form ---
     pub form: EditForm,
 
+    // --- connect-time override form ---
+    pub override_form: OverrideForm,
+
     // --- S3 keys ---
     pub keys: Vec<KeyInfo>,
     pub keys_state: ListState,
@@ -492,6 +566,7 @@ impl App {
             probes: Vec::new(),
             last_sweep: Instant::now(),
             form: EditForm::default(),
+            override_form: OverrideForm::default(),
             keys,
             keys_state: ListState::default(),
             key_host_ctx: None,
@@ -1010,6 +1085,95 @@ pub fn view_from_form(form: &EditForm) -> HostView {
     }
 }
 
+/// Build a blank override form for the host at index `host`. Every field starts
+/// empty: a blank field inherits the host's saved/effective value, and only a
+/// typed field becomes an override (the UI shows the inherited value as a hint).
+pub fn override_form_from_host(host: usize) -> OverrideForm {
+    let fields: Vec<FormField> = OVERRIDE_LABELS
+        .iter()
+        .enumerate()
+        .map(|(i, label)| FormField {
+            label: label.to_string(),
+            value: String::new(),
+            cursor: 0,
+            multi: OVERRIDE_MULTI.contains(&i),
+            rows: Vec::new(),
+            row_sel: 0,
+        })
+        .collect();
+    OverrideForm {
+        form: EditForm {
+            fields,
+            focused: 0,
+            mode: FormMode::Navigate,
+            errors: Vec::new(),
+            original: HostView::default(),
+            edit_backup: String::new(),
+        },
+        verbose: false,
+        host,
+    }
+}
+
+/// Build [`ConnectOverrides`] from the override form, validating exactly as the
+/// edit form does (Port parses as `u16`, no embedded `"`). On the first invalid
+/// field, returns its index + a message so the caller can highlight it. A blank
+/// field contributes nothing — it inherits the host's saved value.
+pub fn overrides_from_form(of: &OverrideForm) -> Result<ConnectOverrides, (usize, String)> {
+    let f = &of.form.fields;
+    let opt = |s: &str| {
+        let t = s.trim();
+        (!t.is_empty()).then(|| t.to_string())
+    };
+    let rows = |i: usize| -> Vec<String> {
+        f[i].rows
+            .iter()
+            .map(|r| r.trim().to_string())
+            .filter(|r| !r.is_empty())
+            .collect()
+    };
+
+    // ssh_config has no escape for a literal double-quote, and neither does an
+    // `-o key="val"` on the wire — reject rather than corrupt the connection.
+    for (i, field) in f.iter().enumerate() {
+        if field.value.contains('"') || field.rows.iter().any(|r| r.contains('"')) {
+            return Err((i, "value cannot contain a double-quote (\")".into()));
+        }
+    }
+
+    let port = match opt(&f[override_idx::PORT].value) {
+        Some(p) => Some(p.parse::<u16>().map_err(|_| {
+            (
+                override_idx::PORT,
+                "Port must be a number 1–65535".to_string(),
+            )
+        })?),
+        None => None,
+    };
+
+    let extra_options = rows(override_idx::EXTRAS)
+        .into_iter()
+        .filter_map(|row| {
+            let mut it = row.splitn(2, char::is_whitespace);
+            let k = it.next()?.to_string();
+            let v = it.next().unwrap_or("").trim().to_string();
+            (!k.is_empty()).then_some((k, v))
+        })
+        .collect();
+
+    Ok(ConnectOverrides {
+        port,
+        user: opt(&f[override_idx::USER].value),
+        identity_file: opt(&f[override_idx::IDENTITY].value).map(std::path::PathBuf::from),
+        proxy_jump: opt(&f[override_idx::PROXYJUMP].value),
+        local_forwards: rows(override_idx::LOCAL_FWD),
+        remote_forwards: rows(override_idx::REMOTE_FWD),
+        dynamic_forwards: rows(override_idx::DYNAMIC_FWD),
+        extra_options,
+        verbose: of.verbose,
+    })
+}
+
 /// Whether a `known_hosts` host field matches `target` by name (the cheap
 /// indicator probe — see [`App::host_known_hint`]). Only `Plain` specs match;
 /// each comma-separated token is compared case-insensitively after stripping a
@@ -1071,6 +1235,71 @@ mod tests {
         // No candidacy match stays None regardless.
         assert_eq!(mask_password_kinds(None, true), None);
         assert_eq!(mask_password_kinds(None, false), None);
+    }
+
+    #[test]
+    fn override_form_empty_inherits_everything() {
+        // A blank override form yields the default (all-inherit) overrides.
+        let of = override_form_from_host(0);
+        assert_eq!(overrides_from_form(&of), Ok(ConnectOverrides::default()));
+    }
+
+    #[test]
+    fn override_form_maps_typed_fields() {
+        let mut of = override_form_from_host(3);
+        of.form.fields[override_idx::USER].value = "deploy".into();
+        of.form.fields[override_idx::PORT].value = "2222".into();
+        of.form.fields[override_idx::IDENTITY].value = "/k/id".into();
+        of.form.fields[override_idx::PROXYJUMP].value = "bastion".into();
+        of.form.fields[override_idx::LOCAL_FWD].rows = vec!["8080 localhost:80".into()];
+        of.form.fields[override_idx::REMOTE_FWD].rows = vec!["9090 localhost:90".into()];
+        of.form.fields[override_idx::DYNAMIC_FWD].rows = vec!["1080".into()];
+        // A blank trailing row is dropped; a real one is split key/value.
+        of.form.fields[override_idx::EXTRAS].rows = vec!["ForwardAgent yes".into(), "   ".into()];
+        of.verbose = true;
+
+        assert_eq!(
+            overrides_from_form(&of),
+            Ok(ConnectOverrides {
+                port: Some(2222),
+                user: Some("deploy".into()),
+                identity_file: Some(std::path::PathBuf::from("/k/id")),
+                proxy_jump: Some("bastion".into()),
+                local_forwards: vec!["8080 localhost:80".into()],
+                remote_forwards: vec!["9090 localhost:90".into()],
+                dynamic_forwards: vec!["1080".into()],
+                extra_options: vec![("ForwardAgent".into(), "yes".into())],
+                verbose: true,
+            })
+        );
+    }
+
+    #[test]
+    fn override_form_blank_field_is_not_an_override() {
+        let mut of = override_form_from_host(0);
+        of.form.fields[override_idx::USER].value = "   ".into();
+        assert_eq!(
+            overrides_from_form(&of).unwrap().user,
+            None,
+            "a whitespace-only field must inherit, not override with empty"
+        );
+    }
+
+    #[test]
+    fn override_form_rejects_bad_port_and_quotes() {
+        let mut bad_port = override_form_from_host(0);
+        bad_port.form.fields[override_idx::PORT].value = "nope".into();
+        assert_eq!(
+            overrides_from_form(&bad_port).unwrap_err().0,
+            override_idx::PORT
+        );
+
+        let mut quoted = override_form_from_host(0);
+        quoted.form.fields[override_idx::USER].value = "a\"b".into();
+        assert_eq!(
+            overrides_from_form(&quoted).unwrap_err().0,
+            override_idx::USER
+        );
     }
 
     #[test]

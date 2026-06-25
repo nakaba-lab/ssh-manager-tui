@@ -12,9 +12,10 @@ use super::theme;
 use super::widgets::{centered, modal_block};
 
 /// The labels shown in the per-host action menu, in selection order.
-pub const ACTION_LABELS: [&str; 5] = [
+pub const ACTION_LABELS: [&str; 6] = [
     "Connect (inline)",
     "Connect (new tab)",
+    "Connect (overrides)…",
     "Copy ssh command",
     "Edit host",
     "Delete host",

@@ -114,7 +114,13 @@ pub const SSH_G_RESOLVE_TIMEOUT: Duration = Duration::from_millis(500);
 /// subprocess and parse the result. `stdin` is nulled so it can never block on a
 /// prompt; on timeout the child is killed and an error returned (caller degrades
 /// to manual entry / no auto-fill).
-pub fn resolve_config(alias: &str) -> io::Result<ResolvedConfig> {
+/// Resolve an alias to its effective config, optionally with ad-hoc override
+/// flags applied so the resolution reflects the *effective* target of an override
+/// connect (a changed user/port/identity/proxy shifts the `user@host` the vault
+/// gates key off). The `options` are trusted leading flags — production builds
+/// them from validated form input via `os::connect::resolve_options`; a plain
+/// saved-host connect passes `&[]`. The untrusted `alias` always follows `--`.
+pub fn resolve_config_with_options(options: &[String], alias: &str) -> io::Result<ResolvedConfig> {
     // Defense against argv flag-smuggling: an alias beginning with '-' would be
     // parsed by ssh as an option (e.g. `-oProxyCommand=...` → code execution).
     // No legitimate SSH host alias starts with '-' (plain `ssh <alias>` could
@@ -125,7 +131,7 @@ pub fn resolve_config(alias: &str) -> io::Result<ResolvedConfig> {
             "alias may not start with '-'",
         ));
     }
-    run_ssh_g(&[], alias)
+    run_ssh_g(options, alias)
 }
 
 /// Shared bounded runner: `ssh -G <options> -- <alias>`. `options` are trusted
@@ -400,7 +406,7 @@ identityfile ~/.ssh/id_rsa
     fn resolve_config_returns_a_hostname_for_any_alias() {
         // `ssh -G <alias>` always succeeds (an unknown alias resolves hostname to
         // itself). Requires ssh on PATH (CLAUDE.md guarantees it; CI has it).
-        let rc = resolve_config("sshm-test-nonexistent-alias")
+        let rc = resolve_config_with_options(&[], "sshm-test-nonexistent-alias")
             .expect("ssh -G should succeed for any alias");
         // hostname defaults to the alias when not in config.
         assert_eq!(rc.hostname.as_deref(), Some("sshm-test-nonexistent-alias"));
@@ -414,7 +420,7 @@ identityfile ~/.ssh/id_rsa
     fn resolve_config_rejects_leading_dash_alias() {
         // argv flag-smuggling guard: a `-`-prefixed alias must be refused, not
         // handed to `ssh`, where it would be parsed as an option.
-        let err = resolve_config("-oProxyCommand=evil").unwrap_err();
+        let err = resolve_config_with_options(&[], "-oProxyCommand=evil").unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 

@@ -3,6 +3,7 @@
 //! state (only widget scroll state).
 
 pub mod confirm;
+pub mod connect_override;
 pub mod edit;
 pub mod help;
 pub mod keys;
@@ -18,7 +19,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::app::{App, GenOrigin, Screen};
+use crate::app::{App, GenOrigin, PickOrigin, Screen};
 
 /// The non-modal screen rendered underneath the current screen (which may be a
 /// modal overlay).
@@ -28,10 +29,14 @@ fn base_screen(app: &App) -> Screen {
         | Screen::Confirm(_)
         | Screen::ActionMenu(_)
         | Screen::VaultUnlock
+        | Screen::ConnectOverride { .. }
         | Screen::PasswordConfirm { .. } => app.prev_screen.clone().unwrap_or(Screen::List),
-        Screen::PickKey { editing } | Screen::PickJump { editing } => {
-            Screen::Edit { editing: *editing }
-        }
+        Screen::PickKey { origin } | Screen::PickJump { origin } => match origin {
+            PickOrigin::Edit { editing } => Screen::Edit { editing: *editing },
+            // The override modal is itself an overlay over the list, so its
+            // pickers render over the list, not a base form screen.
+            PickOrigin::Override => Screen::List,
+        },
         Screen::GenerateKey { origin } => match origin {
             GenOrigin::KeyManager => Screen::KeyManager,
             GenOrigin::EditForm { editing } => Screen::Edit { editing: *editing },
@@ -71,6 +76,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Screen::GenerateKey { .. } => keys::draw_wizard(f, app, body_a),
         Screen::PickKey { .. } => keys::draw_picker(f, app, body_a),
         Screen::PickJump { .. } => list::draw_jump_picker(f, app, body_a),
+        Screen::ConnectOverride { host } => connect_override::draw(f, app, *host, body_a),
         Screen::VaultUnlock => vault::draw_unlock(f, app, body_a),
         Screen::VaultEntry { .. } => vault::draw_entry(f, app, body_a),
         Screen::PasswordConfirm { target, kinds, .. } => {
