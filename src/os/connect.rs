@@ -363,6 +363,37 @@ mod tests {
     }
 
     #[test]
+    fn command_line_quotes_on_any_whitespace() {
+        let h = host("web1");
+        // A space-bearing value (a forward) is quoted as one arg.
+        let ov = ConnectOverrides {
+            local_forwards: vec!["8080 localhost:80".into()],
+            ..Default::default()
+        };
+        let cmd = command_line(&h, &ov);
+        assert!(
+            cmd.contains("\"8080 localhost:80\""),
+            "space value must be quoted: {cmd}"
+        );
+        // A tab-bearing value is also quoted as a single arg (the change from
+        // `contains(' ')` to any-whitespace), so a copied command pastes intact.
+        let ov_tab = ConnectOverrides {
+            extra_options: vec![("RemoteCommand".into(), "echo\thi".into())],
+            ..Default::default()
+        };
+        let cmd_tab = command_line(&h, &ov_tab);
+        assert!(
+            cmd_tab.contains("\"RemoteCommand=echo\thi\""),
+            "tab value must be quoted as one arg: {cmd_tab}"
+        );
+        // The common no-override case stays unquoted: `ssh -- web1`.
+        assert_eq!(
+            command_line(&h, &ConnectOverrides::default()),
+            "ssh -- web1"
+        );
+    }
+
+    #[test]
     fn wt_escaping() {
         assert_eq!(escape_wt_arg("web1"), "web1");
         assert_eq!(escape_wt_arg("a b"), "\"a b\"");

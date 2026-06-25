@@ -1347,8 +1347,10 @@ mod tests {
 
     /// Build a real `App` over a throwaway config file so the few methods that
     /// need full state (host list, picker self-exclusion) can be table-tested.
-    /// `App::new` only reads (config/keys/known_hosts) and spawns non-blocking
-    /// liveness probes, so it is safe and ssh-free in tests.
+    /// `App::new` reads the real `~/.ssh` (read-only) and may spawn `ssh-keygen`
+    /// to fingerprint discovered keys, but the tests assert only on the scratch
+    /// config, so the host environment can't affect results. The scratch dir is
+    /// removed once `App` has loaded the config into memory (tests never re-read).
     fn app_fixture(config_body: &str) -> App {
         use std::io::Write;
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -1360,7 +1362,9 @@ mod tests {
         let mut f = std::fs::File::create(&path).unwrap();
         f.write_all(config_body.as_bytes()).unwrap();
         drop(f);
-        App::new(path).expect("App::new over scratch config")
+        let app = App::new(path).expect("App::new over scratch config");
+        let _ = std::fs::remove_dir_all(&dir);
+        app
     }
 
     #[test]

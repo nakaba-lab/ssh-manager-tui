@@ -119,6 +119,13 @@ fn draw_title(f: &mut Frame, app: &App, base: &Screen, area: Rect) {
         ),
         _ => String::new(),
     };
+    // The override modal resolves its base to List (so the list renders behind
+    // it), but the breadcrumb should name the modal, not show stale host counts.
+    let (name, count) = if matches!(app.screen, Screen::ConnectOverride { .. }) {
+        ("Connect override", String::new())
+    } else {
+        (name, count)
+    };
     let mut spans = vec![
         Span::styled(
             " sshm",
@@ -155,6 +162,7 @@ fn draw_footer(f: &mut Frame, app: &App, base: &Screen, area: Rect) {
             ("^O", "connect"),
             ("^T", "new-tab"),
             ("^Y", "copy"),
+            ("?", "help"),
             ("Esc", "cancel"),
         ]);
         f.render_widget(Paragraph::new(hints), area);
