@@ -786,20 +786,19 @@ impl App {
     /// edit form's Host field when editing, or the override modal's target host.
     /// Returns `""` (exclude nothing) when neither is resolvable (e.g. the add
     /// form before a Host is typed).
-    pub fn pick_jump_self_alias(&self, origin: &PickOrigin) -> String {
+    pub fn pick_jump_self_alias(&self, origin: &PickOrigin) -> &str {
         match origin {
             PickOrigin::Edit { .. } => self
                 .form
                 .fields
                 .get(form_idx::HOST)
                 .and_then(|f| f.value.split_whitespace().next())
-                .unwrap_or("")
-                .to_string(),
+                .unwrap_or(""),
             PickOrigin::Override => self
                 .hosts
                 .get(self.override_form.host)
-                .map(|h| h.alias().to_string())
-                .unwrap_or_default(),
+                .map(|h| h.alias())
+                .unwrap_or(""),
         }
     }
 
@@ -1382,7 +1381,7 @@ mod tests {
         let origin = PickOrigin::Override;
         assert_eq!(app.pick_jump_self_alias(&origin), "beta");
         let cands: Vec<&str> = app
-            .jump_candidates(&app.pick_jump_self_alias(&origin))
+            .jump_candidates(app.pick_jump_self_alias(&origin))
             .iter()
             .map(|&i| app.hosts[i].alias())
             .collect();

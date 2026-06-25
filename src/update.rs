@@ -1099,7 +1099,7 @@ fn handle_edit_navigate(app: &mut App, key: KeyEvent, editing: Option<usize>) {
         KeyCode::Enter if app.form.focused == form_idx::PROXYJUMP => {
             let origin = PickOrigin::Edit { editing };
             let has = !app
-                .jump_candidates(&app.pick_jump_self_alias(&origin))
+                .jump_candidates(app.pick_jump_self_alias(&origin))
                 .is_empty();
             app.pick_jump_state.select(has.then_some(0));
             app.screen = Screen::PickJump { origin };
@@ -1458,7 +1458,7 @@ fn handle_pick_key(app: &mut App, key: KeyEvent, origin: PickOrigin) {
 
 /// Host picker modal, opened from either form's ProxyJump field.
 fn handle_pick_jump(app: &mut App, key: KeyEvent, origin: PickOrigin) {
-    let candidates = app.jump_candidates(&app.pick_jump_self_alias(&origin));
+    let candidates = app.jump_candidates(app.pick_jump_self_alias(&origin));
     match key.code {
         KeyCode::Esc => app.screen = pick_return_screen(app, &origin),
         KeyCode::Char('j') | KeyCode::Down => {
@@ -1631,7 +1631,7 @@ fn handle_override_navigate(app: &mut App, key: KeyEvent) {
         KeyCode::Enter if focused == override_idx::PROXYJUMP => {
             let origin = PickOrigin::Override;
             let has = !app
-                .jump_candidates(&app.pick_jump_self_alias(&origin))
+                .jump_candidates(app.pick_jump_self_alias(&origin))
                 .is_empty();
             app.pick_jump_state.select(has.then_some(0));
             app.screen = Screen::PickJump { origin };

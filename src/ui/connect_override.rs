@@ -57,7 +57,9 @@ pub fn draw(f: &mut Frame, app: &App, host: usize, area: Rect) {
         }
 
         let is_focused = idx == form.focused;
-        if is_focused {
+        // For single fields (and the verbose toggle) the header line IS the focus
+        // target; multi fields set focus_line at the selected row below.
+        if is_focused && !field.multi {
             focus_line = lines.len();
         }
         let label_style = if is_focused {
@@ -108,6 +110,9 @@ pub fn draw(f: &mut Frame, app: &App, host: usize, area: Rect) {
                 Span::styled(format!("{}:", field.label), label_style),
             ]));
             if field.rows.is_empty() {
+                if is_focused {
+                    focus_line = lines.len();
+                }
                 lines.push(Line::from(Span::styled(
                     "      (none — press 'a' to add)",
                     Style::default().fg(theme::FAINT),
@@ -115,6 +120,9 @@ pub fn draw(f: &mut Frame, app: &App, host: usize, area: Rect) {
             }
             for (ri, row) in field.rows.iter().enumerate() {
                 let row_focused = is_focused && ri == field.row_sel;
+                if row_focused {
+                    focus_line = lines.len();
+                }
                 let active = row_focused && editing;
                 let bullet_style = if row_focused {
                     Style::default()
