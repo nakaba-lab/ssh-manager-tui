@@ -6,7 +6,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Clear, List, ListItem, Paragraph, Row, Table, Wrap};
 
-use crate::app::{App, ListFocus};
+use crate::app::{App, ListFocus, PickOrigin};
 use crate::config::model::HostView;
 use crate::os::history;
 use crate::os::liveness::Liveness;
@@ -156,8 +156,8 @@ fn draw_search(f: &mut Frame, app: &App, area: Rect) {
 }
 
 /// Host picker modal, opened from the edit form's ProxyJump field.
-pub fn draw_jump_picker(f: &mut Frame, app: &mut App, area: Rect) {
-    let candidates = app.jump_candidates();
+pub fn draw_jump_picker(f: &mut Frame, app: &mut App, origin: &PickOrigin, area: Rect) {
+    let candidates = app.jump_candidates(&app.pick_jump_self_alias(origin));
     let modal = centered(60, 14, area);
     f.render_widget(Clear, modal);
 

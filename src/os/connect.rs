@@ -90,7 +90,10 @@ pub fn command_line(host: &HostView, ov: &ConnectOverrides) -> String {
     parts
         .iter()
         .map(|p| {
-            if p.contains(' ') {
+            // Quote on any whitespace (not just U+0020) so a tab-bearing value
+            // pastes back as a single argument, matching how the forward/extras
+            // parsers split on any whitespace.
+            if p.chars().any(char::is_whitespace) {
                 format!("\"{p}\"")
             } else {
                 p.clone()

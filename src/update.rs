@@ -1097,11 +1097,12 @@ fn handle_edit_navigate(app: &mut App, key: KeyEvent, editing: Option<usize>) {
             };
         }
         KeyCode::Enter if app.form.focused == form_idx::PROXYJUMP => {
-            let has = !app.jump_candidates().is_empty();
+            let origin = PickOrigin::Edit { editing };
+            let has = !app
+                .jump_candidates(&app.pick_jump_self_alias(&origin))
+                .is_empty();
             app.pick_jump_state.select(has.then_some(0));
-            app.screen = Screen::PickJump {
-                origin: PickOrigin::Edit { editing },
-            };
+            app.screen = Screen::PickJump { origin };
         }
         KeyCode::Enter | KeyCode::Char('i') => begin_edit(&mut app.form),
         KeyCode::Char('a') => {
@@ -1457,7 +1458,7 @@ fn handle_pick_key(app: &mut App, key: KeyEvent, origin: PickOrigin) {
 
 /// Host picker modal, opened from either form's ProxyJump field.
 fn handle_pick_jump(app: &mut App, key: KeyEvent, origin: PickOrigin) {
-    let candidates = app.jump_candidates();
+    let candidates = app.jump_candidates(&app.pick_jump_self_alias(&origin));
     match key.code {
         KeyCode::Esc => app.screen = pick_return_screen(app, &origin),
         KeyCode::Char('j') | KeyCode::Down => {
@@ -1596,6 +1597,7 @@ fn handle_override_navigate(app: &mut App, key: KeyEvent) {
     let nfields = app.override_form.form.fields.len();
     match key.code {
         KeyCode::Esc => close_overlay(app),
+        KeyCode::Char('?') => open_overlay(app, Screen::Help),
         KeyCode::Tab | KeyCode::Down | KeyCode::Char('j') => {
             app.override_form.form.focused = (focused + 1) % nfields;
         }
@@ -1627,11 +1629,12 @@ fn handle_override_navigate(app: &mut App, key: KeyEvent) {
             };
         }
         KeyCode::Enter if focused == override_idx::PROXYJUMP => {
-            let has = !app.jump_candidates().is_empty();
+            let origin = PickOrigin::Override;
+            let has = !app
+                .jump_candidates(&app.pick_jump_self_alias(&origin))
+                .is_empty();
             app.pick_jump_state.select(has.then_some(0));
-            app.screen = Screen::PickJump {
-                origin: PickOrigin::Override,
-            };
+            app.screen = Screen::PickJump { origin };
         }
         KeyCode::Enter | KeyCode::Char('i') if focused != override_idx::VERBOSE => {
             begin_edit(&mut app.override_form.form)
@@ -1644,7 +1647,7 @@ fn handle_override_navigate(app: &mut App, key: KeyEvent) {
             }
             begin_edit(&mut app.override_form.form);
         }
-        KeyCode::Char('d') => {
+        KeyCode::Char('d') if focused != override_idx::VERBOSE => {
             let f = &mut app.override_form.form.fields[focused];
             if f.multi && !f.rows.is_empty() {
                 f.rows.remove(f.row_sel);

@@ -767,14 +767,11 @@ impl App {
     }
 
     /// Indices into `hosts` usable as a ProxyJump target: concrete
-    /// (wildcard-free) aliases other than the host currently being edited.
-    pub fn jump_candidates(&self) -> Vec<usize> {
-        let self_alias = self
-            .form
-            .fields
-            .get(form_idx::HOST)
-            .and_then(|f| f.value.split_whitespace().next())
-            .unwrap_or("");
+    /// (wildcard-free) aliases other than `self_alias` (the host the picker is
+    /// for — pass `""` to exclude nothing). The caller supplies `self_alias`
+    /// because the picker serves both the edit form and the override modal, which
+    /// identify "self" differently (see [`App::pick_jump_self_alias`]).
+    pub fn jump_candidates(&self, self_alias: &str) -> Vec<usize> {
         self.hosts
             .iter()
             .enumerate()
@@ -783,6 +780,27 @@ impl App {
                 (!a.is_empty() && !a.contains(['*', '?', '!']) && a != self_alias).then_some(i)
             })
             .collect()
+    }
+
+    /// The alias to exclude from the ProxyJump picker for a given origin: the
+    /// edit form's Host field when editing, or the override modal's target host.
+    /// Returns `""` (exclude nothing) when neither is resolvable (e.g. the add
+    /// form before a Host is typed).
+    pub fn pick_jump_self_alias(&self, origin: &PickOrigin) -> String {
+        match origin {
+            PickOrigin::Edit { .. } => self
+                .form
+                .fields
+                .get(form_idx::HOST)
+                .and_then(|f| f.value.split_whitespace().next())
+                .unwrap_or("")
+                .to_string(),
+            PickOrigin::Override => self
+                .hosts
+                .get(self.override_form.host)
+                .map(|h| h.alias().to_string())
+                .unwrap_or_default(),
+        }
     }
 
     /// Liveness state for a host by its index in `hosts`.
@@ -1151,15 +1169,24 @@ pub fn overrides_from_form(of: &OverrideForm) -> Result<ConnectOverrides, (usize
         None => None,
     };
 
-    let extra_options = rows(override_idx::EXTRAS)
-        .into_iter()
-        .filter_map(|row| {
-            let mut it = row.splitn(2, char::is_whitespace);
-            let k = it.next()?.to_string();
-            let v = it.next().unwrap_or("").trim().to_string();
-            (!k.is_empty()).then_some((k, v))
-        })
-        .collect();
+    // Each extra option must be `Key Value`. A key with no value would emit a
+    // bare `-o KEY=` that OpenSSH rejects (exit 255) — and the same flag fed to
+    // `ssh -G` silently degrades auto-fill — so reject it in-form instead.
+    let mut extra_options: Vec<(String, String)> = Vec::new();
+    for row in rows(override_idx::EXTRAS) {
+        let mut it = row.splitn(2, char::is_whitespace);
+        let Some(k) = it.next().filter(|k| !k.is_empty()).map(str::to_string) else {
+            continue;
+        };
+        let v = it.next().unwrap_or("").trim().to_string();
+        if v.is_empty() {
+            return Err((
+                override_idx::EXTRAS,
+                format!("extra option '{k}' needs a value (Key Value)"),
+            ));
+        }
+        extra_options.push((k, v));
+    }
 
     Ok(ConnectOverrides {
         port,
@@ -1299,6 +1326,89 @@ mod tests {
         assert_eq!(
             overrides_from_form(&quoted).unwrap_err().0,
             override_idx::USER
+        );
+    }
+
+    #[test]
+    fn override_form_rejects_value_less_extra() {
+        // A key-only extra would emit `-o KEY=` which ssh rejects, so reject it.
+        let mut of = override_form_from_host(0);
+        of.form.fields[override_idx::EXTRAS].rows = vec!["ForwardAgent".into()];
+        assert_eq!(
+            overrides_from_form(&of).unwrap_err().0,
+            override_idx::EXTRAS
+        );
+        // A complete `Key Value` row is accepted.
+        of.form.fields[override_idx::EXTRAS].rows = vec!["ForwardAgent yes".into()];
+        assert_eq!(
+            overrides_from_form(&of).unwrap().extra_options,
+            vec![("ForwardAgent".to_string(), "yes".to_string())]
+        );
+    }
+
+    /// Build a real `App` over a throwaway config file so the few methods that
+    /// need full state (host list, picker self-exclusion) can be table-tested.
+    /// `App::new` only reads (config/keys/known_hosts) and spawns non-blocking
+    /// liveness probes, so it is safe and ssh-free in tests.
+    fn app_fixture(config_body: &str) -> App {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("sshm-app-{}-{}", std::process::id(), n));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(config_body.as_bytes()).unwrap();
+        drop(f);
+        App::new(path).expect("App::new over scratch config")
+    }
+
+    #[test]
+    fn jump_candidates_excludes_override_target_not_stale_edit_form() {
+        let mut app = app_fixture(
+            "Host alpha\n  HostName a\n\nHost beta\n  HostName b\n\nHost gamma\n  HostName g\n",
+        );
+        assert_eq!(
+            app.hosts.iter().map(|h| h.alias()).collect::<Vec<_>>(),
+            vec!["alpha", "beta", "gamma"]
+        );
+        // Leave a stale alias in the edit form to prove the override picker does
+        // NOT key off it (the bug this fixes).
+        app.form = form_from_view(&app.hosts[0].clone()); // HOST = "alpha"
+
+        // Override modal targeting beta (index 1).
+        app.override_form = override_form_from_host(1);
+        let origin = PickOrigin::Override;
+        assert_eq!(app.pick_jump_self_alias(&origin), "beta");
+        let cands: Vec<&str> = app
+            .jump_candidates(&app.pick_jump_self_alias(&origin))
+            .iter()
+            .map(|&i| app.hosts[i].alias())
+            .collect();
+        assert!(
+            !cands.contains(&"beta"),
+            "the override target must be excluded (no self-loop -J)"
+        );
+        assert!(
+            cands.contains(&"alpha") && cands.contains(&"gamma"),
+            "the stale edit-form alias must NOT be excluded from the override list"
+        );
+    }
+
+    #[test]
+    fn pick_jump_self_alias_uses_edit_host_field_for_edit_origin() {
+        let mut app = app_fixture("Host one\n  HostName x\n\nHost two\n  HostName y\n");
+        app.form = form_from_view(&app.hosts[1].clone()); // HOST = "two"
+        assert_eq!(
+            app.pick_jump_self_alias(&PickOrigin::Edit { editing: Some(0) }),
+            "two"
+        );
+        // Add form (empty HOST) excludes nothing.
+        app.form = EditForm::default();
+        assert_eq!(
+            app.pick_jump_self_alias(&PickOrigin::Edit { editing: None }),
+            ""
         );
     }
 

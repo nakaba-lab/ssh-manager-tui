@@ -39,6 +39,18 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
             lines.push(key("Ctrl-S", "validate & save"));
             lines.push(key("Esc", "cancel field, then cancel form"));
         }
+        Screen::ConnectOverride { .. } => {
+            lines.push(section("Connect override (session-only)"));
+            lines.push(key("Tab / j / k", "next / previous field"));
+            lines.push(key("Enter", "IdentityFile/ProxyJump: pick; else edit"));
+            lines.push(key("i", "edit field manually (text)"));
+            lines.push(key("Space / Enter", "toggle Verbose (-v)"));
+            lines.push(key("a / d", "add / remove forward or extra row"));
+            lines.push(key("Ctrl-O", "connect inline with these overrides"));
+            lines.push(key("Ctrl-T", "connect in a new tab"));
+            lines.push(key("Ctrl-Y", "copy the ssh command"));
+            lines.push(key("Esc", "cancel (nothing is written to config)"));
+        }
         Screen::KeyManager => {
             lines.push(section("Key manager"));
             lines.push(key("j / k", "move"));
