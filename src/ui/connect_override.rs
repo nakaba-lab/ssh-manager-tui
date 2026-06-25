@@ -32,7 +32,7 @@ pub fn draw(f: &mut Frame, app: &App, host: usize, area: Rect) {
     let form = &of.form;
     let editing = form.mode == FormMode::Editing;
     let host_view = app.hosts.get(host);
-    let alias = host_view.map(|h| h.alias().to_string()).unwrap_or_default();
+    let alias = host_view.map(|h| h.alias()).unwrap_or_default();
 
     let modal = centered_pct(76, 86, area);
     f.render_widget(Clear, modal);
