@@ -618,6 +618,20 @@ pub fn apply_sftp_event(b: &mut SftpBrowser, event: SftpEvent) {
             {
                 return;
             }
+            // Circuit-breaker: the first auth failure on an armed session disarms
+            // it, so the (apparently wrong/stale) stored password is sent at most
+            // once — subsequent ops fall back to BatchMode=yes (no password sent),
+            // bounding fail2ban/lockout exposure on Windows (no ControlMaster).
+            if b.session.is_armed() && crate::os::sftp::is_auth_failure(&msg) {
+                b.session.disable_arm();
+                b.remote_loading = false;
+                b.status = "stored password rejected — re-check the vault, or press F".to_string();
+                if b.remote_entries.is_empty() {
+                    b.remote_entries = vec![RemoteEntry::parent()];
+                    b.remote_sel = 0;
+                }
+                return;
+            }
             b.remote_loading = false;
             b.status = friendly_sftp_error(&msg);
             // `navigate_remote` cleared the old entries before this (failed) listing,
@@ -1604,6 +1618,46 @@ mod tests {
         assert!(!b.remote_loading);
         assert_eq!(b.status, "Connection refused");
         assert_eq!(b.remote_entries[0].name, "..");
+    }
+
+    #[test]
+    fn apply_sftp_event_trips_circuit_breaker_on_auth_failure() {
+        use crate::os::askpass::ResolvedIdentity;
+        use crate::os::sftp::{SftpArm, SftpEvent};
+        let mut b = SftpBrowser {
+            host: 0,
+            focus: SftpPane::Remote,
+            local_cwd: std::path::PathBuf::from("/"),
+            local_entries: Vec::new(),
+            local_sel: 0,
+            remote_cwd: String::new(),
+            remote_entries: Vec::new(),
+            remote_sel: 0,
+            remote_loading: true,
+            status: String::new(),
+            session: crate::os::sftp::SftpSession::open_no_master("h"),
+        };
+        b.session.set_arm(SftpArm {
+            identity: ResolvedIdentity {
+                user: "u".into(),
+                host: "h".into(),
+                host_key_alias: None,
+                identity_paths: Vec::new(),
+            },
+            password: None,
+            passphrase: None,
+        });
+        assert!(b.session.is_armed());
+        apply_sftp_event(
+            &mut b,
+            SftpEvent::Failed {
+                path: Some(".".into()), // initial listing
+                msg: "u@h: Permission denied (publickey,password).".into(),
+            },
+        );
+        // First auth failure on an armed session disarms it (no second bad attempt).
+        assert!(!b.session.is_armed());
+        assert!(b.status.contains("password"));
     }
 
     #[test]

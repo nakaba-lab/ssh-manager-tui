@@ -15,7 +15,21 @@
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::JoinHandle;
 
+use crate::os::askpass::{ResolvedIdentity, arm_connect};
 use crate::os::binaries::tools;
+use crate::os::vault::Secret;
+
+/// The per-session arming recipe: the resolved identity to bind to, plus the
+/// vault secrets to release. Each browse op mints its OWN listener from a clone of
+/// this, so the per-connect single-shot is consumed exactly once per op. Dropped
+/// (zeroizing the secrets) when the browser closes or the circuit-breaker trips.
+/// `Secret` and `ResolvedIdentity` both derive `Clone`, so the derive suffices.
+#[derive(Clone)]
+pub struct SftpArm {
+    pub identity: ResolvedIdentity,
+    pub password: Option<Secret>,
+    pub passphrase: Option<Secret>,
+}
 
 /// One entry in a remote directory listing.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -170,9 +184,12 @@ fn list_batch(path: &str) -> Option<String> {
 /// alias + per-op args into each worker keeps the workers self-contained.
 pub struct SftpSession {
     alias: String,
-    /// Extra args shared by every op (`-o BatchMode=yes`, and the unix control
-    /// options), in front of the per-op `-b <script> -- <alias>`.
+    /// Extra args shared by every op (the unix control options), in front of the
+    /// per-op `BatchMode` pair and `-b <script> -- <alias>`.
     common_args: Vec<String>,
+    /// When `Some`, ops run armed: `-o BatchMode=no` plus a fresh per-op askpass
+    /// listener minted from this recipe (auto-fills the stored password/passphrase).
+    arm: Option<SftpArm>,
     tx: Sender<SftpEvent>,
     rx: Receiver<SftpEvent>,
     handles: Vec<JoinHandle<()>>,
@@ -209,23 +226,24 @@ impl SftpSession {
     /// Shared constructor: build `common_args` from the optional ControlMaster path.
     fn with_control(alias: &str, #[cfg(unix)] control: Option<std::path::PathBuf>) -> Self {
         let (tx, rx) = mpsc::channel();
-        // `-o BatchMode=yes` makes every op fail fast instead of hanging on a
-        // prompt; on unix the control options (when present) multiplex ops over one
-        // connection.
+        // BatchMode is now supplied per-op by `run_op` (via `batchmode_args`) so an
+        // armed op can flip it to `no`; `common_args` carries only the unix control
+        // options (when present), which multiplex ops over one connection.
         #[cfg(unix)]
         let common_args = {
-            let mut a = vec!["-o".to_string(), "BatchMode=yes".to_string()];
+            let mut a: Vec<String> = Vec::new();
             if let Some(path) = &control {
                 a.extend(control_options(path));
             }
             a
         };
         #[cfg(not(unix))]
-        let common_args = vec!["-o".to_string(), "BatchMode=yes".to_string()];
+        let common_args: Vec<String> = Vec::new();
 
         SftpSession {
             alias: alias.to_string(),
             common_args,
+            arm: None,
             tx,
             rx,
             handles: Vec::new(),
@@ -257,13 +275,30 @@ impl SftpSession {
         Vec::new()
     }
 
+    /// Arm this session: subsequent ops run with `-o BatchMode=no` + a fresh
+    /// per-op askpass listener built from `arm`.
+    pub fn set_arm(&mut self, arm: SftpArm) {
+        self.arm = Some(arm);
+    }
+
+    /// Disable arming (circuit-breaker / teardown): drops + zeroizes the secrets
+    /// and reverts subsequent ops to `BatchMode=yes`.
+    pub fn disable_arm(&mut self) {
+        self.arm = None;
+    }
+
+    pub fn is_armed(&self) -> bool {
+        self.arm.is_some()
+    }
+
     /// Dispatch `op` to a worker thread; its [`SftpEvent`] arrives via [`drain`].
     pub fn request(&mut self, op: SftpOp) {
         let alias = self.alias.clone();
         let common = self.common_args.clone();
+        let arm = self.arm.clone();
         let tx = self.tx.clone();
         let handle = std::thread::spawn(move || {
-            let event = run_op(&alias, &common, op);
+            let event = run_op(&alias, &common, arm, op);
             let _ = tx.send(event);
         });
         self.handles.push(handle);
@@ -331,8 +366,19 @@ impl Drop for SftpSession {
     }
 }
 
+/// The BatchMode option pair for an op. Armed ops pass `BatchMode=no` to override
+/// the `-b`-implied `batchmode yes` (sftp injects it into the spawned ssh), which
+/// is what re-enables the armed `SSH_ASKPASS` helper for the password prompt.
+fn batchmode_args(armed: bool) -> [&'static str; 2] {
+    if armed {
+        ["-o", "BatchMode=no"]
+    } else {
+        ["-o", "BatchMode=yes"]
+    }
+}
+
 /// Run one op to completion in a child `sftp -b` process and map it to an event.
-fn run_op(alias: &str, common_args: &[String], op: SftpOp) -> SftpEvent {
+fn run_op(alias: &str, common_args: &[String], arm: Option<SftpArm>, op: SftpOp) -> SftpEvent {
     let SftpOp::List(path) = op;
     let Some(batch) = list_batch(&path) else {
         return SftpEvent::Failed {
@@ -351,15 +397,31 @@ fn run_op(alias: &str, common_args: &[String], op: SftpOp) -> SftpEvent {
     };
     let _cleanup = BatchCleanup(script.clone());
 
+    let armed = arm.is_some();
     let mut args: Vec<String> = common_args.to_vec();
+    args.extend(batchmode_args(armed).iter().map(|s| s.to_string()));
     args.push("-b".to_string());
     args.push(script.display().to_string());
     args.push("--".to_string());
     args.push(alias.to_string());
 
+    // Arm a fresh per-op listener so the password single-shot is consumed once per
+    // op (one op == one ssh connect). The listener zeroizes on stop_and_join.
+    let listener_env = arm.and_then(|a| arm_connect(a.identity, a.password, a.passphrase).ok());
+    let (listener, env) = match listener_env {
+        Some((l, env)) => (Some(l), env),
+        None => (None, Vec::new()),
+    };
+
     let output = std::process::Command::new(tools().sftp.as_path())
         .args(&args)
+        .envs(env.iter().map(|(k, v)| (k, v)))
         .output();
+
+    // Tear the per-op listener down (zeroize) regardless of outcome.
+    if let Some(l) = listener {
+        let _ = l.stop_and_join();
+    }
 
     match output {
         Ok(o) if o.status.success() => {
@@ -395,7 +457,6 @@ fn run_op(alias: &str, common_args: &[String], op: SftpOp) -> SftpEvent {
 /// parenthesized method list), `Authentication failed…`, or `Too many
 /// authentication failures`. A bare directory `Permission denied` (no `(method)`)
 /// and a host-key failure are deliberately negatives.
-#[allow(dead_code)] // wired in by Task 4 (circuit-breaker) and Task 5 (steer)
 pub fn is_auth_failure(stderr: &str) -> bool {
     stderr.lines().map(str::trim).any(|line| {
         let denied_with_methods = line.contains(": Permission denied (") && line.ends_with(").");
@@ -531,6 +592,12 @@ pub fn stage_batch(contents: &str) -> std::io::Result<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batchmode_args_flip_on_arm() {
+        assert_eq!(batchmode_args(false), ["-o", "BatchMode=yes"]);
+        assert_eq!(batchmode_args(true), ["-o", "BatchMode=no"]);
+    }
 
     #[test]
     fn list_batch_scripts() {

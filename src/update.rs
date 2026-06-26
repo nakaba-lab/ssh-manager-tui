@@ -1747,6 +1747,42 @@ fn arm_sftp_secrets(
     }
 }
 
+/// Build the per-session SFTP browse arming recipe for `host`, or `None` when the
+/// host is not a full auto-fill candidate. Same gate truth as the connect path
+/// (via `sftp_arm_kinds`), plus the System32-ssh requirement (never arm against
+/// the Git/MSYS `[PATH ssh]` build, whose force/console handling differs).
+fn compute_sftp_arm(app: &App, host: &HostView, alias: &str) -> Option<crate::os::sftp::SftpArm> {
+    if !crate::os::binaries::tools().is_system32 {
+        return None;
+    }
+    let candidacy = app.vault_secret_kinds(host)?;
+    if has_match_exec(&app.config.render()) {
+        return None;
+    }
+    let rc = resolve_config_with_options(&[], alias).ok()?;
+    let is_proxied = host.is_proxied() || rc.proxy_jump.is_some() || rc.proxy_command.is_some();
+    let is_known = tofu_lookup_key(&rc).is_some_and(|k| is_host_known(&k, &known_hosts_files(&rc)));
+    let kinds = sftp_arm_kinds(
+        candidacy,
+        app.password_autofill_enabled,
+        app.confirmed_password_targets
+            .contains(&resolved_target(&rc)),
+        crate::os::askpass::ssh_kbdint_prefix_supported(),
+        is_proxied,
+        is_known,
+    )?;
+    let (password, passphrase) = gather_secrets(app, host, kinds);
+    if password.is_none() && passphrase.is_none() {
+        return None;
+    }
+    let identity = resolved_identity(&rc, alias, &os_tokens());
+    Some(crate::os::sftp::SftpArm {
+        identity,
+        password,
+        passphrase,
+    })
+}
+
 /// The SFTP-transfer/browser arming decision, at full parity with `connect_plan`.
 /// Returns the kinds to arm, or `None` to arm nothing. The two blanket gates are
 /// load-bearing for BOTH kinds: a proxied or not-yet-trusted host arms neither the
@@ -1839,6 +1875,11 @@ fn open_sftp_browser(app: &mut App, host: usize) {
         .unwrap_or_else(|| std::path::PathBuf::from(std::path::MAIN_SEPARATOR_STR));
     let local_entries = read_local_dir(&local_cwd);
     let mut session = SftpSession::open(&alias);
+    if let Some(h) = app.hosts.get(host)
+        && let Some(arm) = compute_sftp_arm(app, h, &alias)
+    {
+        session.set_arm(arm);
+    }
     session.request(SftpOp::List(".".to_string()));
     app.sftp_browser = Some(SftpBrowser {
         host,
