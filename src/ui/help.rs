@@ -102,7 +102,7 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
             lines.push(key("t", "connect in new Windows Terminal tab"));
             lines.push(key("F", "open SFTP session (inline)"));
             lines.push(key("O", "connect with one-off overrides"));
-            lines.push(key("o", "action menu"));
+            lines.push(key("o", "action menu (SFTP session / transfer, …)"));
             lines.push(key("c", "copy ssh command"));
             lines.push(key("e / a", "edit / add host"));
             lines.push(key("d", "delete host"));

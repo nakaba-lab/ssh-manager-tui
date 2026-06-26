@@ -16,12 +16,14 @@ use ratatui::crossterm::terminal::{
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::app::{
-    App, ConfirmAction, ConnectMode, EditForm, FormMode, GenOrigin, ListFocus, PickOrigin, Screen,
-    VaultEntryForm, VaultUnlock, form_from_view, form_idx, override_form_from_host, override_idx,
-    overrides_from_form, view_from_form,
+    App, ConfirmAction, ConnectMode, EditForm, FormMode, GenOrigin, ListFocus, PickOrigin,
+    SFTP_FIELDS, Screen, SftpDirection, SftpForm, VaultEntryForm, VaultUnlock, form_from_view,
+    form_idx, override_form_from_host, override_idx, overrides_from_form, view_from_form,
 };
 use crate::config::model::HostView;
-use crate::os::askpass::{DeclineReason, Outcome, arm_connect, os_tokens, resolved_identity};
+use crate::os::askpass::{
+    AskpassListener, DeclineReason, Outcome, arm_connect, os_tokens, resolved_identity,
+};
 use crate::os::connect::{
     ConnectOverrides, Protocol, command_line, connect_new_tab, describe_exit, describe_exit_code,
     resolve_options, run_inline,
@@ -57,6 +59,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent, terminal: &mut DefaultTerminal) 
         Screen::PickKey { origin } => handle_pick_key(app, key, origin),
         Screen::PickJump { origin } => handle_pick_jump(app, key, origin),
         Screen::ConnectOverride { host } => handle_connect_override(app, key, host, terminal)?,
+        Screen::SftpTransfer => handle_sftp_transfer(app, key, terminal)?,
         Screen::Vault => handle_vault(app, key),
         Screen::VaultUnlock => handle_vault_unlock(app, key),
         Screen::VaultEntry { editing } => handle_vault_entry(app, key, editing),
@@ -1539,6 +1542,245 @@ fn open_connect_override(app: &mut App, host: usize) {
     open_overlay(app, Screen::ConnectOverride { host });
 }
 
+/// Open the inline SFTP transfer form for `host`, seeding the local path with the
+/// user's home directory (a sensible default source/destination).
+fn open_sftp_transfer(app: &mut App, host: usize) {
+    let local = dirs::home_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let local_cursor = local.len();
+    app.sftp_form = SftpForm {
+        host,
+        direction: SftpDirection::Get,
+        local,
+        local_cursor,
+        remote: String::new(),
+        remote_cursor: 0,
+        field: 0,
+    };
+    open_overlay(app, Screen::SftpTransfer);
+}
+
+/// Drive the SFTP transfer form: Tab/↑↓ move fields, Space/←→ flip direction,
+/// typing edits the focused path, Ctrl-S runs the transfer, Esc cancels.
+fn handle_sftp_transfer(
+    app: &mut App,
+    key: KeyEvent,
+    terminal: &mut DefaultTerminal,
+) -> Result<()> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Char('s') if ctrl => return submit_sftp_transfer(app, terminal),
+        KeyCode::Esc => close_overlay(app),
+        KeyCode::Tab | KeyCode::Down => {
+            app.sftp_form.field = (app.sftp_form.field + 1) % SFTP_FIELDS;
+        }
+        KeyCode::BackTab | KeyCode::Up => {
+            app.sftp_form.field = (app.sftp_form.field + SFTP_FIELDS - 1) % SFTP_FIELDS;
+        }
+        _ if app.sftp_form.field == 0 => {
+            // Direction field: Space / ←→ toggle Get↔Put; nothing else applies.
+            if matches!(
+                key.code,
+                KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right
+            ) {
+                app.sftp_form.direction = match app.sftp_form.direction {
+                    SftpDirection::Get => SftpDirection::Put,
+                    SftpDirection::Put => SftpDirection::Get,
+                };
+            }
+        }
+        _ => {
+            // A text path field (1 = local, 2 = remote).
+            let (s, cursor) = if app.sftp_form.field == 1 {
+                (&mut app.sftp_form.local, &mut app.sftp_form.local_cursor)
+            } else {
+                (&mut app.sftp_form.remote, &mut app.sftp_form.remote_cursor)
+            };
+            match key.code {
+                KeyCode::Char(c) if !ctrl => insert_char(s, cursor, c),
+                KeyCode::Backspace => backspace(s, cursor),
+                KeyCode::Delete => delete_forward(s, cursor),
+                KeyCode::Left => *cursor = prev_boundary(s, *cursor),
+                KeyCode::Right => *cursor = next_boundary(s, *cursor),
+                KeyCode::Home => *cursor = 0,
+                KeyCode::End => *cursor = s.len(),
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate the form, stage an `sftp -b` batch file, and run the transfer inline.
+fn submit_sftp_transfer(app: &mut App, terminal: &mut DefaultTerminal) -> Result<()> {
+    let Some(host) = app.hosts.get(app.sftp_form.host).cloned() else {
+        close_overlay(app);
+        app.toast("host is no longer available", true);
+        return Ok(());
+    };
+    let alias = host.alias().to_string();
+    let local = app.sftp_form.local.trim().to_string();
+    let remote = app.sftp_form.remote.trim().to_string();
+    let direction = app.sftp_form.direction;
+
+    if local.is_empty() || remote.is_empty() {
+        app.toast("both a local and a remote path are required", true);
+        return Ok(());
+    }
+    // sftp's batch parser has no backslash escape for a literal double-quote, so a
+    // value containing one can't be quoted unambiguously — refuse rather than build
+    // a malformed command (mirrors the config writer's refusal stance).
+    if local.contains('"') || remote.contains('"') {
+        app.toast("paths must not contain a double-quote (\") character", true);
+        return Ok(());
+    }
+
+    let batch = sftp_batch_line(direction, &local, &remote);
+    let temp = match write_sftp_batch(&batch) {
+        Ok(p) => p,
+        Err(e) => {
+            app.toast(format!("could not stage transfer: {e}"), true);
+            return Ok(());
+        }
+    };
+    // Guard deletes the batch file on every exit path (success, failure, panic).
+    let _cleanup = TempCleanup(temp.clone());
+
+    let mut args = vec!["-b".to_string(), temp.display().to_string()];
+    args.extend(Protocol::Sftp.build_args(&host, &ConnectOverrides::default()));
+
+    close_overlay(app);
+    execute_sftp_transfer(app, terminal, &host, &alias, &args)
+}
+
+/// Run a one-shot `sftp -b` transfer inline (suspend/restore the TUI, exactly
+/// like an inline connect, so sftp's own progress meter is visible). A stored
+/// *passphrase* (local key decryption) is auto-filled via the same askpass
+/// listener connect uses; a stored *password* is not auto-filled here — sftp
+/// prompts for it on the inherited TTY and the user types it (no hang, since the
+/// transfer is inline).
+fn execute_sftp_transfer(
+    app: &mut App,
+    terminal: &mut DefaultTerminal,
+    host: &HostView,
+    alias: &str,
+    args: &[String],
+) -> Result<()> {
+    let (listener, env) = arm_sftp_passphrase(app, host, alias);
+    app.record_connect(host.alias());
+    suspend_tui(terminal)?;
+    let status = run_inline(Protocol::Sftp.binary(), args, &env);
+    restore_tui(terminal)?;
+    // A long transfer (TUI suspended) must not trigger a spurious idle auto-lock
+    // on the next tick (#14).
+    app.last_activity = Instant::now();
+    let toast = match (status, listener) {
+        (Ok(s), Some(l)) => connect_toast("sftp", alias, s.code(), &l.stop_and_join()),
+        (Ok(s), None) => describe_exit("sftp", &s),
+        (Err(e), _) => Some((format!("failed to launch sftp: {e}"), true)),
+    };
+    if let Some((msg, is_err)) = toast {
+        app.toast(msg, is_err);
+    }
+    Ok(())
+}
+
+/// Arm a connect-time askpass listener serving ONLY the host's stored passphrase
+/// (local key decryption — safe to auto-fill without the server-facing password
+/// consent gate). Returns `(None, empty)` when there is nothing to arm or the
+/// alias can't be resolved, in which case sftp simply prompts on the TTY.
+fn arm_sftp_passphrase(
+    app: &App,
+    host: &HostView,
+    alias: &str,
+) -> (
+    Option<AskpassListener>,
+    Vec<(std::ffi::OsString, std::ffi::OsString)>,
+) {
+    if !app.vault_secret_kinds(host).is_some_and(|k| k.passphrase) {
+        return (None, Vec::new());
+    }
+    let kinds = MatchedKinds {
+        password: false,
+        passphrase: true,
+    };
+    let (_password, passphrase) = gather_secrets(app, host, kinds);
+    let Some(passphrase) = passphrase else {
+        return (None, Vec::new());
+    };
+    // A `Match exec` predicate anywhere would make `ssh -G` execute it — skip the
+    // resolve (and arming) and let sftp prompt, mirroring connect dispatch.
+    if has_match_exec(&app.config.render()) {
+        return (None, Vec::new());
+    }
+    let Ok(rc) = resolve_config_with_options(&[], alias) else {
+        return (None, Vec::new());
+    };
+    let identity = resolved_identity(&rc, alias, &os_tokens());
+    match arm_connect(identity, None, Some(passphrase)) {
+        Ok((listener, env)) => (Some(listener), env),
+        Err(_) => (None, Vec::new()),
+    }
+}
+
+/// Build the single `sftp -b` batch command for a transfer. `get` pulls
+/// remote→local; `put` pushes local→remote. Each path is quoted independently;
+/// the trailing newline terminates the batch line.
+fn sftp_batch_line(direction: SftpDirection, local: &str, remote: &str) -> String {
+    match direction {
+        SftpDirection::Get => {
+            format!(
+                "get {} {}\n",
+                quote_sftp_path(remote),
+                quote_sftp_path(local)
+            )
+        }
+        SftpDirection::Put => {
+            format!(
+                "put {} {}\n",
+                quote_sftp_path(local),
+                quote_sftp_path(remote)
+            )
+        }
+    }
+}
+
+/// Quote a path for an `sftp` batch command: wrap in double quotes when it
+/// contains whitespace. A literal `"` is rejected upstream, so a bare wrap is
+/// unambiguous. Backslashes are left intact (Windows local paths round-trip).
+fn quote_sftp_path(p: &str) -> String {
+    if p.chars().any(char::is_whitespace) {
+        format!("\"{p}\"")
+    } else {
+        p.to_string()
+    }
+}
+
+/// A temp-file guard: removes the staged batch file on drop so it never lingers,
+/// even on an early return or a transfer that fails to launch.
+struct TempCleanup(std::path::PathBuf);
+
+impl Drop for TempCleanup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Stage an `sftp -b` batch script in a private temp file and return its path
+/// (`0o600` on unix; Windows inherits the temp directory's ACL). One transfer
+/// runs at a time (inline), so a per-process filename never collides.
+fn write_sftp_batch(contents: &str) -> std::io::Result<std::path::PathBuf> {
+    let path = std::env::temp_dir().join(format!("sshm-sftp-{}.txt", std::process::id()));
+    std::fs::write(&path, contents)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(path)
+}
+
 /// Build [`ConnectOverrides`] from the override form, surfacing a validation
 /// error as a toast + highlighted field. `None` means validation failed and the
 /// caller should abort.
@@ -2289,6 +2531,7 @@ fn handle_action_menu(
                         action_idx::SFTP_INLINE => {
                             connect_selected(app, terminal, ConnectMode::Inline, Protocol::Sftp)?
                         }
+                        action_idx::SFTP_TRANSFER => open_sftp_transfer(app, host_idx),
                         action_idx::CONNECT_OVERRIDES => open_connect_override(app, host_idx),
                         action_idx::COPY_COMMAND => copy_command(app),
                         action_idx::EDIT => open_edit(app),
@@ -2562,6 +2805,31 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(known_hosts_files(&rc), vec!["u1", "u2", "g1"]);
+    }
+
+    #[test]
+    fn sftp_batch_line_builds_get_and_put_with_quoting() {
+        // get: remote source first, local destination second.
+        assert_eq!(
+            sftp_batch_line(SftpDirection::Get, "/home/me/out.txt", "/etc/hostname"),
+            "get /etc/hostname /home/me/out.txt\n"
+        );
+        // put: local source first, remote destination second.
+        assert_eq!(
+            sftp_batch_line(SftpDirection::Put, "/home/me/in.txt", "/srv/in.txt"),
+            "put /home/me/in.txt /srv/in.txt\n"
+        );
+        // Paths with whitespace are wrapped in double quotes; each independently.
+        assert_eq!(
+            sftp_batch_line(SftpDirection::Put, "C:\\My Docs\\a.txt", "/srv/up load.txt"),
+            "put \"C:\\My Docs\\a.txt\" \"/srv/up load.txt\"\n"
+        );
+        // A backslash-bearing Windows path with no spaces is left bare (not quoted,
+        // not escaped) — it round-trips verbatim.
+        assert_eq!(
+            sftp_batch_line(SftpDirection::Put, "C:\\id\\a.txt", "/srv/a.txt"),
+            "put C:\\id\\a.txt /srv/a.txt\n"
+        );
     }
 
     #[test]

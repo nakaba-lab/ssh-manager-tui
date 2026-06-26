@@ -9,6 +9,7 @@ pub mod help;
 pub mod keys;
 pub mod known_hosts;
 pub mod list;
+pub mod sftp;
 pub mod theme;
 pub mod vault;
 pub mod widgets;
@@ -30,6 +31,7 @@ fn base_screen(app: &App) -> Screen {
         | Screen::ActionMenu(_)
         | Screen::VaultUnlock
         | Screen::ConnectOverride { .. }
+        | Screen::SftpTransfer
         | Screen::PasswordConfirm { .. } => app.prev_screen.clone().unwrap_or(Screen::List),
         Screen::PickKey { origin } | Screen::PickJump { origin } => match origin {
             PickOrigin::Edit { editing } => Screen::Edit { editing: *editing },
@@ -83,6 +85,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             list::draw_jump_picker(f, app, &origin, body_a)
         }
         Screen::ConnectOverride { host } => connect_override::draw(f, app, *host, body_a),
+        Screen::SftpTransfer => sftp::draw_transfer(f, app, body_a),
         Screen::VaultUnlock => vault::draw_unlock(f, app, body_a),
         Screen::VaultEntry { .. } => vault::draw_entry(f, app, body_a),
         Screen::PasswordConfirm { target, kinds, .. } => {
@@ -163,6 +166,16 @@ fn draw_footer(f: &mut Frame, app: &App, base: &Screen, area: Rect) {
             ("^T", "new-tab"),
             ("^Y", "copy"),
             ("?", "help"),
+            ("Esc", "cancel"),
+        ]);
+        f.render_widget(Paragraph::new(hints), area);
+        return;
+    }
+    if matches!(app.screen, Screen::SftpTransfer) {
+        let hints = widgets::footer_hints(&[
+            ("Tab", "field"),
+            ("Space/←→", "direction"),
+            ("^S", "transfer"),
             ("Esc", "cancel"),
         ]);
         f.render_widget(Paragraph::new(hints), area);

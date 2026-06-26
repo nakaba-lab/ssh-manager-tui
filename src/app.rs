@@ -138,6 +138,11 @@ pub enum Screen {
     ConnectOverride {
         host: usize,
     },
+    /// Inline SFTP transfer form: collects a direction + local/remote paths for a
+    /// one-shot `sftp -b` transfer. The host index and field values live in
+    /// [`App::sftp_form`]. Submitting suspends the TUI and runs the transfer
+    /// inline, just like an inline connect.
+    SftpTransfer,
     /// Password vault: list of stored secrets (login passwords / passphrases).
     Vault,
     /// Master-password prompt modal — unlock an existing vault, or create one.
@@ -446,6 +451,44 @@ impl std::fmt::Debug for VaultEntryForm {
     }
 }
 
+/// Direction of an SFTP transfer relative to the remote host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SftpDirection {
+    /// Download: remote → local (`get`).
+    #[default]
+    Get,
+    /// Upload: local → remote (`put`).
+    Put,
+}
+
+impl SftpDirection {
+    pub fn label(self) -> &'static str {
+        match self {
+            SftpDirection::Get => "Get  (remote → local)",
+            SftpDirection::Put => "Put  (local → remote)",
+        }
+    }
+}
+
+/// Session-only state for the inline SFTP transfer modal. Collects a direction
+/// plus a local and a remote path, then runs a one-shot `sftp -b` transfer
+/// inline (the TUI suspends, exactly like an inline connect). Holds no secret.
+#[derive(Debug, Clone, Default)]
+pub struct SftpForm {
+    /// Index into [`App::hosts`] of the host being transferred to/from.
+    pub host: usize,
+    pub direction: SftpDirection,
+    pub local: String,
+    pub local_cursor: usize,
+    pub remote: String,
+    pub remote_cursor: usize,
+    /// Focused field: 0 = direction, 1 = local path, 2 = remote path.
+    pub field: usize,
+}
+
+/// Number of focusable fields in the SFTP transfer form.
+pub const SFTP_FIELDS: usize = 3;
+
 pub struct App {
     pub should_quit: bool,
     pub screen: Screen,
@@ -481,6 +524,9 @@ pub struct App {
 
     // --- connect-time override form ---
     pub override_form: OverrideForm,
+
+    // --- inline SFTP transfer form ---
+    pub sftp_form: SftpForm,
 
     // --- S3 keys ---
     pub keys: Vec<KeyInfo>,
@@ -569,6 +615,7 @@ impl App {
             last_sweep: Instant::now(),
             form: EditForm::default(),
             override_form: OverrideForm::default(),
+            sftp_form: SftpForm::default(),
             keys,
             keys_state: ListState::default(),
             key_host_ctx: None,
