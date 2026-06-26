@@ -12,9 +12,10 @@ use super::theme;
 use super::widgets::{centered, modal_block};
 
 /// The labels shown in the per-host action menu, in selection order.
-pub const ACTION_LABELS: [&str; 6] = [
+pub const ACTION_LABELS: [&str; 7] = [
     "Connect (inline)",
     "Connect (new tab)",
+    "SFTP (inline)",
     "Connect (overrides)…",
     "Copy ssh command",
     "Edit host",
@@ -28,10 +29,11 @@ pub const ACTION_LABELS: [&str; 6] = [
 pub mod action_idx {
     pub const CONNECT_INLINE: usize = 0;
     pub const CONNECT_NEW_TAB: usize = 1;
-    pub const CONNECT_OVERRIDES: usize = 2;
-    pub const COPY_COMMAND: usize = 3;
-    pub const EDIT: usize = 4;
-    pub const DELETE: usize = 5;
+    pub const SFTP_INLINE: usize = 2;
+    pub const CONNECT_OVERRIDES: usize = 3;
+    pub const COPY_COMMAND: usize = 4;
+    pub const EDIT: usize = 5;
+    pub const DELETE: usize = 6;
 }
 
 pub fn draw(f: &mut Frame, action: ConfirmAction, area: Rect) {
@@ -142,7 +144,7 @@ mod tests {
         // The dispatch keys off these indices; assert each names its own label so
         // a future reorder of ACTION_LABELS without updating action_idx (or the
         // match arms) fails here rather than silently misrouting a menu action.
-        assert_eq!(ACTION_LABELS.len(), 6);
+        assert_eq!(ACTION_LABELS.len(), 7);
         assert_eq!(
             ACTION_LABELS[action_idx::CONNECT_INLINE],
             "Connect (inline)"
@@ -151,6 +153,7 @@ mod tests {
             ACTION_LABELS[action_idx::CONNECT_NEW_TAB],
             "Connect (new tab)"
         );
+        assert_eq!(ACTION_LABELS[action_idx::SFTP_INLINE], "SFTP (inline)");
         assert_eq!(
             ACTION_LABELS[action_idx::CONNECT_OVERRIDES],
             "Connect (overrides)…"

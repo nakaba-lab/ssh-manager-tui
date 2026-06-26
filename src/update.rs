@@ -23,8 +23,8 @@ use crate::app::{
 use crate::config::model::HostView;
 use crate::os::askpass::{DeclineReason, Outcome, arm_connect, os_tokens, resolved_identity};
 use crate::os::connect::{
-    ConnectOverrides, build_ssh_args, command_line, connect_new_tab, describe_exit,
-    describe_exit_code, resolve_options, run_ssh_inline,
+    ConnectOverrides, Protocol, command_line, connect_new_tab, describe_exit, describe_exit_code,
+    resolve_options, run_inline,
 };
 use crate::os::keys::{generate_key, read_public_key};
 use crate::os::known_hosts::remove_entry;
@@ -63,10 +63,11 @@ pub fn handle_key(app: &mut App, key: KeyEvent, terminal: &mut DefaultTerminal) 
         Screen::PasswordConfirm {
             alias,
             mode,
+            protocol,
             rc,
             ov,
             ..
-        } => handle_password_confirm(app, key, alias, mode, rc, *ov, terminal)?,
+        } => handle_password_confirm(app, key, alias, mode, protocol, rc, *ov, terminal)?,
     }
     Ok(())
 }
@@ -76,11 +77,13 @@ pub fn handle_key(app: &mut App, key: KeyEvent, terminal: &mut DefaultTerminal) 
 /// still arms). The cached `rc` from the first pass is handed back so the re-entry
 /// reuses it instead of running `ssh -G` again. Closing the overlay first returns
 /// to the base screen (List) so the inline connect suspends/restores over it.
+#[allow(clippy::too_many_arguments)]
 fn handle_password_confirm(
     app: &mut App,
     key: KeyEvent,
     alias: String,
     mode: ConnectMode,
+    protocol: Protocol,
     rc: Box<ResolvedConfig>,
     ov: ConnectOverrides,
     terminal: &mut DefaultTerminal,
@@ -93,6 +96,7 @@ fn handle_password_confirm(
                 terminal,
                 &alias,
                 mode,
+                protocol,
                 PasswordChoice::Confirmed,
                 Some(*rc),
                 ov,
@@ -105,6 +109,7 @@ fn handle_password_confirm(
                 terminal,
                 &alias,
                 mode,
+                protocol,
                 PasswordChoice::Withheld,
                 Some(*rc),
                 ov,
@@ -260,8 +265,11 @@ fn handle_list(app: &mut App, key: KeyEvent, terminal: &mut DefaultTerminal) -> 
         KeyCode::Char('u') if ctrl => move_selection(app, -5),
         KeyCode::Char('g') => select_index(app, 0),
         KeyCode::Char('G') => select_index(app, app.filtered.len().saturating_sub(1)),
-        KeyCode::Enter => connect_selected(app, terminal, ConnectMode::Inline)?,
-        KeyCode::Char('t') => connect_selected(app, terminal, ConnectMode::NewWtTab)?,
+        KeyCode::Enter => connect_selected(app, terminal, ConnectMode::Inline, Protocol::Ssh)?,
+        KeyCode::Char('t') => {
+            connect_selected(app, terminal, ConnectMode::NewWtTab, Protocol::Ssh)?
+        }
+        KeyCode::Char('F') => connect_selected(app, terminal, ConnectMode::Inline, Protocol::Sftp)?,
         KeyCode::Char('O') => {
             if let Some(h) = app.selected_host() {
                 open_connect_override(app, h);
@@ -479,6 +487,7 @@ fn connect_selected(
     app: &mut App,
     terminal: &mut DefaultTerminal,
     mode: ConnectMode,
+    protocol: Protocol,
 ) -> Result<()> {
     let Some(idx) = app.selected_host() else {
         return Ok(());
@@ -489,6 +498,7 @@ fn connect_selected(
         terminal,
         &alias,
         mode,
+        protocol,
         PasswordChoice::Ask,
         None,
         ConnectOverrides::default(),
@@ -503,11 +513,13 @@ fn connect_selected(
 /// `ov` carries any ad-hoc overrides (empty for a plain saved-host connect); its
 /// resolution-relevant flags are also fed to `ssh -G` so the vault gates key off
 /// the *effective* `user@host`, not the saved config.
+#[allow(clippy::too_many_arguments)]
 fn connect_by_alias(
     app: &mut App,
     terminal: &mut DefaultTerminal,
     alias: &str,
     mode: ConnectMode,
+    protocol: Protocol,
     choice: PasswordChoice,
     cached_rc: Option<ResolvedConfig>,
     ov: ConnectOverrides,
@@ -529,7 +541,7 @@ fn connect_by_alias(
         );
         return Ok(());
     }
-    let args = build_ssh_args(&host, &ov);
+    let args = protocol.build_args(&host, &ov);
 
     // v1 auto-fills the inline path only; a mode that won't auto-fill skips the
     // candidacy + resolve machinery entirely (no `ssh -G`, no env).
@@ -538,7 +550,7 @@ fn connect_by_alias(
         ConnectMode::NewWtTab => NEW_TAB_AUTOFILL,
     };
     if !autofill_mode {
-        return connect_plain(app, terminal, &host, &args, mode);
+        return connect_plain(app, terminal, &host, &args, mode, protocol);
     }
 
     // One-time discoverability nudge for a stored password while auto-fill is off
@@ -565,7 +577,7 @@ fn connect_by_alias(
     }
     // No candidate secret → a plain connect (skip `ssh -G` for the common case).
     if candidacy.is_none() {
-        return connect_plain(app, terminal, &host, &args, mode);
+        return connect_plain(app, terminal, &host, &args, mode, protocol);
     }
 
     // Reuse the first-pass resolution if the modal handed it back, so the
@@ -624,7 +636,7 @@ fn connect_by_alias(
             if let Some(m) = msg {
                 app.toast(m, false);
             }
-            connect_plain(app, terminal, &host, &args, mode)
+            connect_plain(app, terminal, &host, &args, mode, protocol)
         }
         ConnectPlan::DeferPasswordConfirm(kinds) => {
             // Show the one-time consent modal; its Enter/Esc re-enters here with
@@ -637,6 +649,7 @@ fn connect_by_alias(
                 Screen::PasswordConfirm {
                     alias: alias.to_string(),
                     mode,
+                    protocol,
                     kinds,
                     target,
                     rc: Box::new(rc),
@@ -648,7 +661,7 @@ fn connect_by_alias(
         ConnectPlan::Arm(kinds) => {
             // `Arm` implies `resolved`, so `rc` is Some; new-tab returned early.
             let rc = rc.expect("Arm implies a resolved config");
-            arm_and_connect_inline(app, terminal, &host, &args, alias, &rc, kinds)
+            arm_and_connect_inline(app, terminal, &host, &args, alias, protocol, &rc, kinds)
         }
     }
 }
@@ -660,27 +673,31 @@ fn connect_plain(
     host: &HostView,
     args: &[String],
     mode: ConnectMode,
+    protocol: Protocol,
 ) -> Result<()> {
     match mode {
         ConnectMode::Inline => {
-            // The inline path commits to launching ssh (it suspends the TUI and
-            // execs), so record before suspending.
+            // The inline path commits to launching the client (it suspends the TUI
+            // and execs), so record before suspending.
             app.record_connect(host.alias());
             suspend_tui(terminal)?;
-            let status = run_ssh_inline(args, &[]);
+            let status = run_inline(protocol.binary(), args, &[]);
             restore_tui(terminal)?;
             // A long inline session (TUI suspended, no keypresses) must not make the
             // next on_tick spuriously idle-auto-lock the vault (#14).
             app.last_activity = std::time::Instant::now();
-            report_plain_exit(app, status);
+            report_plain_exit(app, protocol, status);
         }
-        ConnectMode::NewWtTab => match connect_new_tab(host.alias(), args, &[]) {
+        ConnectMode::NewWtTab => match connect_new_tab(protocol, host.alias(), args, &[]) {
             // Only stamp history once the tab actually spawned — a spawn failure
             // (e.g. wt.exe missing) launched nothing, so it must not count as a
             // connect (it would wrongly float the host up under the Recent sort).
             Ok(()) => {
                 app.record_connect(host.alias());
-                app.toast(format!("opened new tab: ssh {}", host.alias()), false);
+                app.toast(
+                    format!("opened new tab: {} {}", protocol.label(), host.alias()),
+                    false,
+                );
             }
             Err(e) => app.toast(format!("{e}"), true),
         },
@@ -692,19 +709,21 @@ fn connect_plain(
 /// down (zeroizing secrets) and surface the combined exit+outcome toast. The
 /// listener is a scope-guard: its `Drop` stops+joins+zeroizes even on an early
 /// return or panic before `stop_and_join`.
+#[allow(clippy::too_many_arguments)]
 fn arm_and_connect_inline(
     app: &mut App,
     terminal: &mut DefaultTerminal,
     host: &HostView,
     args: &[String],
     alias: &str,
+    protocol: Protocol,
     rc: &ResolvedConfig,
     kinds: MatchedKinds,
 ) -> Result<()> {
     let (password, passphrase) = gather_secrets(app, host, kinds);
     // Nothing actually resolved to a servable secret → just connect plainly.
     if password.is_none() && passphrase.is_none() {
-        return connect_plain(app, terminal, host, args, ConnectMode::Inline);
+        return connect_plain(app, terminal, host, args, ConnectMode::Inline, protocol);
     }
     let identity = resolved_identity(rc, alias, &os_tokens());
 
@@ -712,15 +731,15 @@ fn arm_and_connect_inline(
         Ok((listener, env)) => {
             app.record_connect(host.alias());
             suspend_tui(terminal)?;
-            let status = run_ssh_inline(args, &env);
+            let status = run_inline(protocol.binary(), args, &env);
             restore_tui(terminal)?;
             // See connect_plain: a long session must not trigger a spurious idle
             // auto-lock on the next tick (#14).
             app.last_activity = std::time::Instant::now();
             let outcome = listener.stop_and_join();
             let toast = match status {
-                Ok(s) => connect_toast(alias, s.code(), &outcome),
-                Err(e) => Some((format!("failed to launch ssh: {e}"), true)),
+                Ok(s) => connect_toast(protocol.label(), alias, s.code(), &outcome),
+                Err(e) => Some((format!("failed to launch {}: {e}", protocol.label()), true)),
             };
             if let Some((msg, is_err)) = toast {
                 app.toast(msg, is_err);
@@ -732,7 +751,7 @@ fn arm_and_connect_inline(
                 format!("auto-fill unavailable ({e}); connecting without it"),
                 false,
             );
-            connect_plain(app, terminal, host, args, ConnectMode::Inline)?;
+            connect_plain(app, terminal, host, args, ConnectMode::Inline, protocol)?;
         }
     }
     Ok(())
@@ -811,33 +830,44 @@ fn maybe_password_discoverability(app: &mut App, host: &HostView) {
     }
 }
 
-/// Surface a plain (no auto-fill) inline ssh exit as a toast.
-fn report_plain_exit(app: &mut App, status: std::io::Result<std::process::ExitStatus>) {
+/// Surface a plain (no auto-fill) inline exit as a toast, naming the launched
+/// program (`ssh` / `sftp`).
+fn report_plain_exit(
+    app: &mut App,
+    protocol: Protocol,
+    status: std::io::Result<std::process::ExitStatus>,
+) {
     match status {
         Ok(s) => {
-            if let Some((msg, is_err)) = describe_exit(&s) {
+            if let Some((msg, is_err)) = describe_exit(protocol.label(), &s) {
                 app.toast(msg, is_err);
             }
         }
-        Err(e) => app.toast(format!("failed to launch ssh: {e}"), true),
+        Err(e) => app.toast(format!("failed to launch {}: {e}", protocol.label()), true),
     }
 }
 
-/// The connect-time auto-fill outcome toast for `alias`: combine the ssh exit
+/// The connect-time auto-fill outcome toast for `alias`: combine the client exit
 /// `code` with the listener `outcome`, exhaustively over the reachable outcomes so
-/// a failed connect is diagnosable. `None` = no toast (a clean exit 0 with nothing
-/// notable, e.g. key auth that never prompted).
-fn connect_toast(alias: &str, code: Option<i32>, outcome: &Outcome) -> Option<(String, bool)> {
+/// a failed connect is diagnosable. `prog` names the launched client (`ssh` /
+/// `sftp`). `None` = no toast (a clean exit 0 with nothing notable, e.g. key auth
+/// that never prompted).
+fn connect_toast(
+    prog: &str,
+    alias: &str,
+    code: Option<i32>,
+    outcome: &Outcome,
+) -> Option<(String, bool)> {
     match outcome {
         Outcome::Served { kind } => {
             let k = kind.label().to_ascii_lowercase();
             match code {
                 Some(0) => Some((format!("auto-filled {k} · connected"), false)),
                 Some(255) => Some((
-                    format!("auto-filled {k}, but ssh authentication/connection failed"),
+                    format!("auto-filled {k}, but {prog} authentication/connection failed"),
                     true,
                 )),
-                _ => describe_exit_code(code),
+                _ => describe_exit_code(prog, code),
             }
         }
         Outcome::Declined {
@@ -866,7 +896,7 @@ fn connect_toast(alias: &str, code: Option<i32>, outcome: &Outcome) -> Option<(S
             true,
         )),
         Outcome::Declined { .. } | Outcome::TimedOut | Outcome::NotAttempted => {
-            describe_exit_code(code)
+            describe_exit_code(prog, code)
         }
     }
 }
@@ -1542,7 +1572,16 @@ fn connect_with_overrides(
         return Ok(());
     };
     close_overlay(app);
-    connect_by_alias(app, terminal, &alias, mode, PasswordChoice::Ask, None, ov)
+    connect_by_alias(
+        app,
+        terminal,
+        &alias,
+        mode,
+        Protocol::Ssh,
+        PasswordChoice::Ask,
+        None,
+        ov,
+    )
 }
 
 /// Copy the `ssh ...` command line for the override modal's host + overrides.
@@ -2242,10 +2281,13 @@ fn handle_action_menu(
                     close_overlay(app);
                     match sel {
                         action_idx::CONNECT_INLINE => {
-                            connect_selected(app, terminal, ConnectMode::Inline)?
+                            connect_selected(app, terminal, ConnectMode::Inline, Protocol::Ssh)?
                         }
                         action_idx::CONNECT_NEW_TAB => {
-                            connect_selected(app, terminal, ConnectMode::NewWtTab)?
+                            connect_selected(app, terminal, ConnectMode::NewWtTab, Protocol::Ssh)?
+                        }
+                        action_idx::SFTP_INLINE => {
+                            connect_selected(app, terminal, ConnectMode::Inline, Protocol::Sftp)?
                         }
                         action_idx::CONNECT_OVERRIDES => open_connect_override(app, host_idx),
                         action_idx::COPY_COMMAND => copy_command(app),
@@ -2527,6 +2569,7 @@ mod tests {
         use crate::os::askpass::{DeclineReason, Outcome};
         // Served + clean exit -> a success toast naming the kind.
         let t = connect_toast(
+            "ssh",
             "h",
             Some(0),
             &Outcome::Served {
@@ -2539,6 +2582,7 @@ mod tests {
         );
         // Served + 255 -> served-but-auth-failed (error).
         let t = connect_toast(
+            "ssh",
             "h",
             Some(255),
             &Outcome::Served {
@@ -2546,8 +2590,19 @@ mod tests {
             },
         );
         assert!(t.is_some_and(|(m, e)| e && m.contains("auto-filled password")));
+        // The program name is threaded into the served-but-failed wording.
+        let t = connect_toast(
+            "sftp",
+            "h",
+            Some(255),
+            &Outcome::Served {
+                kind: SecretKind::Password,
+            },
+        );
+        assert!(t.is_some_and(|(m, e)| e && m.contains("sftp authentication")));
         // Keyboard-interactive decline -> an informational withheld toast.
         let t = connect_toast(
+            "ssh",
             "h",
             Some(255),
             &Outcome::Declined {
@@ -2557,6 +2612,7 @@ mod tests {
         assert!(t.is_some_and(|(m, e)| !e && m.contains("keyboard-interactive")));
         // Withheld / no-match + 255 -> a decline-aware, alias-named diagnostic.
         let t = connect_toast(
+            "ssh",
             "web1",
             Some(255),
             &Outcome::Declined {
@@ -2565,13 +2621,16 @@ mod tests {
         );
         assert!(t.is_some_and(|(m, e)| e && m.contains("web1") && m.contains("withheld")));
         // NotAttempted + 255 -> a "never requested", alias-named diagnostic.
-        let t = connect_toast("web1", Some(255), &Outcome::NotAttempted);
+        let t = connect_toast("ssh", "web1", Some(255), &Outcome::NotAttempted);
         assert!(t.is_some_and(|(m, e)| e && m.contains("web1") && m.contains("never requested")));
         // Nothing served, clean exit (key auth never prompted) -> no toast.
-        assert_eq!(connect_toast("h", Some(0), &Outcome::NotAttempted), None);
+        assert_eq!(
+            connect_toast("ssh", "h", Some(0), &Outcome::NotAttempted),
+            None
+        );
         // A detached/stalled teardown (TimedOut) folds into the exit summary:
         // 255 -> error toast, clean exit -> no toast.
-        assert!(connect_toast("h", Some(255), &Outcome::TimedOut).is_some_and(|(_, e)| e));
-        assert_eq!(connect_toast("h", Some(0), &Outcome::TimedOut), None);
+        assert!(connect_toast("ssh", "h", Some(255), &Outcome::TimedOut).is_some_and(|(_, e)| e));
+        assert_eq!(connect_toast("ssh", "h", Some(0), &Outcome::TimedOut), None);
     }
 }

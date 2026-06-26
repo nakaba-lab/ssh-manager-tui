@@ -15,7 +15,7 @@ pub const VAULT_IDLE_LOCK: Duration = Duration::from_secs(15 * 60);
 
 use crate::config::SshConfig;
 use crate::config::model::HostView;
-use crate::os::connect::ConnectOverrides;
+use crate::os::connect::{ConnectOverrides, Protocol};
 use crate::os::history::History;
 use crate::os::keys::KeyInfo;
 use crate::os::known_hosts::{HostSpec, KnownHostEntry};
@@ -155,6 +155,8 @@ pub enum Screen {
     PasswordConfirm {
         alias: String,
         mode: ConnectMode,
+        /// Which client (`ssh` / `sftp`) the resumed connect launches.
+        protocol: Protocol,
         kinds: MatchedKinds,
         target: String,
         /// The `ssh -G` resolution from the first (Ask) pass, cached so the

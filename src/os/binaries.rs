@@ -15,6 +15,10 @@ pub struct SshTools {
     /// Resolved `ssh-keyscan` (retained for a future "scan host key" action).
     #[allow(dead_code)]
     pub ssh_keyscan: PathBuf,
+    /// Resolved `sftp`, used to launch interactive SFTP sessions. Like `ssh` it
+    /// is preferred from System32 OpenSSH on Windows so it reads `~/.ssh/config`
+    /// and honours `SSH_ASKPASS` the same way.
+    pub sftp: PathBuf,
     /// True when the resolved binaries are the System32 OpenSSH build (Windows)
     /// or any PATH lookup on a non-Windows host.
     pub is_system32: bool,
@@ -37,6 +41,7 @@ fn resolve() -> SshTools {
             ssh,
             ssh_keygen: base.join("ssh-keygen.exe"),
             ssh_keyscan: base.join("ssh-keyscan.exe"),
+            sftp: base.join("sftp.exe"),
             is_system32: true,
         };
     }
@@ -49,6 +54,7 @@ fn resolve() -> SshTools {
         ssh: PathBuf::from("ssh"),
         ssh_keygen: PathBuf::from("ssh-keygen"),
         ssh_keyscan: PathBuf::from("ssh-keyscan"),
+        sftp: PathBuf::from("sftp"),
         is_system32: false,
     }
 }
@@ -59,6 +65,7 @@ fn resolve() -> SshTools {
         ssh: PathBuf::from("ssh"),
         ssh_keygen: PathBuf::from("ssh-keygen"),
         ssh_keyscan: PathBuf::from("ssh-keyscan"),
+        sftp: PathBuf::from("sftp"),
         is_system32: true,
     }
 }
