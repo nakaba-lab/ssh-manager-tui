@@ -128,6 +128,7 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
             lines.push(key("r / R", "refresh liveness (all / selected)"));
             lines.push(key("K", "key manager"));
             lines.push(key("H", "known hosts"));
+            lines.push(key("P", "password vault"));
         }
     }
 
