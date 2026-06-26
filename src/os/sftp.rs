@@ -303,24 +303,31 @@ fn control_options(path: &std::path::Path) -> Vec<String> {
 // NOTE: in-flight op threads are detached, not killed: each holds a blocking
 // `Command::output()` on a short-lived `sftp -b`. On drop the ControlMaster `-O
 // exit` severs the shared connection, so an outstanding op fails fast and its
-// thread exits promptly; Drop never blocks the UI. A wedged op against a hung
-// network could outlive the browser by the connection's own timeout.
+// thread exits promptly. The teardown itself runs on a detached thread so the UI
+// thread (which drops the session when the browser closes) never blocks on a
+// slow/wedged `ssh -O exit`.
 #[cfg(unix)]
 impl Drop for SftpSession {
     fn drop(&mut self) {
         // Tear down the shared ControlMaster so no background connection lingers.
-        if let Some(path) = &self.control {
+        // Run it off the UI thread: `Command::status()` blocks, and a wedged master
+        // or unresponsive host could otherwise freeze the interface.
+        let Some(path) = self.control.take() else {
+            return;
+        };
+        let alias = self.alias.clone();
+        std::thread::spawn(move || {
             let _ = std::process::Command::new(tools().ssh.as_path())
                 .arg("-o")
                 .arg(format!("ControlPath={}", path.display()))
                 .arg("-O")
                 .arg("exit")
                 .arg("--")
-                .arg(&self.alias)
+                .arg(&alias)
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status();
-        }
+        });
     }
 }
 

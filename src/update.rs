@@ -1802,7 +1802,12 @@ fn open_sftp_browser(app: &mut App, host: usize) {
         );
         return;
     }
-    let local_cwd = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    // Always seed an ABSOLUTE local cwd: a relative "." would let `browser_up`
+    // walk to "" (Path::new(".").parent() == Some("")), which read_local_dir can't
+    // read — locking the local pane. Fall back to the current dir, then root.
+    let local_cwd = dirs::home_dir()
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| std::path::PathBuf::from(std::path::MAIN_SEPARATOR_STR));
     let local_entries = read_local_dir(&local_cwd);
     let mut session = SftpSession::open(&alias);
     session.request(SftpOp::List(".".to_string()));
