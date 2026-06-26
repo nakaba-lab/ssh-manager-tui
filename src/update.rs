@@ -1977,6 +1977,14 @@ fn current_remote_path(b: &SftpBrowser) -> String {
 /// Mark the remote pane loading and dispatch a listing op for `path`. The single
 /// site that requests a remote listing, so loading/status stay in sync.
 fn request_remote_listing(b: &mut SftpBrowser, path: String) {
+    // Serialize ARMED ops: never start a second armed listing while one is in
+    // flight. Each armed op is a fresh server auth attempt (Windows has no
+    // ControlMaster), so parallel armed ops would multiply lockout exposure and
+    // defeat the first-failure circuit-breaker. An un-armed session pipelines as
+    // before (no password is sent, so there is no lockout risk).
+    if b.session.is_armed() && b.remote_loading {
+        return;
+    }
     b.remote_loading = true;
     b.status = "loading…".to_string();
     b.session.request(SftpOp::List(path));
@@ -2008,6 +2016,11 @@ fn browser_up(app: &mut App) {
 /// entries first so a keypress arriving before the new listing can't act on a row
 /// from the directory we just left (it would build a path under the new cwd).
 fn navigate_remote(b: &mut SftpBrowser, path: String) {
+    // An armed op is already in flight (see request_remote_listing); don't tear
+    // down the current view for a navigation we won't dispatch.
+    if b.session.is_armed() && b.remote_loading {
+        return;
+    }
     b.remote_cwd = path.clone();
     b.remote_sel = 0;
     b.remote_entries.clear();
@@ -3356,5 +3369,59 @@ mod tests {
                 passphrase: true
             })
         );
+    }
+
+    #[test]
+    fn armed_session_drops_navigation_while_op_in_flight() {
+        use crate::app::SftpPane;
+        use crate::os::askpass::ResolvedIdentity;
+        use crate::os::sftp::SftpArm;
+        // Construct a browser in the armed + in-flight state, mirroring
+        // apply_sftp_event_trips_circuit_breaker_on_auth_failure in app.rs.
+        let mut b = SftpBrowser {
+            host: 0,
+            focus: SftpPane::Remote,
+            local_cwd: std::path::PathBuf::from("/"),
+            local_entries: Vec::new(),
+            local_sel: 0,
+            remote_cwd: "/a".to_string(),
+            remote_entries: Vec::new(),
+            remote_sel: 0,
+            remote_loading: true,
+            status: String::new(),
+            session: crate::os::sftp::SftpSession::open_no_master("h"),
+        };
+        b.session.set_arm(SftpArm {
+            identity: ResolvedIdentity {
+                user: "u".into(),
+                host: "h".into(),
+                host_key_alias: None,
+                identity_paths: Vec::new(),
+            },
+            password: None,
+            passphrase: None,
+        });
+        // Seed some entries to verify they are NOT cleared.
+        b.remote_entries = vec![crate::os::sftp::RemoteEntry {
+            name: "file.txt".to_string(),
+            is_dir: false,
+            is_link: false,
+            size: 0,
+        }];
+
+        // navigate_remote to "/b" must be a no-op: armed + in-flight guard fires.
+        navigate_remote(&mut b, "/b".to_string());
+
+        // The navigation was dropped: cwd and entries are unchanged.
+        assert_eq!(
+            b.remote_cwd, "/a",
+            "cwd must not change while armed op is in flight"
+        );
+        assert_eq!(
+            b.remote_entries.len(),
+            1,
+            "entries must not be cleared while armed op is in flight"
+        );
+        assert_eq!(b.remote_entries[0].name, "file.txt");
     }
 }
