@@ -609,7 +609,12 @@ pub fn apply_sftp_event(b: &mut SftpBrowser, event: SftpEvent) {
             b.remote_loading = false;
             b.status.clear();
         }
-        SftpEvent::Failed { path, msg } => {
+        SftpEvent::Failed {
+            path,
+            msg,
+            auth_failure,
+            served,
+        } => {
             // Ignore a failure from a superseded navigation (its path is no longer
             // the one we're showing); the current op's result is still pending.
             if let Some(p) = &path
@@ -618,14 +623,24 @@ pub fn apply_sftp_event(b: &mut SftpBrowser, event: SftpEvent) {
             {
                 return;
             }
-            // Circuit-breaker: the first auth failure on an armed session disarms
-            // it, so the (apparently wrong/stale) stored password is sent at most
-            // once — subsequent ops fall back to BatchMode=yes (no password sent),
-            // bounding fail2ban/lockout exposure on Windows (no ControlMaster).
-            if b.session.is_armed() && crate::os::sftp::is_auth_failure(&msg) {
-                b.session.disable_arm();
-                b.remote_loading = false;
-                b.status = "stored password rejected — re-check the vault, or press F".to_string();
+            // Circuit-breaker (armed sessions): an auth failure over the FULL stderr
+            // (carried as `auth_failure`, so a leading server Banner can't mask it).
+            // `served` distinguishes a real password rejection from a transient
+            // arm_connect failure that degraded to an un-armed op.
+            if b.session.is_armed() && auth_failure {
+                if served {
+                    // The stored password was sent and rejected -> disarm so it is
+                    // not re-sent on the next navigation (bounds lockout exposure).
+                    b.session.disable_arm();
+                    b.remote_loading = false;
+                    b.status =
+                        "stored password rejected — re-check the vault, or press F".to_string();
+                } else {
+                    // Armed session but THIS op could not start its listener, so it ran
+                    // un-armed (no password sent) — transient; keep the session armed.
+                    b.remote_loading = false;
+                    b.status = "could not arm auto-fill — try again, or press F".to_string();
+                }
                 if b.remote_entries.is_empty() {
                     b.remote_entries = vec![RemoteEntry::parent()];
                     b.remote_sel = 0;
@@ -633,7 +648,7 @@ pub fn apply_sftp_event(b: &mut SftpBrowser, event: SftpEvent) {
                 return;
             }
             b.remote_loading = false;
-            b.status = friendly_sftp_error(&msg);
+            b.status = friendly_sftp_error(&msg, auth_failure);
             // `navigate_remote` cleared the old entries before this (failed) listing,
             // so reseed the synthetic `..` row — otherwise the pane is empty and a
             // user can't select a row to go back up (Backspace still works too).
@@ -646,10 +661,12 @@ pub fn apply_sftp_event(b: &mut SftpBrowser, event: SftpEvent) {
 }
 
 /// Map a raw sftp error to a more actionable message where we can recognise it.
-fn friendly_sftp_error(msg: &str) -> String {
+/// `auth_failure` is precomputed by `run_op` over the FULL stderr; the host-key
+/// arm stays first and keys on `msg`.
+fn friendly_sftp_error(msg: &str, auth_failure: bool) -> String {
     if msg.contains("Host key verification failed") {
         "host key not trusted — connect once (Enter/F) to accept it, then browse".to_string()
-    } else if crate::os::sftp::is_auth_failure(msg) {
+    } else if auth_failure {
         "auth failed — press F to open an SFTP session (stored password auto-fills)".to_string()
     } else {
         msg.to_string()
@@ -1567,6 +1584,8 @@ mod tests {
             SftpEvent::Failed {
                 path: Some("/old".to_string()),
                 msg: "boom".to_string(),
+                auth_failure: false,
+                served: false,
             },
         );
         assert!(b.status.is_empty());
@@ -1576,6 +1595,8 @@ mod tests {
             SftpEvent::Failed {
                 path: Some("/now".to_string()),
                 msg: "boom".to_string(),
+                auth_failure: false,
+                served: false,
             },
         );
         assert_eq!(b.status, "boom");
@@ -1585,6 +1606,8 @@ mod tests {
             SftpEvent::Failed {
                 path: Some("/now".to_string()),
                 msg: "Host key verification failed.".to_string(),
+                auth_failure: false,
+                served: false,
             },
         );
         assert!(b.status.contains("connect once"));
@@ -1602,6 +1625,8 @@ mod tests {
             SftpEvent::Failed {
                 path: Some("/now".to_string()),
                 msg: "Permission denied".to_string(),
+                auth_failure: false,
+                served: false,
             },
         );
         assert_eq!(b.remote_entries.len(), 1);
@@ -1620,6 +1645,8 @@ mod tests {
             SftpEvent::Failed {
                 path: Some(".".to_string()),
                 msg: "Connection refused".to_string(),
+                auth_failure: false,
+                served: false,
             },
         );
         assert!(!b.remote_loading);
@@ -1660,11 +1687,74 @@ mod tests {
             SftpEvent::Failed {
                 path: Some(".".into()), // initial listing
                 msg: "u@h: Permission denied (publickey,password).".into(),
+                auth_failure: true,
+                served: true,
             },
         );
         // First auth failure on an armed session disarms it (no second bad attempt).
         assert!(!b.session.is_armed());
         assert!(b.status.contains("password"));
+    }
+
+    #[test]
+    fn breaker_served_vs_not_picks_message_and_disarm() {
+        use crate::os::askpass::ResolvedIdentity;
+        use crate::os::sftp::{SftpArm, SftpEvent};
+
+        let make_arm = || SftpArm {
+            identity: ResolvedIdentity {
+                user: "u".into(),
+                host: "h".into(),
+                host_key_alias: None,
+                identity_paths: Vec::new(),
+            },
+            password: None,
+            passphrase: None,
+        };
+        let mut b = SftpBrowser {
+            host: 0,
+            focus: SftpPane::Remote,
+            local_cwd: std::path::PathBuf::from("/"),
+            local_entries: Vec::new(),
+            local_sel: 0,
+            remote_cwd: String::new(),
+            remote_entries: Vec::new(),
+            remote_sel: 0,
+            remote_loading: true,
+            status: String::new(),
+            session: crate::os::sftp::SftpSession::open_no_master("h"),
+        };
+
+        // served=true: the stored password was sent and rejected -> disarm.
+        b.session.set_arm(make_arm());
+        assert!(b.session.is_armed());
+        apply_sftp_event(
+            &mut b,
+            SftpEvent::Failed {
+                path: Some(".".into()),
+                msg: "u@h: Permission denied (publickey,password).".into(),
+                auth_failure: true,
+                served: true,
+            },
+        );
+        assert!(!b.session.is_armed());
+        assert!(b.status.contains("rejected"));
+
+        // served=false: armed but arm_connect failed so the op ran un-armed (no
+        // password sent) -> stay armed, transient message.
+        b.session.set_arm(make_arm());
+        assert!(b.session.is_armed());
+        apply_sftp_event(
+            &mut b,
+            SftpEvent::Failed {
+                path: Some(".".into()),
+                msg: "u@h: Permission denied (publickey,password).".into(),
+                auth_failure: true,
+                served: false,
+            },
+        );
+        assert!(b.session.is_armed());
+        assert!(b.status.contains("could not arm"));
     }
 
     #[test]
@@ -1958,13 +2048,14 @@ mod tests {
 
     #[test]
     fn friendly_sftp_error_steers_on_auth_failure() {
+        // `auth_failure` is precomputed by run_op; pass it through here.
         // Auth failure -> steer to F. Host-key failure keeps the accept-key steer.
-        let s = friendly_sftp_error("u@h: Permission denied (publickey,password).");
+        let s = friendly_sftp_error("u@h: Permission denied (publickey,password).", true);
         assert!(s.contains('F') && s.to_lowercase().contains("password"));
-        let hk = friendly_sftp_error("Host key verification failed.");
+        let hk = friendly_sftp_error("Host key verification failed.", false);
         assert!(hk.contains("host key") && !hk.to_lowercase().contains("stored password"));
         // A directory-ACL denial passes through unchanged (not an auth failure).
-        let acl = friendly_sftp_error("remote open(\"/root/x\"): Permission denied");
+        let acl = friendly_sftp_error("remote open(\"/root/x\"): Permission denied", false);
         assert_eq!(acl, "remote open(\"/root/x\"): Permission denied");
     }
 }

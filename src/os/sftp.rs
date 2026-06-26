@@ -15,7 +15,7 @@
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::JoinHandle;
 
-use crate::os::askpass::{ResolvedIdentity, arm_connect};
+use crate::os::askpass::{Outcome, ResolvedIdentity, arm_connect};
 use crate::os::binaries::tools;
 use crate::os::vault::Secret;
 
@@ -165,7 +165,18 @@ pub enum SftpEvent {
     },
     /// An op failed. `path` is the requested directory (so a stale failure from a
     /// superseded navigation can be ignored); `msg` is a short, user-facing reason.
-    Failed { path: Option<String>, msg: String },
+    Failed {
+        path: Option<String>,
+        msg: String,
+        /// `is_auth_failure` over the FULL stderr (not just the first line), so a
+        /// leading server Banner can't mask the auth-failure verdict.
+        auth_failure: bool,
+        /// The per-op askpass listener actually served the stored password this op
+        /// (`Outcome::Served`). Distinguishes a real password rejection from a
+        /// transient `arm_connect` failure that degraded to an un-armed
+        /// `BatchMode=yes` op.
+        served: bool,
+    },
 }
 
 /// The `sftp` batch script for listing `path`, or `None` if the path can't be
@@ -384,6 +395,8 @@ fn run_op(alias: &str, common_args: &[String], arm: Option<SftpArm>, op: SftpOp)
         return SftpEvent::Failed {
             path: Some(path),
             msg: "unsafe remote path (contains a quote or control character)".to_string(),
+            auth_failure: false,
+            served: false,
         };
     };
     let script = match stage_batch(&batch) {
@@ -392,6 +405,8 @@ fn run_op(alias: &str, common_args: &[String], arm: Option<SftpArm>, op: SftpOp)
             return SftpEvent::Failed {
                 path: Some(path),
                 msg: format!("could not stage command: {e}"),
+                auth_failure: false,
+                served: false,
             };
         }
     };
@@ -412,6 +427,13 @@ fn run_op(alias: &str, common_args: &[String], arm: Option<SftpArm>, op: SftpOp)
 
     let mut args: Vec<String> = common_args.to_vec();
     args.extend(batchmode_args(armed).iter().map(|s| s.to_string()));
+    // Read-only connection options (they do not affect auth) so a disappeared /
+    // black-holed host fails fast instead of wedging the remote pane (and, on
+    // Windows where SftpSession has no Drop, leaking the hung op's listener +
+    // un-zeroized secret). Applied to ALL browse ops, armed and un-armed.
+    args.extend(["-o".to_string(), "ConnectTimeout=8".to_string()]);
+    args.extend(["-o".to_string(), "ServerAliveInterval=5".to_string()]);
+    args.extend(["-o".to_string(), "ServerAliveCountMax=2".to_string()]);
     args.push("-b".to_string());
     args.push(script.display().to_string());
     args.push("--".to_string());
@@ -422,10 +444,11 @@ fn run_op(alias: &str, common_args: &[String], arm: Option<SftpArm>, op: SftpOp)
         .envs(env.iter().map(|(k, v)| (k, v)))
         .output();
 
-    // Tear the per-op listener down (zeroize) regardless of outcome.
-    if let Some(l) = listener {
-        let _ = l.stop_and_join();
-    }
+    // Tear the per-op listener down (zeroize) regardless of outcome, capturing its
+    // Outcome so we can tell a real password rejection (Served) from a transient
+    // arm failure that ran un-armed.
+    let outcome = listener.map(|l| l.stop_and_join());
+    let served = matches!(outcome, Some(Outcome::Served { .. }));
 
     match output {
         Ok(o) if o.status.success() => {
@@ -441,13 +464,20 @@ fn run_op(alias: &str, common_args: &[String], arm: Option<SftpArm>, op: SftpOp)
                 entries: parse_ls_l(&stdout),
             }
         }
-        Ok(o) => SftpEvent::Failed {
-            path: Some(path),
-            msg: first_error_line(&o.stderr, &o.stdout),
-        },
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            SftpEvent::Failed {
+                path: Some(path),
+                msg: first_error_line(&o.stderr, &o.stdout),
+                auth_failure: is_auth_failure(&stderr), // FULL stderr, not first line
+                served,
+            }
+        }
         Err(e) => SftpEvent::Failed {
             path: Some(path),
             msg: e.to_string(),
+            auth_failure: false,
+            served, // false on a spawn error
         },
     }
 }
@@ -815,6 +845,16 @@ srwxr-xr-x    1 user  group      0 Jan 15 10:30 sock";
         // Negative: a server banner that merely contains the substring before success.
         assert!(!is_auth_failure(
             "Notice: 'Permission denied (' is logged for audits"
+        ));
+    }
+
+    #[test]
+    fn is_auth_failure_sees_past_a_leading_banner() {
+        // The full-stderr classification defeats banner-masking: a leading server
+        // Banner can't hide a LATER auth-failure line (the breaker is fed this, not
+        // just first_error_line).
+        assert!(is_auth_failure(
+            "************ AUTHORIZED USE ONLY ************\nWelcome banner line 2\nuser@host: Permission denied (publickey,password)."
         ));
     }
 }
