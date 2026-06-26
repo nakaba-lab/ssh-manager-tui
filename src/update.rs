@@ -1863,7 +1863,7 @@ fn open_sftp_browser(app: &mut App, host: usize) {
     if let Some(h) = app.hosts.get(host)
         && let Some(arm) = compute_sftp_arm(app, h, &alias)
     {
-        session.set_arm(arm);
+        session.arm(arm);
     }
     session.request(SftpOp::List(".".to_string()));
     app.sftp_browser = Some(SftpBrowser {
@@ -3402,7 +3402,7 @@ mod tests {
             status: String::new(),
             session: crate::os::sftp::SftpSession::open_no_master("h"),
         };
-        b.session.set_arm(SftpArm {
+        b.session.arm(SftpArm {
             identity: ResolvedIdentity {
                 user: "u".into(),
                 host: "h".into(),
@@ -3434,5 +3434,55 @@ mod tests {
             "entries must not be cleared while armed op is in flight"
         );
         assert_eq!(b.remote_entries[0].name, "file.txt");
+    }
+
+    #[test]
+    fn armed_session_request_listing_drops_while_in_flight() {
+        use crate::app::SftpPane;
+        use crate::os::askpass::ResolvedIdentity;
+        use crate::os::sftp::SftpArm;
+        // Mirror `armed_session_drops_navigation_while_op_in_flight` but call
+        // `request_remote_listing` directly (the serialization guard is shared).
+        let mut b = SftpBrowser {
+            host: 0,
+            focus: SftpPane::Remote,
+            local_cwd: std::path::PathBuf::from("/"),
+            local_entries: Vec::new(),
+            local_sel: 0,
+            remote_cwd: "/x".to_string(),
+            remote_entries: Vec::new(),
+            remote_sel: 0,
+            remote_loading: true, // simulate an op already in flight
+            status: "loading…".to_string(),
+            session: crate::os::sftp::SftpSession::open_no_master("h"),
+        };
+        b.session.arm(SftpArm {
+            identity: ResolvedIdentity {
+                user: "u".into(),
+                host: "h".into(),
+                host_key_alias: None,
+                identity_paths: Vec::new(),
+            },
+            password: None,
+            passphrase: None,
+        });
+
+        // request_remote_listing must be a no-op: armed + in-flight guard fires.
+        request_remote_listing(&mut b, "/x".to_string());
+
+        // State is entirely unchanged: session still armed, loading still true,
+        // status still shows the original message (no second "loading…" dispatch).
+        assert!(
+            b.session.is_armed(),
+            "session must remain armed after dropped dispatch"
+        );
+        assert!(
+            b.remote_loading,
+            "remote_loading must remain true after dropped dispatch"
+        );
+        assert_eq!(
+            b.status, "loading…",
+            "status must not be reset by a dropped dispatch"
+        );
     }
 }

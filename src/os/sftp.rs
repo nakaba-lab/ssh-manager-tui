@@ -21,8 +21,15 @@ use crate::os::vault::Secret;
 
 /// The per-session arming recipe: the resolved identity to bind to, plus the
 /// vault secrets to release. Each browse op mints its OWN listener from a clone of
-/// this, so the per-connect single-shot is consumed exactly once per op. Dropped
-/// (zeroizing the secrets) when the browser closes or the circuit-breaker trips.
+/// this, so the per-connect single-shot is consumed exactly once per op.
+///
+/// **Bounded residency**: the secrets live for the whole browse session, cloned
+/// per op. This is deliberate — avoiding a per-nav vault re-open — not a leak.
+/// The bound is enforced by zeroize-on-drop (both `Secret` and the listener) and
+/// by the two teardown paths (`idle_autolock` and the circuit-breaker calling
+/// `disarm`) that drop the `SftpArm` promptly when the session should no longer
+/// auto-fill.
+///
 /// `Secret` and `ResolvedIdentity` both derive `Clone`, so the derive suffices.
 #[derive(Clone)]
 pub struct SftpArm {
@@ -200,6 +207,9 @@ pub struct SftpSession {
     common_args: Vec<String>,
     /// When `Some`, ops run armed: `-o BatchMode=no` plus a fresh per-op askpass
     /// listener minted from this recipe (auto-fills the stored password/passphrase).
+    /// **Fail-safe degrade**: if `arm_connect` fails for a given op, that op runs
+    /// `-o BatchMode=yes` instead (keyed on `listener.is_some()` in `run_op`), so
+    /// `BatchMode=no` is only ever emitted alongside a live askpass environment.
     arm: Option<SftpArm>,
     tx: Sender<SftpEvent>,
     rx: Receiver<SftpEvent>,
@@ -286,15 +296,17 @@ impl SftpSession {
         Vec::new()
     }
 
-    /// Arm this session: subsequent ops run with `-o BatchMode=no` + a fresh
-    /// per-op askpass listener built from `arm`.
-    pub fn set_arm(&mut self, arm: SftpArm) {
+    /// Arm this session: subsequent ops request a fresh per-op askpass listener
+    /// and, when that listener is successfully started, run with `-o BatchMode=no`.
+    /// If `arm_connect` fails for an individual op it degrades to `BatchMode=yes`
+    /// (no password sent) — see the `arm` field doc for the full fail-safe story.
+    pub fn arm(&mut self, arm: SftpArm) {
         self.arm = Some(arm);
     }
 
-    /// Disable arming (circuit-breaker / teardown): drops + zeroizes the secrets
+    /// Disarm (circuit-breaker / teardown): drops + zeroizes the held secrets
     /// and reverts subsequent ops to `BatchMode=yes`.
-    pub fn disable_arm(&mut self) {
+    pub fn disarm(&mut self) {
         self.arm = None;
     }
 
@@ -484,16 +496,24 @@ fn run_op(alias: &str, common_args: &[String], arm: Option<SftpArm>, op: SftpOp)
 
 /// True iff `stderr` reports an OpenSSH **authentication** failure (vs a
 /// directory-ACL denial, a host-key/KEX failure, or an arbitrary banner). Scans
-/// every line so a leading server banner can neither mask the result nor forge a
-/// false positive. A line must, after trimming, BE an auth-failure form: the
-/// `<user>@<host>: Permission denied (<method-list>).` exhaustion message (the
-/// `": Permission denied ("` infix demands the `user@host:` prefix AND the
-/// parenthesized method list), `Permission denied, please try again.` (the
-/// per-attempt password-reject message — the FIRST stderr line of an armed
-/// wrong-password op, which `apply_sftp_event` classifies via `first_error_line`),
-/// `Authentication failed…`, or `Too many authentication failures`. A bare
-/// directory `Permission denied` (no `(method)`) and a host-key failure are
+/// the FULL stderr so a leading server banner cannot mask a later auth-failure
+/// line. The recognized forms are:
+///
+/// - `<user>@<host>: Permission denied (<method-list>).` — the exhaustion message
+///   (`contains(": Permission denied (")` plus `ends_with(").")`).
+/// - `Permission denied, please try again.` — the per-attempt password-reject
+///   message, the FIRST stderr line of an armed wrong-password op (`starts_with`).
+/// - `Authentication failed…` (`starts_with`).
+/// - `Too many authentication failures` (`contains`).
+///
+/// A bare directory `Permission denied` (no `(method)`) and host-key failures are
 /// deliberately negatives.
+///
+/// **False-positive note**: the two `contains`-based clauses key on message shape,
+/// not exact equality, so a crafted server banner line that contains
+/// `": Permission denied ("` or `"Too many authentication failures"` could produce
+/// a false positive. This is fail-safe: a false positive only disarms the session
+/// (no password is re-sent); it never causes the server to authenticate.
 pub fn is_auth_failure(stderr: &str) -> bool {
     stderr.lines().map(str::trim).any(|line| {
         let denied_with_methods = line.contains(": Permission denied (") && line.ends_with(").");

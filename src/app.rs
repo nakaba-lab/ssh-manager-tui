@@ -623,6 +623,7 @@ pub fn apply_sftp_event(b: &mut SftpBrowser, event: SftpEvent) {
             {
                 return;
             }
+            b.remote_loading = false;
             // Circuit-breaker (armed sessions): an auth failure over the FULL stderr
             // (carried as `auth_failure`, so a leading server Banner can't mask it).
             // `served` distinguishes a real password rejection from a transient
@@ -631,24 +632,17 @@ pub fn apply_sftp_event(b: &mut SftpBrowser, event: SftpEvent) {
                 if served {
                     // The stored password was sent and rejected -> disarm so it is
                     // not re-sent on the next navigation (bounds lockout exposure).
-                    b.session.disable_arm();
-                    b.remote_loading = false;
+                    b.session.disarm();
                     b.status =
                         "stored password rejected — re-check the vault, or press F".to_string();
                 } else {
                     // Armed session but THIS op could not start its listener, so it ran
                     // un-armed (no password sent) — transient; keep the session armed.
-                    b.remote_loading = false;
                     b.status = "could not arm auto-fill — try again, or press F".to_string();
                 }
-                if b.remote_entries.is_empty() {
-                    b.remote_entries = vec![RemoteEntry::parent()];
-                    b.remote_sel = 0;
-                }
-                return;
+            } else {
+                b.status = friendly_sftp_error(&msg, auth_failure);
             }
-            b.remote_loading = false;
-            b.status = friendly_sftp_error(&msg, auth_failure);
             // `navigate_remote` cleared the old entries before this (failed) listing,
             // so reseed the synthetic `..` row — otherwise the pane is empty and a
             // user can't select a row to go back up (Backspace still works too).
@@ -1189,7 +1183,7 @@ impl App {
             // A locked vault must not keep auto-filling an already-open browser:
             // disarm its session (drops + zeroizes the held SftpArm secrets).
             if let Some(b) = self.sftp_browser.as_mut() {
-                b.session.disable_arm();
+                b.session.disarm();
             }
             // Bounce off any vault screen to the safe list view. `Screen::VaultUnlock`
             // is intentionally NOT matched: it is only reachable while the vault is
@@ -1671,7 +1665,7 @@ mod tests {
             status: String::new(),
             session: crate::os::sftp::SftpSession::open_no_master("h"),
         };
-        b.session.set_arm(SftpArm {
+        b.session.arm(SftpArm {
             identity: ResolvedIdentity {
                 user: "u".into(),
                 host: "h".into(),
@@ -1726,7 +1720,7 @@ mod tests {
         };
 
         // served=true: the stored password was sent and rejected -> disarm.
-        b.session.set_arm(make_arm());
+        b.session.arm(make_arm());
         assert!(b.session.is_armed());
         apply_sftp_event(
             &mut b,
@@ -1742,7 +1736,7 @@ mod tests {
 
         // served=false: armed but arm_connect failed so the op ran un-armed (no
         // password sent) -> stay armed, transient message.
-        b.session.set_arm(make_arm());
+        b.session.arm(make_arm());
         assert!(b.session.is_armed());
         apply_sftp_event(
             &mut b,
