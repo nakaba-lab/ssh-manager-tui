@@ -1721,22 +1721,21 @@ fn arm_sftp_secrets(
     let Ok(rc) = resolve_config_with_options(&[], alias) else {
         return (None, Vec::new());
     };
-    // Decide which kinds to arm: passphrase always; password only when the gate
-    // below allows it.
-    let arm_password = should_arm_sftp_password(
-        candidacy.password,
+    // Blanket gates at connect_plan parity (GAP 1/2): never arm EITHER kind for a
+    // proxied or not-yet-trusted host.
+    let is_proxied = host.is_proxied() || rc.proxy_jump.is_some() || rc.proxy_command.is_some();
+    let is_known = tofu_lookup_key(&rc).is_some_and(|k| is_host_known(&k, &known_hosts_files(&rc)));
+    let Some(kinds) = sftp_arm_kinds(
+        candidacy,
         app.password_autofill_enabled,
         app.confirmed_password_targets
             .contains(&resolved_target(&rc)),
         crate::os::askpass::ssh_kbdint_prefix_supported(),
-    );
-    let kinds = MatchedKinds {
-        password: arm_password,
-        passphrase: candidacy.passphrase,
-    };
-    if !kinds.any() {
+        is_proxied,
+        is_known,
+    ) else {
         return (None, Vec::new());
-    }
+    };
     let (password, passphrase) = gather_secrets(app, host, kinds);
     if password.is_none() && passphrase.is_none() {
         return (None, Vec::new());
@@ -1746,6 +1745,36 @@ fn arm_sftp_secrets(
         Ok((listener, env)) => (Some(listener), env),
         Err(_) => (None, Vec::new()),
     }
+}
+
+/// The SFTP-transfer/browser arming decision, at full parity with `connect_plan`.
+/// Returns the kinds to arm, or `None` to arm nothing. The two blanket gates are
+/// load-bearing for BOTH kinds: a proxied or not-yet-trusted host arms neither the
+/// server password NOR the local passphrase (arming sets `SSH_ASKPASS_REQUIRE=force`,
+/// which would intercept the host-key prompt). Pure, so it is unit-tested against the
+/// same truth table as `connect_plan`.
+fn sftp_arm_kinds(
+    candidacy: MatchedKinds,
+    autofill_enabled: bool,
+    target_consented: bool,
+    kbdint_supported: bool,
+    is_proxied: bool,
+    is_known: bool,
+) -> Option<MatchedKinds> {
+    if is_proxied || !is_known {
+        return None;
+    }
+    let password = should_arm_sftp_password(
+        candidacy.password,
+        autofill_enabled,
+        target_consented,
+        kbdint_supported,
+    );
+    let kinds = MatchedKinds {
+        password,
+        passphrase: candidacy.passphrase,
+    };
+    kinds.any().then_some(kinds)
 }
 
 /// Whether an inline SFTP transfer may auto-fill the server **password**. A
@@ -3239,5 +3268,52 @@ mod tests {
         // 255 -> error toast, clean exit -> no toast.
         assert!(connect_toast("ssh", "h", Some(255), &Outcome::TimedOut).is_some_and(|(_, e)| e));
         assert_eq!(connect_toast("ssh", "h", Some(0), &Outcome::TimedOut), None);
+    }
+
+    #[test]
+    fn sftp_arm_kinds_matches_connect_plan_blanket_gates() {
+        use crate::os::vault::MatchedKinds;
+        let both = MatchedKinds {
+            password: true,
+            passphrase: true,
+        };
+        let pp_only = MatchedKinds {
+            password: false,
+            passphrase: true,
+        };
+
+        // Known, non-proxied, consented, autofill on, kbdint ok -> arm both.
+        assert_eq!(
+            sftp_arm_kinds(both, true, true, true, false, true),
+            Some(MatchedKinds {
+                password: true,
+                passphrase: true
+            })
+        );
+        // PROXIED -> arm NOTHING, even the local passphrase (connect_plan parity).
+        assert_eq!(sftp_arm_kinds(both, true, true, true, true, true), None);
+        assert_eq!(sftp_arm_kinds(pp_only, true, true, true, true, true), None);
+        // NOT KNOWN (TOFU) -> arm NOTHING, even the passphrase.
+        assert_eq!(sftp_arm_kinds(both, true, true, true, false, false), None);
+        assert_eq!(
+            sftp_arm_kinds(pp_only, true, true, true, false, false),
+            None
+        );
+        // Known + non-proxied but password un-consented -> passphrase only.
+        assert_eq!(
+            sftp_arm_kinds(both, true, false, true, false, true),
+            Some(MatchedKinds {
+                password: false,
+                passphrase: true
+            })
+        );
+        // Autofill off -> password masked, passphrase still arms.
+        assert_eq!(
+            sftp_arm_kinds(both, false, true, true, false, true),
+            Some(MatchedKinds {
+                password: false,
+                passphrase: true
+            })
+        );
     }
 }
