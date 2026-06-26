@@ -1695,66 +1695,12 @@ fn execute_sftp_transfer(
     Ok(())
 }
 
-/// Arm a connect-time askpass listener for an inline SFTP transfer. The host's
-/// stored *passphrase* (local key decryption) is always safe to auto-fill; the
-/// *password* (server-facing) is armed only when its resolved `<user@host>` is
-/// already session-consented (the same `confirmed_password_targets` gate the
-/// connect path uses) and auto-fill is enabled — so a both-secret host works
-/// without a manual prompt while an un-consented password is never released.
-/// Returns `(None, empty)` when there's nothing to arm or the alias won't resolve.
-fn arm_sftp_secrets(
-    app: &App,
-    host: &HostView,
-    alias: &str,
-) -> (
-    Option<AskpassListener>,
-    Vec<(std::ffi::OsString, std::ffi::OsString)>,
-) {
-    let Some(candidacy) = app.vault_secret_kinds(host) else {
-        return (None, Vec::new());
-    };
-    // A `Match exec` predicate anywhere would make `ssh -G` execute it — skip the
-    // resolve (and arming) and let sftp prompt, mirroring connect dispatch.
-    if has_match_exec(&app.config.render()) {
-        return (None, Vec::new());
-    }
-    let Ok(rc) = resolve_config_with_options(&[], alias) else {
-        return (None, Vec::new());
-    };
-    // Blanket gates at connect_plan parity (GAP 1/2): never arm EITHER kind for a
-    // proxied or not-yet-trusted host.
-    let is_proxied = host.is_proxied() || rc.proxy_jump.is_some() || rc.proxy_command.is_some();
-    let is_known = tofu_lookup_key(&rc).is_some_and(|k| is_host_known(&k, &known_hosts_files(&rc)));
-    let Some(kinds) = sftp_arm_kinds(
-        candidacy,
-        app.password_autofill_enabled,
-        app.confirmed_password_targets
-            .contains(&resolved_target(&rc)),
-        crate::os::askpass::ssh_kbdint_prefix_supported(),
-        is_proxied,
-        is_known,
-    ) else {
-        return (None, Vec::new());
-    };
-    let (password, passphrase) = gather_secrets(app, host, kinds);
-    if password.is_none() && passphrase.is_none() {
-        return (None, Vec::new());
-    }
-    let identity = resolved_identity(&rc, alias, &os_tokens());
-    match arm_connect(identity, password, passphrase) {
-        Ok((listener, env)) => (Some(listener), env),
-        Err(_) => (None, Vec::new()),
-    }
-}
-
-/// Build the per-session SFTP browse arming recipe for `host`, or `None` when the
-/// host is not a full auto-fill candidate. Same gate truth as the connect path
-/// (via `sftp_arm_kinds`), plus the System32-ssh requirement (never arm against
-/// the Git/MSYS `[PATH ssh]` build, whose force/console handling differs).
-fn compute_sftp_arm(app: &App, host: &HostView, alias: &str) -> Option<crate::os::sftp::SftpArm> {
-    if !crate::os::binaries::tools().is_system32 {
-        return None;
-    }
+/// The shared SFTP arming recipe: the connect_plan-parity gate decision plus the
+/// gathered vault secrets and resolved identity, or `None` when the host is not an
+/// auto-fill candidate. Both arming entry points (the inline transfer and the
+/// browser) build on this so their gates can never diverge again (GAP 1/2). Does
+/// NOT gate on System32-ssh — `compute_sftp_arm` adds that as an explicit wrapper.
+fn sftp_arm_recipe(app: &App, host: &HostView, alias: &str) -> Option<crate::os::sftp::SftpArm> {
     let candidacy = app.vault_secret_kinds(host)?;
     if has_match_exec(&app.config.render()) {
         return None;
@@ -1781,6 +1727,45 @@ fn compute_sftp_arm(app: &App, host: &HostView, alias: &str) -> Option<crate::os
         password,
         passphrase,
     })
+}
+
+/// Arm a connect-time askpass listener for an inline SFTP transfer. The host's
+/// stored *passphrase* (local key decryption) is always safe to auto-fill; the
+/// *password* (server-facing) is armed only when its resolved `<user@host>` is
+/// already session-consented (the same `confirmed_password_targets` gate the
+/// connect path uses) and auto-fill is enabled — so a both-secret host works
+/// without a manual prompt while an un-consented password is never released.
+/// Returns `(None, empty)` when there's nothing to arm or the alias won't resolve.
+/// Delegates gate logic to `sftp_arm_recipe` (no System32 requirement here).
+fn arm_sftp_secrets(
+    app: &App,
+    host: &HostView,
+    alias: &str,
+) -> (
+    Option<AskpassListener>,
+    Vec<(std::ffi::OsString, std::ffi::OsString)>,
+) {
+    let Some(a) = sftp_arm_recipe(app, host, alias) else {
+        return (None, Vec::new());
+    };
+    match arm_connect(a.identity, a.password, a.passphrase) {
+        Ok((listener, env)) => (Some(listener), env),
+        Err(_) => (None, Vec::new()),
+    }
+}
+
+/// Build the per-session SFTP browse arming recipe for `host`, or `None` when the
+/// host is not a full auto-fill candidate. Same gate truth as the connect path
+/// (via `sftp_arm_kinds`), plus the System32-ssh requirement (never arm against
+/// the Git/MSYS `[PATH ssh]` build, whose force/console handling differs).
+/// Delegates shared gate logic to `sftp_arm_recipe`.
+fn compute_sftp_arm(app: &App, host: &HostView, alias: &str) -> Option<crate::os::sftp::SftpArm> {
+    // Never arm against the Git/MSYS [PATH ssh] fallback build (its force/console
+    // handling differs); only the System32 OpenSSH client is trusted for auto-fill.
+    if !crate::os::binaries::tools().is_system32 {
+        return None;
+    }
+    sftp_arm_recipe(app, host, alias)
 }
 
 /// The SFTP-transfer/browser arming decision, at full parity with `connect_plan`.
