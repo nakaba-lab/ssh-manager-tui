@@ -3467,11 +3467,24 @@ mod tests {
             passphrase: None,
         });
 
+        assert_eq!(
+            b.session.pending_ops(),
+            0,
+            "precondition: no op dispatched yet"
+        );
+
         // request_remote_listing must be a no-op: armed + in-flight guard fires.
         request_remote_listing(&mut b, "/x".to_string());
 
-        // State is entirely unchanged: session still armed, loading still true,
-        // status still shows the original message (no second "loading…" dispatch).
+        // The discriminating assertion: NO worker op was dispatched. This fails if
+        // the guard is deleted (request would spawn a worker), unlike a status check
+        // — request_remote_listing sets status to "loading…" itself, so a status
+        // assertion passes whether or not the guard fired (tautological).
+        assert_eq!(
+            b.session.pending_ops(),
+            0,
+            "armed + in-flight guard must drop the dispatch (no worker spawned)"
+        );
         assert!(
             b.session.is_armed(),
             "session must remain armed after dropped dispatch"
@@ -3479,10 +3492,6 @@ mod tests {
         assert!(
             b.remote_loading,
             "remote_loading must remain true after dropped dispatch"
-        );
-        assert_eq!(
-            b.status, "loading…",
-            "status must not be reset by a dropped dispatch"
         );
     }
 }

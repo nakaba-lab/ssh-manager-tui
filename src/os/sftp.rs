@@ -314,6 +314,14 @@ impl SftpSession {
         self.arm.is_some()
     }
 
+    /// Number of dispatched op worker threads tracked so far — lets a test observe
+    /// whether a dispatch actually happened (vs was dropped by the serialization
+    /// guard) rather than only inspecting status strings.
+    #[cfg(test)]
+    pub fn pending_ops(&self) -> usize {
+        self.handles.len()
+    }
+
     /// Dispatch `op` to a worker thread; its [`SftpEvent`] arrives via [`drain`].
     pub fn request(&mut self, op: SftpOp) {
         let alias = self.alias.clone();
