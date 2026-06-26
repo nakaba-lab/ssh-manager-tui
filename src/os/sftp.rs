@@ -397,21 +397,25 @@ fn run_op(alias: &str, common_args: &[String], arm: Option<SftpArm>, op: SftpOp)
     };
     let _cleanup = BatchCleanup(script.clone());
 
-    let armed = arm.is_some();
+    // Arm a fresh per-op listener FIRST so the BatchMode choice can key on whether
+    // the askpass env is actually present: arming sets the password single-shot
+    // (consumed once per op == one ssh connect; the listener zeroizes on
+    // stop_and_join). If arming FAILS we must NOT pass BatchMode=no with no env —
+    // on Windows that invites a CONIN$ console prompt that corrupts the TUI — so we
+    // degrade to a plain BatchMode=yes op.
+    let listener_env = arm.and_then(|a| arm_connect(a.identity, a.password, a.passphrase).ok());
+    let (listener, env) = match listener_env {
+        Some((l, env)) => (Some(l), env),
+        None => (None, Vec::new()),
+    };
+    let armed = listener.is_some();
+
     let mut args: Vec<String> = common_args.to_vec();
     args.extend(batchmode_args(armed).iter().map(|s| s.to_string()));
     args.push("-b".to_string());
     args.push(script.display().to_string());
     args.push("--".to_string());
     args.push(alias.to_string());
-
-    // Arm a fresh per-op listener so the password single-shot is consumed once per
-    // op (one op == one ssh connect). The listener zeroizes on stop_and_join.
-    let listener_env = arm.and_then(|a| arm_connect(a.identity, a.password, a.passphrase).ok());
-    let (listener, env) = match listener_env {
-        Some((l, env)) => (Some(l), env),
-        None => (None, Vec::new()),
-    };
 
     let output = std::process::Command::new(tools().sftp.as_path())
         .args(&args)

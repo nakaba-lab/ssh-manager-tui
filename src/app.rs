@@ -1169,6 +1169,11 @@ impl App {
             // (both Drop-zeroize when replaced), so a lock leaves nothing behind.
             self.vault_entry = VaultEntryForm::default();
             self.vault_unlock = VaultUnlock::default();
+            // A locked vault must not keep auto-filling an already-open browser:
+            // disarm its session (drops + zeroizes the held SftpArm secrets).
+            if let Some(b) = self.sftp_browser.as_mut() {
+                b.session.disable_arm();
+            }
             // Bounce off any vault screen to the safe list view. `Screen::VaultUnlock`
             // is intentionally NOT matched: it is only reachable while the vault is
             // locked (see `open_vault`), so the `vault.is_some()` guard above already
