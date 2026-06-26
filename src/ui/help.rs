@@ -91,6 +91,24 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(theme::FAINT),
             )));
         }
+        Screen::SftpBrowser => {
+            lines.push(section("SFTP browser (local | remote)"));
+            lines.push(key("Tab", "switch focused pane"));
+            lines.push(key("j / k, ↑ / ↓", "move selection"));
+            lines.push(key("Enter", "open a directory, or transfer the file"));
+            lines.push(key("Backspace", "go up one directory"));
+            lines.push(key("r", "refresh the focused pane"));
+            lines.push(key("Esc", "close the browser"));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  Enter on a file downloads (remote pane) or uploads (local pane)",
+                Style::default().fg(theme::FAINT),
+            )));
+            lines.push(Line::from(Span::styled(
+                "  it to the other pane's directory, inline (sftp shows progress).",
+                Style::default().fg(theme::FAINT),
+            )));
+        }
         _ => {
             lines.push(section("Host list"));
             lines.push(key("j / k, ↑ / ↓", "move selection"));

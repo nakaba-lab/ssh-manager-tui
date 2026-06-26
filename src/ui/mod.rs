@@ -194,20 +194,17 @@ fn draw_footer(f: &mut Frame, app: &App, base: &Screen, area: Rect) {
             ("?", "help"),
             ("q", "quit"),
         ]),
+        // Kept to a single 80-col line: the most-used keys plus the `o` action
+        // menu and `?` help, which surface everything else (new-tab, overrides,
+        // sort, keys, passwords, SFTP actions, …).
         (Screen::List, _) => widgets::footer_hints(&[
             ("j/k", "move"),
             ("/", "search"),
             ("Enter", "connect"),
-            ("t", "new-tab"),
+            ("o", "menu"),
+            ("a", "add"),
             ("F", "sftp"),
             ("b", "browse"),
-            ("O", "overrides"),
-            ("e", "edit"),
-            ("a", "add"),
-            ("d", "del"),
-            ("s", "sort"),
-            ("K", "keys"),
-            ("P", "passwords"),
             ("?", "help"),
         ]),
         (Screen::Edit { .. }, a) if a.form.mode == crate::app::FormMode::Editing => {
@@ -271,7 +268,8 @@ fn draw_footer(f: &mut Frame, app: &App, base: &Screen, area: Rect) {
             ("Enter", "open/transfer"),
             ("Bksp", "up"),
             ("r", "refresh"),
-            ("q", "quit"),
+            ("?", "help"),
+            ("Esc", "back"),
         ]),
         _ => widgets::footer_hints(&[("?", "help"), ("q", "quit")]),
     };

@@ -518,7 +518,12 @@ pub fn read_local_dir(path: &std::path::Path) -> Vec<LocalEntry> {
         .flatten()
         .map(|e| LocalEntry {
             name: e.file_name().to_string_lossy().into_owned(),
-            is_dir: e.file_type().map(|t| t.is_dir()).unwrap_or(false),
+            // `metadata` follows symlinks, so a symlink-to-directory counts as a
+            // directory (you can descend into it); `file_type` would not, which
+            // would wrongly route Enter on it to a file transfer.
+            is_dir: std::fs::metadata(e.path())
+                .map(|m| m.is_dir())
+                .unwrap_or(false),
         })
         .collect();
     entries.sort_by(|a, b| {
@@ -557,6 +562,65 @@ pub struct SftpBrowser {
     /// Last status / error line shown in the browser footer area.
     pub status: String,
     pub session: SftpSession,
+}
+
+/// Apply one drained [`SftpEvent`] to the browser state. Pure (no I/O), so the
+/// stale-listing / unresolved-home / stale-failure handling is unit-testable
+/// without a live session.
+pub fn apply_sftp_event(b: &mut SftpBrowser, event: SftpEvent) {
+    match event {
+        SftpEvent::Listing { path, cwd, entries } => {
+            let is_initial = b.remote_cwd.is_empty() && path == ".";
+            if is_initial {
+                match cwd {
+                    Some(home) => b.remote_cwd = home,
+                    None => {
+                        // Without the absolute home, navigation would build wrong
+                        // paths from an empty cwd — refuse to apply and prompt retry.
+                        b.remote_loading = false;
+                        b.status = "could not resolve remote home — press r to retry".to_string();
+                        return;
+                    }
+                }
+            } else if path != b.remote_cwd {
+                // A stale listing for a directory we've navigated away from.
+                return;
+            }
+            let mut sorted = entries;
+            sorted.sort_by(|a, z| {
+                z.is_dir
+                    .cmp(&a.is_dir)
+                    .then_with(|| a.name.to_lowercase().cmp(&z.name.to_lowercase()))
+            });
+            let mut list = vec![RemoteEntry::parent()];
+            list.extend(sorted);
+            b.remote_entries = list;
+            b.remote_sel = b.remote_sel.min(b.remote_entries.len().saturating_sub(1));
+            b.remote_loading = false;
+            b.status.clear();
+        }
+        SftpEvent::Failed { path, msg } => {
+            // Ignore a failure from a superseded navigation (its path is no longer
+            // the one we're showing); the current op's result is still pending.
+            if let Some(p) = &path
+                && !b.remote_cwd.is_empty()
+                && *p != b.remote_cwd
+            {
+                return;
+            }
+            b.remote_loading = false;
+            b.status = friendly_sftp_error(&msg);
+        }
+    }
+}
+
+/// Map a raw sftp error to a more actionable message where we can recognise it.
+fn friendly_sftp_error(msg: &str) -> String {
+    if msg.contains("Host key verification failed") {
+        "host key not trusted — connect once (Enter/F) to accept it, then browse".to_string()
+    } else {
+        msg.to_string()
+    }
 }
 
 pub struct App {
@@ -1038,39 +1102,7 @@ impl App {
             return false;
         }
         for event in events {
-            match event {
-                SftpEvent::Listing { path, cwd, entries } => {
-                    // Resolve the initial "." listing to its absolute home; ignore
-                    // any stale listing that isn't the directory we're now showing.
-                    let is_initial = b.remote_cwd.is_empty() && path == ".";
-                    if is_initial {
-                        if let Some(home) = cwd {
-                            b.remote_cwd = home;
-                        }
-                    } else if path != b.remote_cwd {
-                        continue;
-                    }
-                    let mut sorted = entries;
-                    sorted.sort_by(|a, z| {
-                        z.is_dir
-                            .cmp(&a.is_dir)
-                            .then_with(|| a.name.to_lowercase().cmp(&z.name.to_lowercase()))
-                    });
-                    let mut list = vec![RemoteEntry::parent()];
-                    list.extend(sorted);
-                    b.remote_entries = list;
-                    b.remote_sel = b.remote_sel.min(b.remote_entries.len().saturating_sub(1));
-                    b.remote_loading = false;
-                    b.status.clear();
-                }
-                SftpEvent::Done { op } => {
-                    b.status = format!("{op} ok");
-                }
-                SftpEvent::Failed { op, msg } => {
-                    b.remote_loading = false;
-                    b.status = format!("{op} failed: {msg}");
-                }
-            }
+            apply_sftp_event(b, event);
         }
         true
     }
@@ -1408,6 +1440,130 @@ fn mask_password_kinds(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_browser() -> SftpBrowser {
+        SftpBrowser {
+            host: 0,
+            focus: SftpPane::Remote,
+            local_cwd: std::path::PathBuf::from("/tmp"),
+            local_entries: Vec::new(),
+            local_sel: 0,
+            remote_cwd: String::new(),
+            remote_entries: Vec::new(),
+            remote_sel: 0,
+            remote_loading: true,
+            status: String::new(),
+            session: SftpSession::open("test-host"),
+        }
+    }
+
+    fn rentry(name: &str, is_dir: bool) -> RemoteEntry {
+        RemoteEntry {
+            name: name.to_string(),
+            is_dir,
+            is_link: false,
+            size: 0,
+        }
+    }
+
+    #[test]
+    fn apply_initial_listing_resolves_home_sorts_and_prepends_parent() {
+        let mut b = test_browser();
+        let entries = vec![rentry("b.txt", false), rentry("adir", true)];
+        apply_sftp_event(
+            &mut b,
+            SftpEvent::Listing {
+                path: ".".to_string(),
+                cwd: Some("/home/me".to_string()),
+                entries,
+            },
+        );
+        assert_eq!(b.remote_cwd, "/home/me");
+        assert!(!b.remote_loading);
+        // ".." first, then directories before files.
+        let names: Vec<&str> = b.remote_entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["..", "adir", "b.txt"]);
+    }
+
+    #[test]
+    fn apply_stale_listing_is_ignored() {
+        let mut b = test_browser();
+        b.remote_cwd = "/home/me".to_string();
+        b.remote_entries = vec![RemoteEntry::parent()];
+        apply_sftp_event(
+            &mut b,
+            SftpEvent::Listing {
+                path: "/somewhere/else".to_string(),
+                cwd: None,
+                entries: vec![rentry("x", false)],
+            },
+        );
+        assert_eq!(b.remote_entries.len(), 1); // unchanged
+    }
+
+    #[test]
+    fn apply_initial_listing_without_home_sets_error_status() {
+        let mut b = test_browser();
+        apply_sftp_event(
+            &mut b,
+            SftpEvent::Listing {
+                path: ".".to_string(),
+                cwd: None,
+                entries: vec![],
+            },
+        );
+        assert!(b.remote_cwd.is_empty());
+        assert!(!b.remote_loading);
+        assert!(b.status.contains("could not resolve"));
+    }
+
+    #[test]
+    fn apply_failed_is_gated_by_path_and_friendlier() {
+        let mut b = test_browser();
+        b.remote_cwd = "/now".to_string();
+        // A failure for a directory we've navigated away from is ignored.
+        apply_sftp_event(
+            &mut b,
+            SftpEvent::Failed {
+                path: Some("/old".to_string()),
+                msg: "boom".to_string(),
+            },
+        );
+        assert!(b.status.is_empty());
+        // A failure for the current directory is shown.
+        apply_sftp_event(
+            &mut b,
+            SftpEvent::Failed {
+                path: Some("/now".to_string()),
+                msg: "boom".to_string(),
+            },
+        );
+        assert_eq!(b.status, "boom");
+        // A host-key error is mapped to an actionable hint.
+        apply_sftp_event(
+            &mut b,
+            SftpEvent::Failed {
+                path: Some("/now".to_string()),
+                msg: "Host key verification failed.".to_string(),
+            },
+        );
+        assert!(b.status.contains("connect once"));
+    }
+
+    #[test]
+    fn read_local_dir_sorts_dirs_first_and_prepends_parent() {
+        let base = std::env::temp_dir().join(format!("sshm-rld-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("zdir")).unwrap();
+        std::fs::create_dir_all(base.join("Adir")).unwrap();
+        std::fs::write(base.join("m.txt"), b"x").unwrap();
+        let entries = read_local_dir(&base);
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        // ".." first (base has a parent), then dirs case-insensitive alpha, then file.
+        assert_eq!(names, vec!["..", "Adir", "zdir", "m.txt"]);
+        assert!(entries[1].is_dir && entries[2].is_dir && !entries[3].is_dir);
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn mask_password_kinds_applies_opt_in() {

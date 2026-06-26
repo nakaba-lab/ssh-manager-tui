@@ -34,7 +34,7 @@ use crate::os::known_hosts::remove_entry;
 use crate::os::resolve::{
     ResolvedConfig, has_match_exec, is_host_known, resolve_config_with_options, tofu_lookup_key,
 };
-use crate::os::sftp::{SftpOp, SftpSession, batch_path_ok, remote_join, remote_parent};
+use crate::os::sftp::{SftpOp, SftpSession, remote_join, remote_parent, sftp_quote, stage_batch};
 use crate::os::ssh_dir;
 use crate::os::vault::{
     self, MatchedKinds, Secret, SecretKind, Vault, VaultEntry, match_vault_kinds,
@@ -1636,16 +1636,17 @@ fn submit_sftp_transfer(app: &mut App, terminal: &mut DefaultTerminal) -> Result
         app.toast("both a local and a remote path are required", true);
         return Ok(());
     }
-    // sftp's batch parser has no backslash escape for a literal double-quote, so a
-    // value containing one can't be quoted unambiguously — refuse rather than build
-    // a malformed command (mirrors the config writer's refusal stance).
-    if local.contains('"') || remote.contains('"') {
-        app.toast("paths must not contain a double-quote (\") character", true);
+    // sftp's batch parser has no escape for a literal `"` and a control character
+    // (e.g. a newline) would corrupt the single-line command — refuse rather than
+    // build a malformed/ambiguous command (mirrors the config writer's stance).
+    let Some(batch) = sftp_batch_line(direction, &local, &remote) else {
+        app.toast(
+            "paths must not contain a double-quote or control character",
+            true,
+        );
         return Ok(());
-    }
-
-    let batch = sftp_batch_line(direction, &local, &remote);
-    let temp = match write_sftp_batch(&batch) {
+    };
+    let temp = match stage_batch(&batch) {
         Ok(p) => p,
         Err(e) => {
             app.toast(format!("could not stage transfer: {e}"), true);
@@ -1664,10 +1665,9 @@ fn submit_sftp_transfer(app: &mut App, terminal: &mut DefaultTerminal) -> Result
 
 /// Run a one-shot `sftp -b` transfer inline (suspend/restore the TUI, exactly
 /// like an inline connect, so sftp's own progress meter is visible). A stored
-/// *passphrase* (local key decryption) is auto-filled via the same askpass
-/// listener connect uses; a stored *password* is not auto-filled here — sftp
-/// prompts for it on the inherited TTY and the user types it (no hang, since the
-/// transfer is inline).
+/// *passphrase* always auto-fills; a stored *password* auto-fills only when its
+/// resolved target was already consented this session (same gate as connect) —
+/// otherwise sftp prompts for it on the inherited TTY.
 fn execute_sftp_transfer(
     app: &mut App,
     terminal: &mut DefaultTerminal,
@@ -1675,7 +1675,8 @@ fn execute_sftp_transfer(
     alias: &str,
     args: &[String],
 ) -> Result<()> {
-    let (listener, env) = arm_sftp_passphrase(app, host, alias);
+    let label = Protocol::Sftp.label();
+    let (listener, env) = arm_sftp_secrets(app, host, alias);
     app.record_connect(host.alias());
     suspend_tui(terminal)?;
     let status = run_inline(Protocol::Sftp.binary(), args, &env);
@@ -1684,9 +1685,9 @@ fn execute_sftp_transfer(
     // on the next tick (#14).
     app.last_activity = Instant::now();
     let toast = match (status, listener) {
-        (Ok(s), Some(l)) => connect_toast("sftp", alias, s.code(), &l.stop_and_join()),
-        (Ok(s), None) => describe_exit("sftp", &s),
-        (Err(e), _) => Some((format!("failed to launch sftp: {e}"), true)),
+        (Ok(s), Some(l)) => connect_toast(label, alias, s.code(), &l.stop_and_join()),
+        (Ok(s), None) => describe_exit(label, &s),
+        (Err(e), _) => Some((format!("failed to launch {label}: {e}"), true)),
     };
     if let Some((msg, is_err)) = toast {
         app.toast(msg, is_err);
@@ -1694,11 +1695,14 @@ fn execute_sftp_transfer(
     Ok(())
 }
 
-/// Arm a connect-time askpass listener serving ONLY the host's stored passphrase
-/// (local key decryption — safe to auto-fill without the server-facing password
-/// consent gate). Returns `(None, empty)` when there is nothing to arm or the
-/// alias can't be resolved, in which case sftp simply prompts on the TTY.
-fn arm_sftp_passphrase(
+/// Arm a connect-time askpass listener for an inline SFTP transfer. The host's
+/// stored *passphrase* (local key decryption) is always safe to auto-fill; the
+/// *password* (server-facing) is armed only when its resolved `<user@host>` is
+/// already session-consented (the same `confirmed_password_targets` gate the
+/// connect path uses) and auto-fill is enabled — so a both-secret host works
+/// without a manual prompt while an un-consented password is never released.
+/// Returns `(None, empty)` when there's nothing to arm or the alias won't resolve.
+fn arm_sftp_secrets(
     app: &App,
     host: &HostView,
     alias: &str,
@@ -1706,15 +1710,7 @@ fn arm_sftp_passphrase(
     Option<AskpassListener>,
     Vec<(std::ffi::OsString, std::ffi::OsString)>,
 ) {
-    if !app.vault_secret_kinds(host).is_some_and(|k| k.passphrase) {
-        return (None, Vec::new());
-    }
-    let kinds = MatchedKinds {
-        password: false,
-        passphrase: true,
-    };
-    let (_password, passphrase) = gather_secrets(app, host, kinds);
-    let Some(passphrase) = passphrase else {
+    let Some(candidacy) = app.vault_secret_kinds(host) else {
         return (None, Vec::new());
     };
     // A `Match exec` predicate anywhere would make `ssh -G` execute it — skip the
@@ -1725,44 +1721,41 @@ fn arm_sftp_passphrase(
     let Ok(rc) = resolve_config_with_options(&[], alias) else {
         return (None, Vec::new());
     };
+    // Decide which kinds to arm: passphrase always; password only when consented,
+    // enabled, and the client can isolate keyboard-interactive (#6).
+    let password = candidacy.password
+        && app.password_autofill_enabled
+        && app
+            .confirmed_password_targets
+            .contains(&resolved_target(&rc))
+        && crate::os::askpass::ssh_kbdint_prefix_supported();
+    let kinds = MatchedKinds {
+        password,
+        passphrase: candidacy.passphrase,
+    };
+    if !kinds.any() {
+        return (None, Vec::new());
+    }
+    let (password, passphrase) = gather_secrets(app, host, kinds);
+    if password.is_none() && passphrase.is_none() {
+        return (None, Vec::new());
+    }
     let identity = resolved_identity(&rc, alias, &os_tokens());
-    match arm_connect(identity, None, Some(passphrase)) {
+    match arm_connect(identity, password, passphrase) {
         Ok((listener, env)) => (Some(listener), env),
         Err(_) => (None, Vec::new()),
     }
 }
 
-/// Build the single `sftp -b` batch command for a transfer. `get` pulls
-/// remote→local; `put` pushes local→remote. Each path is quoted independently;
-/// the trailing newline terminates the batch line.
-fn sftp_batch_line(direction: SftpDirection, local: &str, remote: &str) -> String {
-    match direction {
-        SftpDirection::Get => {
-            format!(
-                "get {} {}\n",
-                quote_sftp_path(remote),
-                quote_sftp_path(local)
-            )
-        }
-        SftpDirection::Put => {
-            format!(
-                "put {} {}\n",
-                quote_sftp_path(local),
-                quote_sftp_path(remote)
-            )
-        }
-    }
-}
-
-/// Quote a path for an `sftp` batch command: wrap in double quotes when it
-/// contains whitespace. A literal `"` is rejected upstream, so a bare wrap is
-/// unambiguous. Backslashes are left intact (Windows local paths round-trip).
-fn quote_sftp_path(p: &str) -> String {
-    if p.chars().any(char::is_whitespace) {
-        format!("\"{p}\"")
-    } else {
-        p.to_string()
-    }
+/// Build the single `sftp -b` batch command for a transfer, or `None` if either
+/// path can't be expressed safely (see [`sftp_quote`]). `get` pulls remote→local;
+/// `put` pushes local→remote. Each path is quoted independently.
+fn sftp_batch_line(direction: SftpDirection, local: &str, remote: &str) -> Option<String> {
+    let (local, remote) = (sftp_quote(local)?, sftp_quote(remote)?);
+    Some(match direction {
+        SftpDirection::Get => format!("get {remote} {local}\n"),
+        SftpDirection::Put => format!("put {local} {remote}\n"),
+    })
 }
 
 /// A temp-file guard: removes the staged batch file on drop so it never lingers,
@@ -1775,20 +1768,6 @@ impl Drop for TempCleanup {
     }
 }
 
-/// Stage an `sftp -b` batch script in a private temp file and return its path
-/// (`0o600` on unix; Windows inherits the temp directory's ACL). One transfer
-/// runs at a time (inline), so a per-process filename never collides.
-fn write_sftp_batch(contents: &str) -> std::io::Result<std::path::PathBuf> {
-    let path = std::env::temp_dir().join(format!("sshm-sftp-{}.txt", std::process::id()));
-    std::fs::write(&path, contents)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    }
-    Ok(path)
-}
-
 // ---------------------------------------------------------------------------
 // Dual-pane SFTP browser (Phase 3, M3.3)
 // ---------------------------------------------------------------------------
@@ -1799,6 +1778,15 @@ fn open_sftp_browser(app: &mut App, host: usize) {
     let Some(alias) = app.hosts.get(host).map(|h| h.alias().to_string()) else {
         return;
     };
+    // Defense in depth (CWE-88), mirroring connect_by_alias: an empty or '-'-leading
+    // config-controlled alias is flag-smuggling bait and not a usable destination.
+    if alias.is_empty() || alias.starts_with('-') {
+        app.toast(
+            format!("refusing to browse: unsafe host alias '{alias}'"),
+            true,
+        );
+        return;
+    }
     let local_cwd = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
     let local_entries = read_local_dir(&local_cwd);
     let mut session = SftpSession::open(&alias);
@@ -1821,15 +1809,17 @@ fn open_sftp_browser(app: &mut App, host: usize) {
 
 /// Route a keypress in the dual-pane browser. Tab switches panes; j/k move; Enter
 /// descends a directory or transfers a file (download from remote / upload from
-/// local); Backspace goes up; `r` refreshes; Esc/`q` closes (dropping the session,
-/// which tears down the ControlMaster).
+/// local); Backspace goes up; `r` refreshes; `?` opens help; Esc closes (dropping
+/// the session, which tears down the ControlMaster).
 fn handle_sftp_browser(app: &mut App, key: KeyEvent, terminal: &mut DefaultTerminal) -> Result<()> {
     match key.code {
-        KeyCode::Esc | KeyCode::Char('q') => {
+        KeyCode::Esc => {
             // Dropping the browser drops its SftpSession → ControlMaster teardown.
+            // (Esc only — `q` is the app-quit chord on the list and not rebound here.)
             app.sftp_browser = None;
             app.screen = Screen::List;
         }
+        KeyCode::Char('?') => open_overlay(app, Screen::Help),
         KeyCode::Tab => {
             if let Some(b) = app.sftp_browser.as_mut() {
                 b.focus = match b.focus {
@@ -1878,16 +1868,28 @@ fn browser_refresh(app: &mut App) {
             b.local_sel = b.local_sel.min(b.local_entries.len().saturating_sub(1));
         }
         SftpPane::Remote => {
-            let path = if b.remote_cwd.is_empty() {
-                ".".to_string()
-            } else {
-                b.remote_cwd.clone()
-            };
-            b.remote_loading = true;
-            b.status = "loading…".to_string();
-            b.session.request(SftpOp::List(path));
+            let path = current_remote_path(b);
+            request_remote_listing(b, path);
         }
     }
+}
+
+/// The path to (re)list for the remote pane: the resolved cwd, or the `.` home
+/// sentinel while the cwd is still unresolved.
+fn current_remote_path(b: &SftpBrowser) -> String {
+    if b.remote_cwd.is_empty() {
+        ".".to_string()
+    } else {
+        b.remote_cwd.clone()
+    }
+}
+
+/// Mark the remote pane loading and dispatch a listing op for `path`. The single
+/// site that requests a remote listing, so loading/status stay in sync.
+fn request_remote_listing(b: &mut SftpBrowser, path: String) {
+    b.remote_loading = true;
+    b.status = "loading…".to_string();
+    b.session.request(SftpOp::List(path));
 }
 
 /// Go up one directory in the focused pane.
@@ -1912,13 +1914,14 @@ fn browser_up(app: &mut App) {
     }
 }
 
-/// Point the remote pane at `path` and request its listing.
+/// Point the remote pane at `path` and request its listing. Clears the stale
+/// entries first so a keypress arriving before the new listing can't act on a row
+/// from the directory we just left (it would build a path under the new cwd).
 fn navigate_remote(b: &mut SftpBrowser, path: String) {
     b.remote_cwd = path.clone();
     b.remote_sel = 0;
-    b.remote_loading = true;
-    b.status = "loading…".to_string();
-    b.session.request(SftpOp::List(path));
+    b.remote_entries.clear();
+    request_remote_listing(b, path);
 }
 
 /// What activating (Enter) the focused selection does, computed under a short
@@ -1948,7 +1951,12 @@ fn browser_activate(app: &mut App, terminal: &mut DefaultTerminal) -> Result<()>
         SftpPane::Remote => match b.remote_entries.get(b.remote_sel) {
             None => BrowseAct::Noop,
             Some(e) if e.name == ".." => BrowseAct::Up,
-            Some(e) if e.is_dir => BrowseAct::RemoteDescend(remote_join(&b.remote_cwd, &e.name)),
+            // A directory OR a symlink descends: `ls -la <path>` follows a
+            // symlink-to-dir and lists its target. (A symlink-to-file lists just
+            // that one entry — harmless; the user goes back up.)
+            Some(e) if e.is_dir || e.is_link => {
+                BrowseAct::RemoteDescend(remote_join(&b.remote_cwd, &e.name))
+            }
             Some(e) => BrowseAct::Download(e.name.clone()),
         },
     };
@@ -1996,13 +2004,14 @@ fn browser_transfer(
     let local = b.local_cwd.join(name).display().to_string();
     let remote = remote_join(&b.remote_cwd, name);
 
-    if !batch_path_ok(&local) || !batch_path_ok(&remote) {
-        set_browser_status(app, "path contains a \" — cannot transfer".to_string());
+    let Some(batch) = sftp_batch_line(direction, &local, &remote) else {
+        set_browser_status(
+            app,
+            "path contains a \" or control character — cannot transfer".to_string(),
+        );
         return Ok(());
-    }
-
-    let batch = sftp_batch_line(direction, &local, &remote);
-    let temp = match write_sftp_batch(&batch) {
+    };
+    let temp = match stage_batch(&batch) {
         Ok(p) => p,
         Err(e) => {
             set_browser_status(app, format!("could not stage transfer: {e}"));
@@ -2010,7 +2019,14 @@ fn browser_transfer(
         }
     };
     let _cleanup = TempCleanup(temp.clone());
-    let mut args = vec!["-b".to_string(), temp.display().to_string()];
+    // Reuse the browse session's ControlMaster (unix) so this transfer rides the
+    // already-authenticated connection instead of handshaking from scratch.
+    let mut args = b
+        .session
+        .control_args()
+        .into_iter()
+        .chain(["-b".to_string(), temp.display().to_string()])
+        .collect::<Vec<_>>();
     args.extend(Protocol::Sftp.build_args(&host, &ConnectOverrides::default()));
 
     execute_sftp_transfer(app, terminal, &host, &alias, &args)?;
@@ -2020,17 +2036,13 @@ fn browser_transfer(
         SftpDirection::Get => {
             if let Some(b) = app.sftp_browser.as_mut() {
                 b.local_entries = read_local_dir(&b.local_cwd);
+                b.local_sel = b.local_sel.min(b.local_entries.len().saturating_sub(1));
             }
         }
         SftpDirection::Put => {
             if let Some(b) = app.sftp_browser.as_mut() {
-                let path = if b.remote_cwd.is_empty() {
-                    ".".to_string()
-                } else {
-                    b.remote_cwd.clone()
-                };
-                b.remote_loading = true;
-                b.session.request(SftpOp::List(path));
+                let path = current_remote_path(b);
+                request_remote_listing(b, path);
             }
         }
     }
@@ -3075,24 +3087,42 @@ mod tests {
         // get: remote source first, local destination second.
         assert_eq!(
             sftp_batch_line(SftpDirection::Get, "/home/me/out.txt", "/etc/hostname"),
-            "get /etc/hostname /home/me/out.txt\n"
+            Some("get /etc/hostname /home/me/out.txt\n".to_string())
         );
         // put: local source first, remote destination second.
         assert_eq!(
             sftp_batch_line(SftpDirection::Put, "/home/me/in.txt", "/srv/in.txt"),
-            "put /home/me/in.txt /srv/in.txt\n"
+            Some("put /home/me/in.txt /srv/in.txt\n".to_string())
         );
         // Paths with whitespace are wrapped in double quotes; each independently.
         assert_eq!(
             sftp_batch_line(SftpDirection::Put, "C:\\My Docs\\a.txt", "/srv/up load.txt"),
-            "put \"C:\\My Docs\\a.txt\" \"/srv/up load.txt\"\n"
+            Some("put \"C:\\My Docs\\a.txt\" \"/srv/up load.txt\"\n".to_string())
         );
         // A backslash-bearing Windows path with no spaces is left bare (not quoted,
         // not escaped) — it round-trips verbatim.
         assert_eq!(
             sftp_batch_line(SftpDirection::Put, "C:\\id\\a.txt", "/srv/a.txt"),
-            "put C:\\id\\a.txt /srv/a.txt\n"
+            Some("put C:\\id\\a.txt /srv/a.txt\n".to_string())
         );
+        // A path with a quote or control character is refused (no batch built).
+        assert_eq!(
+            sftp_batch_line(SftpDirection::Put, "/home/me/a\nb.txt", "/srv/x"),
+            None
+        );
+        assert_eq!(
+            sftp_batch_line(SftpDirection::Get, "/srv/x", "/home/me/a\"b.txt"),
+            None
+        );
+    }
+
+    #[test]
+    fn clamp_idx_bounds() {
+        assert_eq!(clamp_idx(0, 0, 1), 0); // empty list
+        assert_eq!(clamp_idx(0, 3, -1), 0); // can't go below 0
+        assert_eq!(clamp_idx(2, 3, 1), 2); // can't exceed len-1
+        assert_eq!(clamp_idx(1, 3, 1), 2);
+        assert_eq!(clamp_idx(2, 3, -1), 1);
     }
 
     #[test]

@@ -12,8 +12,6 @@
 //! only be exercised against a real server (the batch-construction helpers it
 //! uses are unit-tested in isolation).
 
-#![allow(dead_code)] // Some browse ops are wired incrementally by the UI layer.
-
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::JoinHandle;
 
@@ -28,9 +26,6 @@ pub struct RemoteEntry {
     pub is_link: bool,
     /// Size in bytes as reported by the listing (0 when unparseable).
     pub size: u64,
-    /// The raw permission/type field verbatim (e.g. `drwxr-xr-x`), kept for
-    /// display without re-deriving it.
-    pub raw_mode: String,
 }
 
 impl RemoteEntry {
@@ -41,7 +36,6 @@ impl RemoteEntry {
             is_dir: true,
             is_link: false,
             size: 0,
-            raw_mode: "d---------".to_string(),
         }
     }
 }
@@ -121,7 +115,6 @@ fn parse_ls_l_line(line: &str) -> Option<RemoteEntry> {
         is_dir,
         is_link,
         size,
-        raw_mode: mode.to_string(),
     })
 }
 
@@ -137,47 +130,13 @@ fn parse_ls_l_line(line: &str) -> Option<RemoteEntry> {
 // fast with a diagnosable error. On unix a per-session ControlMaster multiplexes
 // the ops over one authenticated connection so only the first pays the handshake.
 
-/// A remote operation to run against the session's host.
+/// A remote operation to run against the session's host. Only directory listing
+/// is wired today; mutating ops (mkdir/rename/remove) are added when a UI consumer
+/// exists, to avoid carrying unreachable command-builders.
 #[derive(Debug, Clone)]
 pub enum SftpOp {
-    /// List a directory (`ls -la <path>`) and report its entries.
+    /// List a directory (`ls -la <path>`); `"."` resolves + lists the home dir.
     List(String),
-    /// Create a remote directory (`mkdir <path>`).
-    Mkdir(String),
-    /// Rename/move (`rename <from> <to>`).
-    Rename { from: String, to: String },
-    /// Remove a file (`rm <path>`) or empty directory (`rmdir <path>`).
-    Remove { path: String, is_dir: bool },
-}
-
-impl SftpOp {
-    /// The verb used in result events / toasts.
-    fn verb(&self) -> &'static str {
-        match self {
-            SftpOp::List(_) => "list",
-            SftpOp::Mkdir(_) => "mkdir",
-            SftpOp::Rename { .. } => "rename",
-            SftpOp::Remove { .. } => "remove",
-        }
-    }
-
-    /// The `sftp` batch script (one command + newline) that performs the op.
-    fn batch(&self) -> String {
-        match self {
-            // The initial listing uses "." as a sentinel for "the remote home":
-            // `pwd` resolves its absolute path (so later navigation can build
-            // absolute paths — each op is a fresh connection at the home dir),
-            // then `ls -la` lists it. A concrete (absolute) path just lists it.
-            SftpOp::List(p) if p == "." => "pwd\nls -la\n".to_string(),
-            SftpOp::List(p) => format!("ls -la {}\n", quote(p)),
-            SftpOp::Mkdir(p) => format!("mkdir {}\n", quote(p)),
-            SftpOp::Rename { from, to } => format!("rename {} {}\n", quote(from), quote(to)),
-            SftpOp::Remove { path, is_dir } => {
-                let cmd = if *is_dir { "rmdir" } else { "rm" };
-                format!("{cmd} {}\n", quote(path))
-            }
-        }
-    }
 }
 
 /// The result of a completed background op.
@@ -190,10 +149,20 @@ pub enum SftpEvent {
         cwd: Option<String>,
         entries: Vec<RemoteEntry>,
     },
-    /// A mutating op (mkdir/rename/remove) succeeded.
-    Done { op: &'static str },
-    /// An op failed; `msg` is a short, user-facing reason (first stderr line).
-    Failed { op: &'static str, msg: String },
+    /// An op failed. `path` is the requested directory (so a stale failure from a
+    /// superseded navigation can be ignored); `msg` is a short, user-facing reason.
+    Failed { path: Option<String>, msg: String },
+}
+
+/// The `sftp` batch script for listing `path`, or `None` if the path can't be
+/// expressed safely (see [`sftp_quote`]). `"."` is the home-dir sentinel: `pwd`
+/// resolves its absolute path (so later navigation builds absolute paths — each
+/// op is a fresh connection at the home dir), then `ls -la` lists it.
+fn list_batch(path: &str) -> Option<String> {
+    if path == "." {
+        return Some("pwd\nls -la\n".to_string());
+    }
+    Some(format!("ls -la {}\n", sftp_quote(path)?))
 }
 
 /// A live browse session against one saved host. Holds the channel the UI drains
@@ -207,8 +176,6 @@ pub struct SftpSession {
     tx: Sender<SftpEvent>,
     rx: Receiver<SftpEvent>,
     handles: Vec<JoinHandle<()>>,
-    /// Number of dispatched ops not yet drained — lets the UI show a spinner.
-    inflight: usize,
     #[cfg(unix)]
     control: Option<std::path::PathBuf>,
 }
@@ -220,27 +187,24 @@ impl SftpSession {
         let (tx, rx) = mpsc::channel();
 
         // A private ControlMaster socket under a per-process temp path (unix only;
-        // OpenSSH for Windows has no ControlMaster). One browser is open at a time,
-        // so a per-pid name never collides.
+        // OpenSSH for Windows has no ControlMaster). A random nonce keys it to THIS
+        // session so a stale socket (a failed `-O exit`) can never be reused by a
+        // later browse of a different host.
         #[cfg(unix)]
-        let control =
-            Some(std::env::temp_dir().join(format!("sshm-sftp-cm-{}", std::process::id())));
+        let control = Some(std::env::temp_dir().join(format!(
+            "sshm-sftp-cm-{}-{}",
+            std::process::id(),
+            nonce()
+        )));
 
         // `-o BatchMode=yes` makes every op fail fast instead of hanging on a
         // prompt; on unix the control options multiplex ops over one connection.
         #[cfg(unix)]
         let common_args = {
             let path = control.as_ref().expect("control path set on unix");
-            vec![
-                "-o".to_string(),
-                "BatchMode=yes".to_string(),
-                "-o".to_string(),
-                "ControlMaster=auto".to_string(),
-                "-o".to_string(),
-                format!("ControlPath={}", path.display()),
-                "-o".to_string(),
-                "ControlPersist=30".to_string(),
-            ]
+            let mut a = vec!["-o".to_string(), "BatchMode=yes".to_string()];
+            a.extend(control_options(path));
+            a
         };
         #[cfg(not(unix))]
         let common_args = vec!["-o".to_string(), "BatchMode=yes".to_string()];
@@ -251,15 +215,21 @@ impl SftpSession {
             tx,
             rx,
             handles: Vec::new(),
-            inflight: 0,
             #[cfg(unix)]
             control,
         }
     }
 
-    /// Whether any dispatched op has not yet been drained.
-    pub fn is_busy(&self) -> bool {
-        self.inflight > 0
+    /// The ControlMaster options to reuse this session's shared connection for an
+    /// out-of-band inline transfer (so a browse transfer authenticates at most
+    /// once). Empty on Windows / where there is no master — the transfer then
+    /// authenticates on its own.
+    pub fn control_args(&self) -> Vec<String> {
+        #[cfg(unix)]
+        if let Some(path) = &self.control {
+            return control_options(path);
+        }
+        Vec::new()
     }
 
     /// Dispatch `op` to a worker thread; its [`SftpEvent`] arrives via [`drain`].
@@ -267,7 +237,6 @@ impl SftpSession {
         let alias = self.alias.clone();
         let common = self.common_args.clone();
         let tx = self.tx.clone();
-        self.inflight += 1;
         let handle = std::thread::spawn(move || {
             let event = run_op(&alias, &common, op);
             let _ = tx.send(event);
@@ -275,23 +244,42 @@ impl SftpSession {
         self.handles.push(handle);
     }
 
-    /// Non-blocking drain of completed op events (decrements the in-flight count).
+    /// Non-blocking drain of completed op events. Also reaps finished worker
+    /// threads so `handles` can't grow unbounded over a long browse session.
     pub fn drain(&mut self) -> Vec<SftpEvent> {
         let mut out = Vec::new();
         // Both Empty and Disconnected stop the drain; the tx is held by `self`, so
         // Disconnected only occurs at teardown.
         while let Ok(e) = self.rx.try_recv() {
-            self.inflight = self.inflight.saturating_sub(1);
             out.push(e);
         }
+        self.handles.retain(|h| !h.is_finished());
         out
     }
 }
 
+/// The `-o ControlMaster/ControlPath/ControlPersist` flags for `path` (unix).
+#[cfg(unix)]
+fn control_options(path: &std::path::Path) -> Vec<String> {
+    vec![
+        "-o".to_string(),
+        "ControlMaster=auto".to_string(),
+        "-o".to_string(),
+        format!("ControlPath={}", path.display()),
+        "-o".to_string(),
+        "ControlPersist=30".to_string(),
+    ]
+}
+
 // Only unix has a ControlMaster to tear down; on Windows the session needs no
 // custom Drop (op threads detach, channels close). Gating the whole impl avoids
-// an empty Drop body on Windows. Still-running op threads finish quickly and just
-// fail to send on the closed channel — Drop never blocks the UI.
+// an empty Drop body on Windows.
+//
+// NOTE: in-flight op threads are detached, not killed: each holds a blocking
+// `Command::output()` on a short-lived `sftp -b`. On drop the ControlMaster `-O
+// exit` severs the shared connection, so an outstanding op fails fast and its
+// thread exits promptly; Drop never blocks the UI. A wedged op against a hung
+// network could outlive the browser by the connection's own timeout.
 #[cfg(unix)]
 impl Drop for SftpSession {
     fn drop(&mut self) {
@@ -313,13 +301,18 @@ impl Drop for SftpSession {
 
 /// Run one op to completion in a child `sftp -b` process and map it to an event.
 fn run_op(alias: &str, common_args: &[String], op: SftpOp) -> SftpEvent {
-    let verb = op.verb();
-    let batch = op.batch();
-    let script = match write_batch(&batch) {
+    let SftpOp::List(path) = op;
+    let Some(batch) = list_batch(&path) else {
+        return SftpEvent::Failed {
+            path: Some(path),
+            msg: "unsafe remote path (contains a quote or control character)".to_string(),
+        };
+    };
+    let script = match stage_batch(&batch) {
         Ok(p) => p,
         Err(e) => {
             return SftpEvent::Failed {
-                op: verb,
+                path: Some(path),
                 msg: format!("could not stage command: {e}"),
             };
         }
@@ -337,28 +330,25 @@ fn run_op(alias: &str, common_args: &[String], op: SftpOp) -> SftpEvent {
         .output();
 
     match output {
-        Ok(o) if o.status.success() => match op {
-            SftpOp::List(path) => {
-                let stdout = String::from_utf8_lossy(&o.stdout);
-                let cwd = if path == "." {
-                    parse_pwd(&stdout)
-                } else {
-                    None
-                };
-                SftpEvent::Listing {
-                    path,
-                    cwd,
-                    entries: parse_ls_l(&stdout),
-                }
+        Ok(o) if o.status.success() => {
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            let cwd = if path == "." {
+                parse_pwd(&stdout)
+            } else {
+                None
+            };
+            SftpEvent::Listing {
+                path,
+                cwd,
+                entries: parse_ls_l(&stdout),
             }
-            _ => SftpEvent::Done { op: verb },
-        },
+        }
         Ok(o) => SftpEvent::Failed {
-            op: verb,
+            path: Some(path),
             msg: first_error_line(&o.stderr, &o.stdout),
         },
         Err(e) => SftpEvent::Failed {
-            op: verb,
+            path: Some(path),
             msg: e.to_string(),
         },
     }
@@ -409,21 +399,31 @@ pub fn remote_parent(cwd: &str) -> String {
     }
 }
 
-/// Quote a path for an `sftp` batch command line: double-quote when it contains
-/// whitespace. A literal `"` is refused by the caller (sftp has no escape for
-/// it), so a bare wrap is unambiguous; backslashes are left intact.
-fn quote(p: &str) -> String {
+/// Quote a path for an `sftp` batch command, or `None` if it can't be expressed
+/// safely. sftp's batch parser has no escape for a literal `"`, and a control
+/// character (newline/CR/tab/…) would split or corrupt the single-line command —
+/// reject both, fail-closed (mirrors the config writer's refusal stance). A value
+/// containing whitespace is wrapped in double quotes; backslashes are left intact
+/// so Windows local paths round-trip. This is the single quoting gate for every
+/// path that reaches an `sftp` batch line (browse ops and inline transfers).
+pub fn sftp_quote(p: &str) -> Option<String> {
+    if p.contains('"') || p.chars().any(|c| c.is_control()) {
+        return None;
+    }
     if p.chars().any(char::is_whitespace) {
-        format!("\"{p}\"")
+        Some(format!("\"{p}\""))
     } else {
-        p.to_string()
+        Some(p.to_string())
     }
 }
 
-/// Whether a path is safe to send in an `sftp` batch command — a literal `"`
-/// can't be escaped, so reject it (mirrors the config writer's stance).
-pub fn batch_path_ok(p: &str) -> bool {
-    !p.contains('"')
+/// A short random hex nonce for unique, unguessable temp paths (control socket,
+/// batch files). Falls back to the pid on the (vanishingly rare) RNG failure.
+fn nonce() -> String {
+    match crate::os::vault::random_bytes(8) {
+        Ok(bytes) => bytes.iter().map(|b| format!("{b:02x}")).collect(),
+        Err(_) => format!("{:x}", std::process::id()),
+    }
 }
 
 /// A temp-file guard removing a staged batch script on drop.
@@ -435,19 +435,26 @@ impl Drop for BatchCleanup {
     }
 }
 
-/// Stage an `sftp -b` batch script in a private temp file (`0o600` on unix).
-fn write_batch(contents: &str) -> std::io::Result<std::path::PathBuf> {
-    // A counter keeps concurrent browse ops from colliding on one filename.
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let n = SEQ.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!("sshm-sftp-op-{}-{n}.txt", std::process::id()));
-    std::fs::write(&path, contents)?;
+/// Stage an `sftp -b` batch script in a fresh private temp file and return its
+/// path. A random-nonce name plus `create_new` means a pre-planted symlink or
+/// file can never redirect the write (it fails closed), and the `0o600` mode is
+/// applied atomically at creation on unix (no chmod race).
+pub fn stage_batch(contents: &str) -> std::io::Result<std::path::PathBuf> {
+    use std::io::Write;
+    let path = std::env::temp_dir().join(format!(
+        "sshm-sftp-op-{}-{}.txt",
+        std::process::id(),
+        nonce()
+    ));
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
     }
+    let mut file = opts.open(&path)?;
+    file.write_all(contents.as_bytes())?;
     Ok(path)
 }
 
@@ -456,49 +463,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn op_batch_scripts() {
-        assert_eq!(SftpOp::List("/var/log".into()).batch(), "ls -la /var/log\n");
+    fn list_batch_scripts() {
+        // The "." sentinel resolves the home dir via pwd, then lists it.
+        assert_eq!(list_batch("."), Some("pwd\nls -la\n".to_string()));
+        // A concrete absolute path is just listed (quoted if it has whitespace).
         assert_eq!(
-            SftpOp::Mkdir("/srv/new dir".into()).batch(),
-            "mkdir \"/srv/new dir\"\n"
+            list_batch("/var/log"),
+            Some("ls -la /var/log\n".to_string())
         );
         assert_eq!(
-            SftpOp::Rename {
-                from: "/a".into(),
-                to: "/b c".into()
-            }
-            .batch(),
-            "rename /a \"/b c\"\n"
+            list_batch("/srv/new dir"),
+            Some("ls -la \"/srv/new dir\"\n".to_string())
         );
-        assert_eq!(
-            SftpOp::Remove {
-                path: "/t".into(),
-                is_dir: false
-            }
-            .batch(),
-            "rm /t\n"
-        );
-        assert_eq!(
-            SftpOp::Remove {
-                path: "/d".into(),
-                is_dir: true
-            }
-            .batch(),
-            "rmdir /d\n"
-        );
+        // An unsafe path can't be expressed → no batch (the op fails fast).
+        assert_eq!(list_batch("/bad\"quote"), None);
+        assert_eq!(list_batch("/bad\nnewline"), None);
     }
 
     #[test]
-    fn op_verbs() {
-        assert_eq!(SftpOp::List(String::new()).verb(), "list");
-        assert_eq!(SftpOp::Mkdir(String::new()).verb(), "mkdir");
-    }
-
-    #[test]
-    fn batch_path_rejects_double_quote() {
-        assert!(batch_path_ok("/normal/path"));
-        assert!(batch_path_ok("/with spaces/ok"));
-        assert!(!batch_path_ok("/bad\"quote"));
+    fn sftp_quote_is_fail_closed() {
+        assert_eq!(sftp_quote("/normal/path"), Some("/normal/path".to_string()));
+        // Backslashes are preserved, not escaped (Windows local paths round-trip).
+        assert_eq!(
+            sftp_quote("C:\\id\\a.txt"),
+            Some("C:\\id\\a.txt".to_string())
+        );
+        // Whitespace → wrapped in double quotes.
+        assert_eq!(sftp_quote("/a b/c"), Some("\"/a b/c\"".to_string()));
+        // A literal quote, newline, CR, or other control char is rejected.
+        assert_eq!(sftp_quote("/bad\"q"), None);
+        assert_eq!(sftp_quote("/bad\nq"), None);
+        assert_eq!(sftp_quote("/bad\rq"), None);
+        assert_eq!(sftp_quote("/bad\tq"), None);
     }
 
     #[test]

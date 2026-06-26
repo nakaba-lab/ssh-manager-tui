@@ -234,3 +234,22 @@ fn human_size(bytes: u64) -> String {
         format!("{size:.1}{}", UNITS[unit])
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn human_size_scales_at_1024_boundaries() {
+        assert_eq!(human_size(0), "0B");
+        assert_eq!(human_size(1023), "1023B");
+        assert_eq!(human_size(1024), "1.0K");
+        assert_eq!(human_size(1536), "1.5K");
+        assert_eq!(human_size(1024 * 1024), "1.0M");
+        assert_eq!(human_size(3 * 1024 * 1024 + 512 * 1024), "3.5M");
+        assert_eq!(human_size(1024u64.pow(3)), "1.0G");
+        assert_eq!(human_size(1024u64.pow(4)), "1.0T");
+        // Beyond the last unit it keeps scaling the top unit, never panics.
+        assert_eq!(human_size(5 * 1024u64.pow(4)), "5.0T");
+    }
+}
