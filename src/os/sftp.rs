@@ -386,6 +386,25 @@ fn run_op(alias: &str, common_args: &[String], op: SftpOp) -> SftpEvent {
     }
 }
 
+/// True iff `stderr` reports an OpenSSH **authentication** failure (vs a
+/// directory-ACL denial, a host-key/KEX failure, or an arbitrary banner). Scans
+/// every line so a leading server banner can neither mask the result nor forge a
+/// false positive. A line must, after trimming, BE an auth-failure form: the
+/// `<user>@<host>: Permission denied (<method-list>).` exhaustion message (the
+/// `": Permission denied ("` infix demands the `user@host:` prefix AND the
+/// parenthesized method list), `Authentication failed…`, or `Too many
+/// authentication failures`. A bare directory `Permission denied` (no `(method)`)
+/// and a host-key failure are deliberately negatives.
+#[allow(dead_code)] // wired in by Task 4 (circuit-breaker) and Task 5 (steer)
+pub fn is_auth_failure(stderr: &str) -> bool {
+    stderr.lines().map(str::trim).any(|line| {
+        let denied_with_methods = line.contains(": Permission denied (") && line.ends_with(").");
+        denied_with_methods
+            || line.starts_with("Authentication failed")
+            || line.contains("Too many authentication failures")
+    })
+}
+
 /// The first non-empty stderr line (falling back to stdout, then a generic note)
 /// — a compact, user-facing failure reason.
 fn first_error_line(stderr: &[u8], stdout: &[u8]) -> String {
@@ -687,5 +706,32 @@ srwxr-xr-x    1 user  group      0 Jan 15 10:30 sock";
         assert_eq!(p.name, "..");
         assert!(p.is_dir);
         assert!(!p.is_link);
+    }
+
+    #[test]
+    fn is_auth_failure_classifies_auth_only() {
+        // Positive: the parenthesized method-list form, and the explicit phrases.
+        assert!(is_auth_failure(
+            "user@host: Permission denied (publickey,password)."
+        ));
+        assert!(is_auth_failure("Authentication failed."));
+        assert!(is_auth_failure(
+            "Received disconnect: Too many authentication failures"
+        ));
+        // Positive even when a banner precedes it (scan ALL lines).
+        assert!(is_auth_failure(
+            "WARNING: unauthorized use prohibited\nuser@host: Permission denied (password)."
+        ));
+        // Negative: a directory-ACL denial with NO (method-list).
+        assert!(!is_auth_failure(
+            "remote open(\"/root/x\"): Permission denied"
+        ));
+        // Negative: host-key / KEX phase (must route to the accept-key steer, not here).
+        assert!(!is_auth_failure("Host key verification failed."));
+        assert!(!is_auth_failure("Connection closed by 10.0.0.1 port 22"));
+        // Negative: a server banner that merely contains the substring before success.
+        assert!(!is_auth_failure(
+            "Notice: 'Permission denied (' is logged for audits"
+        ));
     }
 }
