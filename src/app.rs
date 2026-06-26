@@ -649,6 +649,8 @@ pub fn apply_sftp_event(b: &mut SftpBrowser, event: SftpEvent) {
 fn friendly_sftp_error(msg: &str) -> String {
     if msg.contains("Host key verification failed") {
         "host key not trusted — connect once (Enter/F) to accept it, then browse".to_string()
+    } else if crate::os::sftp::is_auth_failure(msg) {
+        "auth failed — press F to open an SFTP session (stored password auto-fills)".to_string()
     } else {
         msg.to_string()
     }
@@ -1947,5 +1949,17 @@ mod tests {
             &HostSpec::Hashed("|1|abc=|def=".into()),
             "web1.example.com"
         ));
+    }
+
+    #[test]
+    fn friendly_sftp_error_steers_on_auth_failure() {
+        // Auth failure -> steer to F. Host-key failure keeps the accept-key steer.
+        let s = friendly_sftp_error("u@h: Permission denied (publickey,password).");
+        assert!(s.contains('F') && s.to_lowercase().contains("password"));
+        let hk = friendly_sftp_error("Host key verification failed.");
+        assert!(hk.contains("host key") && !hk.to_lowercase().contains("stored password"));
+        // A directory-ACL denial passes through unchanged (not an auth failure).
+        let acl = friendly_sftp_error("remote open(\"/root/x\"): Permission denied");
+        assert_eq!(acl, "remote open(\"/root/x\"): Permission denied");
     }
 }

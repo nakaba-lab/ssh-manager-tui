@@ -1923,6 +1923,32 @@ fn handle_sftp_browser(app: &mut App, key: KeyEvent, terminal: &mut DefaultTermi
         KeyCode::Char('r') => browser_refresh(app),
         KeyCode::Backspace => browser_up(app),
         KeyCode::Enter => return browser_activate(app, terminal),
+        KeyCode::Char('F') => {
+            // Resolve the alias from the BROWSED host (b.host), never the list
+            // cursor, so the stored secret is served for the host on screen.
+            let alias = app
+                .sftp_browser
+                .as_ref()
+                .and_then(|b| app.hosts.get(b.host))
+                .map(|h| h.alias().to_string());
+            match alias {
+                Some(alias) => {
+                    app.sftp_browser = None;
+                    app.screen = Screen::List;
+                    return connect_by_alias(
+                        app,
+                        terminal,
+                        &alias,
+                        ConnectMode::Inline,
+                        Protocol::Sftp,
+                        PasswordChoice::Ask,
+                        None,
+                        ConnectOverrides::default(),
+                    );
+                }
+                None => app.toast("host is no longer available", true),
+            }
+        }
         _ => {}
     }
     Ok(())

@@ -98,6 +98,10 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
             lines.push(key("Enter", "open a directory, or transfer the file"));
             lines.push(key("Backspace", "go up one directory"));
             lines.push(key("r", "refresh the focused pane"));
+            lines.push(key(
+                "F",
+                "open an inline SFTP session (auto-fills password)",
+            ));
             lines.push(key("Esc", "close the browser"));
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(

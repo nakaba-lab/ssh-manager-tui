@@ -41,8 +41,8 @@ const SFTP_BROWSER_FOOTER: &[(&str, &str)] = &[
     ("Tab", "pane"),
     ("j/k", "move"),
     ("Enter", "open/xfer"),
+    ("F", "sftp"),
     ("Bksp", "up"),
-    ("r", "refresh"),
     ("?", "help"),
     ("Esc", "back"),
 ];
