@@ -458,13 +458,21 @@ fn run_op(alias: &str, common_args: &[String], arm: Option<SftpArm>, op: SftpOp)
 /// false positive. A line must, after trimming, BE an auth-failure form: the
 /// `<user>@<host>: Permission denied (<method-list>).` exhaustion message (the
 /// `": Permission denied ("` infix demands the `user@host:` prefix AND the
-/// parenthesized method list), `Authentication failed…`, or `Too many
-/// authentication failures`. A bare directory `Permission denied` (no `(method)`)
-/// and a host-key failure are deliberately negatives.
+/// parenthesized method list), `Permission denied, please try again.` (the
+/// per-attempt password-reject message — the FIRST stderr line of an armed
+/// wrong-password op, which `apply_sftp_event` classifies via `first_error_line`),
+/// `Authentication failed…`, or `Too many authentication failures`. A bare
+/// directory `Permission denied` (no `(method)`) and a host-key failure are
+/// deliberately negatives.
 pub fn is_auth_failure(stderr: &str) -> bool {
     stderr.lines().map(str::trim).any(|line| {
         let denied_with_methods = line.contains(": Permission denied (") && line.ends_with(").");
         denied_with_methods
+            // The askpass-served password was rejected by the server. This is the
+            // FIRST stderr line of an armed wrong-password op (the `(method-list)`
+            // exhaustion line comes last), so without this clause the circuit-breaker
+            // would never trip on the real armed-wrong-password case (caught by E2E).
+            || line.starts_with("Permission denied, please try again")
             || line.starts_with("Authentication failed")
             || line.contains("Too many authentication failures")
     })
@@ -789,6 +797,10 @@ srwxr-xr-x    1 user  group      0 Jan 15 10:30 sock";
         assert!(is_auth_failure(
             "Received disconnect: Too many authentication failures"
         ));
+        // Positive: the askpass-served password was rejected — the armed
+        // wrong-password op's FIRST stderr line, which apply_sftp_event classifies
+        // (regression for an E2E-found gap where the breaker never tripped).
+        assert!(is_auth_failure("Permission denied, please try again."));
         // Positive even when a banner precedes it (scan ALL lines).
         assert!(is_auth_failure(
             "WARNING: unauthorized use prohibited\nuser@host: Permission denied (password)."
