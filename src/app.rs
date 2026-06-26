@@ -15,12 +15,13 @@ pub const VAULT_IDLE_LOCK: Duration = Duration::from_secs(15 * 60);
 
 use crate::config::SshConfig;
 use crate::config::model::HostView;
-use crate::os::connect::ConnectOverrides;
+use crate::os::connect::{ConnectOverrides, Protocol};
 use crate::os::history::History;
 use crate::os::keys::KeyInfo;
 use crate::os::known_hosts::{HostSpec, KnownHostEntry};
 use crate::os::liveness::{Liveness, LivenessProbe, ProbeTarget};
 use crate::os::resolve::ResolvedConfig;
+use crate::os::sftp::{RemoteEntry, SftpEvent, SftpSession};
 use crate::os::vault::{MatchedKinds, SecretKind, Vault, match_vault_kinds};
 use crate::os::{self, keys, known_hosts};
 
@@ -138,6 +139,14 @@ pub enum Screen {
     ConnectOverride {
         host: usize,
     },
+    /// Inline SFTP transfer form: collects a direction + local/remote paths for a
+    /// one-shot `sftp -b` transfer. The host index and field values live in
+    /// [`App::sftp_form`]. Submitting suspends the TUI and runs the transfer
+    /// inline, just like an inline connect.
+    SftpTransfer,
+    /// Dual-pane SFTP browser (local | remote). A full base screen, not an
+    /// overlay; all state lives in [`App::sftp_browser`].
+    SftpBrowser,
     /// Password vault: list of stored secrets (login passwords / passphrases).
     Vault,
     /// Master-password prompt modal — unlock an existing vault, or create one.
@@ -155,6 +164,8 @@ pub enum Screen {
     PasswordConfirm {
         alias: String,
         mode: ConnectMode,
+        /// Which client (`ssh` / `sftp`) the resumed connect launches.
+        protocol: Protocol,
         kinds: MatchedKinds,
         target: String,
         /// The `ssh -G` resolution from the first (Ask) pass, cached so the
@@ -444,6 +455,191 @@ impl std::fmt::Debug for VaultEntryForm {
     }
 }
 
+/// Direction of an SFTP transfer relative to the remote host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SftpDirection {
+    /// Download: remote → local (`get`).
+    #[default]
+    Get,
+    /// Upload: local → remote (`put`).
+    Put,
+}
+
+impl SftpDirection {
+    pub fn label(self) -> &'static str {
+        match self {
+            SftpDirection::Get => "Get  (remote → local)",
+            SftpDirection::Put => "Put  (local → remote)",
+        }
+    }
+}
+
+/// Session-only state for the inline SFTP transfer modal. Collects a direction
+/// plus a local and a remote path, then runs a one-shot `sftp -b` transfer
+/// inline (the TUI suspends, exactly like an inline connect). Holds no secret.
+#[derive(Debug, Clone, Default)]
+pub struct SftpForm {
+    /// Index into [`App::hosts`] of the host being transferred to/from.
+    pub host: usize,
+    pub direction: SftpDirection,
+    pub local: String,
+    pub local_cursor: usize,
+    pub remote: String,
+    pub remote_cursor: usize,
+    /// Focused field: 0 = direction, 1 = local path, 2 = remote path.
+    pub field: usize,
+}
+
+/// Number of focusable fields in the SFTP transfer form.
+pub const SFTP_FIELDS: usize = 3;
+
+/// Which pane of the dual-pane SFTP browser has focus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SftpPane {
+    Local,
+    Remote,
+}
+
+/// One entry in the local pane of the SFTP browser.
+#[derive(Debug, Clone)]
+pub struct LocalEntry {
+    pub name: String,
+    pub is_dir: bool,
+}
+
+/// Read a local directory into sorted entries (directories first, then files,
+/// each alphabetical, case-insensitive), prepending a `..` row when `path` has a
+/// parent. Unreadable entries are silently skipped (best-effort, like the rest of
+/// the browser). Never fails — an unreadable directory yields just the `..` row.
+pub fn read_local_dir(path: &std::path::Path) -> Vec<LocalEntry> {
+    let mut entries: Vec<LocalEntry> = std::fs::read_dir(path)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| {
+            // `file_type` is free (from the dir read) for the common case; only a
+            // symlink needs an extra `metadata` stat to follow it, so a
+            // symlink-to-directory counts as a directory (Enter descends into it)
+            // rather than being misrouted to a file transfer. A broken symlink fails
+            // the stat and falls back to "not a directory".
+            let ft = e.file_type().ok();
+            let is_dir = match ft {
+                Some(t) if t.is_symlink() => std::fs::metadata(e.path())
+                    .map(|m| m.is_dir())
+                    .unwrap_or(false),
+                Some(t) => t.is_dir(),
+                None => false,
+            };
+            LocalEntry {
+                name: e.file_name().to_string_lossy().into_owned(),
+                is_dir,
+            }
+        })
+        .collect();
+    entries.sort_by(|a, b| {
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    if path.parent().is_some() {
+        entries.insert(
+            0,
+            LocalEntry {
+                name: "..".to_string(),
+                is_dir: true,
+            },
+        );
+    }
+    entries
+}
+
+/// State for the dual-pane SFTP browser (local | remote). The browse session
+/// runs each remote op as a short-lived background `sftp -b` child; results are
+/// drained per tick by [`App::drain_sftp_browser`]. Held in `App::sftp_browser`
+/// (`None` when not browsing) because it owns a non-clonable [`SftpSession`].
+pub struct SftpBrowser {
+    pub host: usize,
+    pub focus: SftpPane,
+    pub local_cwd: std::path::PathBuf,
+    pub local_entries: Vec<LocalEntry>,
+    pub local_sel: usize,
+    /// Absolute remote directory; empty until the initial `pwd` resolves it.
+    pub remote_cwd: String,
+    pub remote_entries: Vec<RemoteEntry>,
+    pub remote_sel: usize,
+    /// True while a remote listing op is in flight (drives a spinner).
+    pub remote_loading: bool,
+    /// Last status / error line shown in the browser footer area.
+    pub status: String,
+    pub session: SftpSession,
+}
+
+/// Apply one drained [`SftpEvent`] to the browser state. Pure (no I/O), so the
+/// stale-listing / unresolved-home / stale-failure handling is unit-testable
+/// without a live session.
+pub fn apply_sftp_event(b: &mut SftpBrowser, event: SftpEvent) {
+    match event {
+        SftpEvent::Listing { path, cwd, entries } => {
+            let is_initial = b.remote_cwd.is_empty() && path == ".";
+            if is_initial {
+                match cwd {
+                    Some(home) => b.remote_cwd = home,
+                    None => {
+                        // Without the absolute home, navigation would build wrong
+                        // paths from an empty cwd — refuse to apply and prompt retry.
+                        b.remote_loading = false;
+                        b.status = "could not resolve remote home — press r to retry".to_string();
+                        return;
+                    }
+                }
+            } else if path != b.remote_cwd {
+                // A stale listing for a directory we've navigated away from.
+                return;
+            }
+            let mut sorted = entries;
+            sorted.sort_by(|a, z| {
+                z.is_dir
+                    .cmp(&a.is_dir)
+                    .then_with(|| a.name.to_lowercase().cmp(&z.name.to_lowercase()))
+            });
+            let mut list = vec![RemoteEntry::parent()];
+            list.extend(sorted);
+            b.remote_entries = list;
+            b.remote_sel = b.remote_sel.min(b.remote_entries.len().saturating_sub(1));
+            b.remote_loading = false;
+            b.status.clear();
+        }
+        SftpEvent::Failed { path, msg } => {
+            // Ignore a failure from a superseded navigation (its path is no longer
+            // the one we're showing); the current op's result is still pending.
+            if let Some(p) = &path
+                && !b.remote_cwd.is_empty()
+                && *p != b.remote_cwd
+            {
+                return;
+            }
+            b.remote_loading = false;
+            b.status = friendly_sftp_error(&msg);
+            // `navigate_remote` cleared the old entries before this (failed) listing,
+            // so reseed the synthetic `..` row — otherwise the pane is empty and a
+            // user can't select a row to go back up (Backspace still works too).
+            if b.remote_entries.is_empty() {
+                b.remote_entries = vec![RemoteEntry::parent()];
+                b.remote_sel = 0;
+            }
+        }
+    }
+}
+
+/// Map a raw sftp error to a more actionable message where we can recognise it.
+fn friendly_sftp_error(msg: &str) -> String {
+    if msg.contains("Host key verification failed") {
+        "host key not trusted — connect once (Enter/F) to accept it, then browse".to_string()
+    } else {
+        msg.to_string()
+    }
+}
+
 pub struct App {
     pub should_quit: bool,
     pub screen: Screen,
@@ -479,6 +675,12 @@ pub struct App {
 
     // --- connect-time override form ---
     pub override_form: OverrideForm,
+
+    // --- inline SFTP transfer form ---
+    pub sftp_form: SftpForm,
+
+    // --- dual-pane SFTP browser (None when not browsing) ---
+    pub sftp_browser: Option<SftpBrowser>,
 
     // --- S3 keys ---
     pub keys: Vec<KeyInfo>,
@@ -567,6 +769,8 @@ impl App {
             last_sweep: Instant::now(),
             form: EditForm::default(),
             override_form: OverrideForm::default(),
+            sftp_form: SftpForm::default(),
+            sftp_browser: None,
             keys,
             keys_state: ListState::default(),
             key_host_ctx: None,
@@ -902,6 +1106,24 @@ impl App {
         rank_changed
     }
 
+    /// Drain completed SFTP browse-session ops into the browser state (no-op when
+    /// not browsing). Called per tick, like [`drain_liveness`](Self::drain_liveness),
+    /// so the UI thread never blocks on a remote op. Returns true if anything
+    /// changed (so the caller redraws).
+    pub fn drain_sftp_browser(&mut self) -> bool {
+        let Some(b) = self.sftp_browser.as_mut() else {
+            return false;
+        };
+        let events = b.session.drain();
+        if events.is_empty() {
+            return false;
+        }
+        for event in events {
+            apply_sftp_event(b, event);
+        }
+        true
+    }
+
     /// Per-tick housekeeping: expire transient toasts and auto-lock an idle vault.
     /// Returns true if anything changed (so the caller redraws).
     pub fn on_tick(&mut self) -> bool {
@@ -1235,6 +1457,169 @@ fn mask_password_kinds(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_browser() -> SftpBrowser {
+        SftpBrowser {
+            host: 0,
+            focus: SftpPane::Remote,
+            local_cwd: std::path::PathBuf::from("/tmp"),
+            local_entries: Vec::new(),
+            local_sel: 0,
+            remote_cwd: String::new(),
+            remote_entries: Vec::new(),
+            remote_sel: 0,
+            remote_loading: true,
+            status: String::new(),
+            // No ControlMaster, so the session's unix Drop spawns no `ssh -O exit`
+            // and these tests stay genuinely I/O-free.
+            session: SftpSession::open_no_master("test-host"),
+        }
+    }
+
+    fn rentry(name: &str, is_dir: bool) -> RemoteEntry {
+        RemoteEntry {
+            name: name.to_string(),
+            is_dir,
+            is_link: false,
+            size: 0,
+        }
+    }
+
+    #[test]
+    fn apply_initial_listing_resolves_home_sorts_and_prepends_parent() {
+        let mut b = test_browser();
+        let entries = vec![rentry("b.txt", false), rentry("adir", true)];
+        apply_sftp_event(
+            &mut b,
+            SftpEvent::Listing {
+                path: ".".to_string(),
+                cwd: Some("/home/me".to_string()),
+                entries,
+            },
+        );
+        assert_eq!(b.remote_cwd, "/home/me");
+        assert!(!b.remote_loading);
+        // ".." first, then directories before files.
+        let names: Vec<&str> = b.remote_entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["..", "adir", "b.txt"]);
+    }
+
+    #[test]
+    fn apply_stale_listing_is_ignored() {
+        let mut b = test_browser();
+        b.remote_cwd = "/home/me".to_string();
+        b.remote_entries = vec![RemoteEntry::parent()];
+        apply_sftp_event(
+            &mut b,
+            SftpEvent::Listing {
+                path: "/somewhere/else".to_string(),
+                cwd: None,
+                entries: vec![rentry("x", false)],
+            },
+        );
+        assert_eq!(b.remote_entries.len(), 1); // unchanged
+    }
+
+    #[test]
+    fn apply_initial_listing_without_home_sets_error_status() {
+        let mut b = test_browser();
+        apply_sftp_event(
+            &mut b,
+            SftpEvent::Listing {
+                path: ".".to_string(),
+                cwd: None,
+                entries: vec![],
+            },
+        );
+        assert!(b.remote_cwd.is_empty());
+        assert!(!b.remote_loading);
+        assert!(b.status.contains("could not resolve"));
+    }
+
+    #[test]
+    fn apply_failed_is_gated_by_path_and_friendlier() {
+        let mut b = test_browser();
+        b.remote_cwd = "/now".to_string();
+        // A failure for a directory we've navigated away from is ignored.
+        apply_sftp_event(
+            &mut b,
+            SftpEvent::Failed {
+                path: Some("/old".to_string()),
+                msg: "boom".to_string(),
+            },
+        );
+        assert!(b.status.is_empty());
+        // A failure for the current directory is shown.
+        apply_sftp_event(
+            &mut b,
+            SftpEvent::Failed {
+                path: Some("/now".to_string()),
+                msg: "boom".to_string(),
+            },
+        );
+        assert_eq!(b.status, "boom");
+        // A host-key error is mapped to an actionable hint.
+        apply_sftp_event(
+            &mut b,
+            SftpEvent::Failed {
+                path: Some("/now".to_string()),
+                msg: "Host key verification failed.".to_string(),
+            },
+        );
+        assert!(b.status.contains("connect once"));
+    }
+
+    #[test]
+    fn apply_failed_reseeds_parent_row_when_pane_empty() {
+        // navigate_remote clears entries before a listing; if that listing fails,
+        // the pane must still show the `..` row so the user can go back up.
+        let mut b = test_browser();
+        b.remote_cwd = "/now".to_string();
+        b.remote_entries.clear();
+        apply_sftp_event(
+            &mut b,
+            SftpEvent::Failed {
+                path: Some("/now".to_string()),
+                msg: "Permission denied".to_string(),
+            },
+        );
+        assert_eq!(b.remote_entries.len(), 1);
+        assert_eq!(b.remote_entries[0].name, "..");
+        assert!(!b.remote_loading);
+        assert_eq!(b.status, "Permission denied");
+    }
+
+    #[test]
+    fn apply_failed_on_unresolved_home_is_applied() {
+        // The initial '.' failure (remote_cwd still empty) is NOT a stale failure
+        // and must surface, not be skipped by the path gate.
+        let mut b = test_browser();
+        apply_sftp_event(
+            &mut b,
+            SftpEvent::Failed {
+                path: Some(".".to_string()),
+                msg: "Connection refused".to_string(),
+            },
+        );
+        assert!(!b.remote_loading);
+        assert_eq!(b.status, "Connection refused");
+        assert_eq!(b.remote_entries[0].name, "..");
+    }
+
+    #[test]
+    fn read_local_dir_sorts_dirs_first_and_prepends_parent() {
+        let base = std::env::temp_dir().join(format!("sshm-rld-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("zdir")).unwrap();
+        std::fs::create_dir_all(base.join("Adir")).unwrap();
+        std::fs::write(base.join("m.txt"), b"x").unwrap();
+        let entries = read_local_dir(&base);
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        // ".." first (base has a parent), then dirs case-insensitive alpha, then file.
+        assert_eq!(names, vec!["..", "Adir", "zdir", "m.txt"]);
+        assert!(entries[1].is_dir && entries[2].is_dir && !entries[3].is_dir);
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn mask_password_kinds_applies_opt_in() {

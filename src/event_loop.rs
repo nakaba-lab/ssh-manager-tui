@@ -46,6 +46,9 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
                 // so the Status sort re-orders just when its key actually moved.
                 app.resort_after_liveness();
             }
+            // Apply any completed SFTP browse ops so the panes refresh without
+            // blocking the draw (no-op when not browsing).
+            app.drain_sftp_browser();
             update::tick_clipboard(app);
             last_tick = Instant::now();
         }

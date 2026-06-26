@@ -9,6 +9,7 @@ pub mod help;
 pub mod keys;
 pub mod known_hosts;
 pub mod list;
+pub mod sftp;
 pub mod theme;
 pub mod vault;
 pub mod widgets;
@@ -21,6 +22,31 @@ use ratatui::widgets::Paragraph;
 
 use crate::app::{App, GenOrigin, PickOrigin, Screen};
 
+/// Host-list footer hints. Kept to the most-used keys plus the `o` action menu
+/// and `?` help (which surface new-tab, overrides, sort, keys, passwords, the
+/// SFTP actions, …). Must render within 80 columns — see `footers_fit_80_cols`.
+const LIST_FOOTER: &[(&str, &str)] = &[
+    ("j/k", "move"),
+    ("/", "search"),
+    ("Enter", "ssh"),
+    ("o", "menu"),
+    ("a", "add"),
+    ("F", "sftp"),
+    ("b", "browse"),
+    ("?", "help"),
+];
+
+/// SFTP browser footer hints (must render within 80 columns).
+const SFTP_BROWSER_FOOTER: &[(&str, &str)] = &[
+    ("Tab", "pane"),
+    ("j/k", "move"),
+    ("Enter", "open/xfer"),
+    ("Bksp", "up"),
+    ("r", "refresh"),
+    ("?", "help"),
+    ("Esc", "back"),
+];
+
 /// The non-modal screen rendered underneath the current screen (which may be a
 /// modal overlay).
 fn base_screen(app: &App) -> Screen {
@@ -30,6 +56,7 @@ fn base_screen(app: &App) -> Screen {
         | Screen::ActionMenu(_)
         | Screen::VaultUnlock
         | Screen::ConnectOverride { .. }
+        | Screen::SftpTransfer
         | Screen::PasswordConfirm { .. } => app.prev_screen.clone().unwrap_or(Screen::List),
         Screen::PickKey { origin } | Screen::PickJump { origin } => match origin {
             PickOrigin::Edit { editing } => Screen::Edit { editing: *editing },
@@ -64,6 +91,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Screen::KeyManager => keys::draw(f, app, body_a),
         Screen::KnownHosts => known_hosts::draw(f, app, body_a),
         Screen::Vault => vault::draw(f, app, body_a),
+        Screen::SftpBrowser => sftp::draw_browser(f, app, body_a),
         _ => list::draw(f, app, body_a),
     }
     draw_footer(f, app, &base, footer_a);
@@ -83,6 +111,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             list::draw_jump_picker(f, app, &origin, body_a)
         }
         Screen::ConnectOverride { host } => connect_override::draw(f, app, *host, body_a),
+        Screen::SftpTransfer => sftp::draw_transfer(f, app, body_a),
         Screen::VaultUnlock => vault::draw_unlock(f, app, body_a),
         Screen::VaultEntry { .. } => vault::draw_entry(f, app, body_a),
         Screen::PasswordConfirm { target, kinds, .. } => {
@@ -102,6 +131,7 @@ fn draw_title(f: &mut Frame, app: &App, base: &Screen, area: Rect) {
         Screen::KeyManager => "Keys",
         Screen::KnownHosts => "Known hosts",
         Screen::Vault => "Passwords",
+        Screen::SftpBrowser => "SFTP browser",
         _ => "SSH Manager",
     };
     let count = match base {
@@ -168,6 +198,16 @@ fn draw_footer(f: &mut Frame, app: &App, base: &Screen, area: Rect) {
         f.render_widget(Paragraph::new(hints), area);
         return;
     }
+    if matches!(app.screen, Screen::SftpTransfer) {
+        let hints = widgets::footer_hints(&[
+            ("Tab", "field"),
+            ("Space/←→", "direction"),
+            ("^S", "transfer"),
+            ("Esc", "cancel"),
+        ]);
+        f.render_widget(Paragraph::new(hints), area);
+        return;
+    }
     let hints = match (base, app) {
         (Screen::List, a) if a.searching => {
             widgets::footer_hints(&[("type", "filter"), ("Enter", "keep"), ("Esc", "clear")])
@@ -179,20 +219,7 @@ fn draw_footer(f: &mut Frame, app: &App, base: &Screen, area: Rect) {
             ("?", "help"),
             ("q", "quit"),
         ]),
-        (Screen::List, _) => widgets::footer_hints(&[
-            ("j/k", "move"),
-            ("/", "search"),
-            ("Enter", "connect"),
-            ("t", "new-tab"),
-            ("O", "overrides"),
-            ("e", "edit"),
-            ("a", "add"),
-            ("d", "del"),
-            ("s", "sort"),
-            ("K", "keys"),
-            ("P", "passwords"),
-            ("?", "help"),
-        ]),
+        (Screen::List, _) => widgets::footer_hints(LIST_FOOTER),
         (Screen::Edit { .. }, a) if a.form.mode == crate::app::FormMode::Editing => {
             widgets::footer_hints(&[("Enter", "commit"), ("Esc", "cancel field")])
         }
@@ -248,6 +275,7 @@ fn draw_footer(f: &mut Frame, app: &App, base: &Screen, area: Rect) {
             ("L", "lock"),
             ("Esc", "back"),
         ]),
+        (Screen::SftpBrowser, _) => widgets::footer_hints(SFTP_BROWSER_FOOTER),
         _ => widgets::footer_hints(&[("?", "help"), ("q", "quit")]),
     };
     f.render_widget(Paragraph::new(hints), area);
@@ -283,4 +311,26 @@ fn draw_toast(f: &mut Frame, app: &App, area: Rect) {
         height: 1,
     };
     f.render_widget(Paragraph::new(Span::styled(text, style)), toast_area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn footers_fit_80_cols() {
+        // The host-list and SFTP-browser footers render on a single, non-wrapping
+        // line; a >80-col footer silently clips its trailing hints on an 80-column
+        // terminal (the regression this guards against).
+        assert!(
+            widgets::footer_hints(LIST_FOOTER).width() <= 80,
+            "list footer is {} cols",
+            widgets::footer_hints(LIST_FOOTER).width()
+        );
+        assert!(
+            widgets::footer_hints(SFTP_BROWSER_FOOTER).width() <= 80,
+            "sftp browser footer is {} cols",
+            widgets::footer_hints(SFTP_BROWSER_FOOTER).width()
+        );
+    }
 }

@@ -16,21 +16,25 @@ use ratatui::crossterm::terminal::{
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::app::{
-    App, ConfirmAction, ConnectMode, EditForm, FormMode, GenOrigin, ListFocus, PickOrigin, Screen,
-    VaultEntryForm, VaultUnlock, form_from_view, form_idx, override_form_from_host, override_idx,
-    overrides_from_form, view_from_form,
+    App, ConfirmAction, ConnectMode, EditForm, FormMode, GenOrigin, ListFocus, PickOrigin,
+    SFTP_FIELDS, Screen, SftpBrowser, SftpDirection, SftpForm, SftpPane, VaultEntryForm,
+    VaultUnlock, form_from_view, form_idx, override_form_from_host, override_idx,
+    overrides_from_form, read_local_dir, view_from_form,
 };
 use crate::config::model::HostView;
-use crate::os::askpass::{DeclineReason, Outcome, arm_connect, os_tokens, resolved_identity};
+use crate::os::askpass::{
+    AskpassListener, DeclineReason, Outcome, arm_connect, os_tokens, resolved_identity,
+};
 use crate::os::connect::{
-    ConnectOverrides, build_ssh_args, command_line, connect_new_tab, describe_exit,
-    describe_exit_code, resolve_options, run_ssh_inline,
+    ConnectOverrides, Protocol, command_line, connect_new_tab, describe_exit, describe_exit_code,
+    resolve_options, run_inline,
 };
 use crate::os::keys::{generate_key, read_public_key};
 use crate::os::known_hosts::remove_entry;
 use crate::os::resolve::{
     ResolvedConfig, has_match_exec, is_host_known, resolve_config_with_options, tofu_lookup_key,
 };
+use crate::os::sftp::{SftpOp, SftpSession, remote_join, remote_parent, sftp_quote, stage_batch};
 use crate::os::ssh_dir;
 use crate::os::vault::{
     self, MatchedKinds, Secret, SecretKind, Vault, VaultEntry, match_vault_kinds,
@@ -57,16 +61,19 @@ pub fn handle_key(app: &mut App, key: KeyEvent, terminal: &mut DefaultTerminal) 
         Screen::PickKey { origin } => handle_pick_key(app, key, origin),
         Screen::PickJump { origin } => handle_pick_jump(app, key, origin),
         Screen::ConnectOverride { host } => handle_connect_override(app, key, host, terminal)?,
+        Screen::SftpTransfer => handle_sftp_transfer(app, key, terminal)?,
+        Screen::SftpBrowser => handle_sftp_browser(app, key, terminal)?,
         Screen::Vault => handle_vault(app, key),
         Screen::VaultUnlock => handle_vault_unlock(app, key),
         Screen::VaultEntry { editing } => handle_vault_entry(app, key, editing),
         Screen::PasswordConfirm {
             alias,
             mode,
+            protocol,
             rc,
             ov,
             ..
-        } => handle_password_confirm(app, key, alias, mode, rc, *ov, terminal)?,
+        } => handle_password_confirm(app, key, alias, mode, protocol, rc, *ov, terminal)?,
     }
     Ok(())
 }
@@ -76,11 +83,13 @@ pub fn handle_key(app: &mut App, key: KeyEvent, terminal: &mut DefaultTerminal) 
 /// still arms). The cached `rc` from the first pass is handed back so the re-entry
 /// reuses it instead of running `ssh -G` again. Closing the overlay first returns
 /// to the base screen (List) so the inline connect suspends/restores over it.
+#[allow(clippy::too_many_arguments)]
 fn handle_password_confirm(
     app: &mut App,
     key: KeyEvent,
     alias: String,
     mode: ConnectMode,
+    protocol: Protocol,
     rc: Box<ResolvedConfig>,
     ov: ConnectOverrides,
     terminal: &mut DefaultTerminal,
@@ -93,6 +102,7 @@ fn handle_password_confirm(
                 terminal,
                 &alias,
                 mode,
+                protocol,
                 PasswordChoice::Confirmed,
                 Some(*rc),
                 ov,
@@ -105,6 +115,7 @@ fn handle_password_confirm(
                 terminal,
                 &alias,
                 mode,
+                protocol,
                 PasswordChoice::Withheld,
                 Some(*rc),
                 ov,
@@ -260,8 +271,16 @@ fn handle_list(app: &mut App, key: KeyEvent, terminal: &mut DefaultTerminal) -> 
         KeyCode::Char('u') if ctrl => move_selection(app, -5),
         KeyCode::Char('g') => select_index(app, 0),
         KeyCode::Char('G') => select_index(app, app.filtered.len().saturating_sub(1)),
-        KeyCode::Enter => connect_selected(app, terminal, ConnectMode::Inline)?,
-        KeyCode::Char('t') => connect_selected(app, terminal, ConnectMode::NewWtTab)?,
+        KeyCode::Enter => connect_selected(app, terminal, ConnectMode::Inline, Protocol::Ssh)?,
+        KeyCode::Char('t') => {
+            connect_selected(app, terminal, ConnectMode::NewWtTab, Protocol::Ssh)?
+        }
+        KeyCode::Char('F') => connect_selected(app, terminal, ConnectMode::Inline, Protocol::Sftp)?,
+        KeyCode::Char('b') => {
+            if let Some(h) = app.selected_host() {
+                open_sftp_browser(app, h);
+            }
+        }
         KeyCode::Char('O') => {
             if let Some(h) = app.selected_host() {
                 open_connect_override(app, h);
@@ -479,6 +498,7 @@ fn connect_selected(
     app: &mut App,
     terminal: &mut DefaultTerminal,
     mode: ConnectMode,
+    protocol: Protocol,
 ) -> Result<()> {
     let Some(idx) = app.selected_host() else {
         return Ok(());
@@ -489,6 +509,7 @@ fn connect_selected(
         terminal,
         &alias,
         mode,
+        protocol,
         PasswordChoice::Ask,
         None,
         ConnectOverrides::default(),
@@ -503,11 +524,13 @@ fn connect_selected(
 /// `ov` carries any ad-hoc overrides (empty for a plain saved-host connect); its
 /// resolution-relevant flags are also fed to `ssh -G` so the vault gates key off
 /// the *effective* `user@host`, not the saved config.
+#[allow(clippy::too_many_arguments)]
 fn connect_by_alias(
     app: &mut App,
     terminal: &mut DefaultTerminal,
     alias: &str,
     mode: ConnectMode,
+    protocol: Protocol,
     choice: PasswordChoice,
     cached_rc: Option<ResolvedConfig>,
     ov: ConnectOverrides,
@@ -529,7 +552,7 @@ fn connect_by_alias(
         );
         return Ok(());
     }
-    let args = build_ssh_args(&host, &ov);
+    let args = protocol.build_args(&host, &ov);
 
     // v1 auto-fills the inline path only; a mode that won't auto-fill skips the
     // candidacy + resolve machinery entirely (no `ssh -G`, no env).
@@ -538,7 +561,7 @@ fn connect_by_alias(
         ConnectMode::NewWtTab => NEW_TAB_AUTOFILL,
     };
     if !autofill_mode {
-        return connect_plain(app, terminal, &host, &args, mode);
+        return connect_plain(app, terminal, &host, &args, mode, protocol);
     }
 
     // One-time discoverability nudge for a stored password while auto-fill is off
@@ -565,7 +588,7 @@ fn connect_by_alias(
     }
     // No candidate secret → a plain connect (skip `ssh -G` for the common case).
     if candidacy.is_none() {
-        return connect_plain(app, terminal, &host, &args, mode);
+        return connect_plain(app, terminal, &host, &args, mode, protocol);
     }
 
     // Reuse the first-pass resolution if the modal handed it back, so the
@@ -624,7 +647,7 @@ fn connect_by_alias(
             if let Some(m) = msg {
                 app.toast(m, false);
             }
-            connect_plain(app, terminal, &host, &args, mode)
+            connect_plain(app, terminal, &host, &args, mode, protocol)
         }
         ConnectPlan::DeferPasswordConfirm(kinds) => {
             // Show the one-time consent modal; its Enter/Esc re-enters here with
@@ -637,6 +660,7 @@ fn connect_by_alias(
                 Screen::PasswordConfirm {
                     alias: alias.to_string(),
                     mode,
+                    protocol,
                     kinds,
                     target,
                     rc: Box::new(rc),
@@ -648,7 +672,7 @@ fn connect_by_alias(
         ConnectPlan::Arm(kinds) => {
             // `Arm` implies `resolved`, so `rc` is Some; new-tab returned early.
             let rc = rc.expect("Arm implies a resolved config");
-            arm_and_connect_inline(app, terminal, &host, &args, alias, &rc, kinds)
+            arm_and_connect_inline(app, terminal, &host, &args, alias, protocol, &rc, kinds)
         }
     }
 }
@@ -660,27 +684,31 @@ fn connect_plain(
     host: &HostView,
     args: &[String],
     mode: ConnectMode,
+    protocol: Protocol,
 ) -> Result<()> {
     match mode {
         ConnectMode::Inline => {
-            // The inline path commits to launching ssh (it suspends the TUI and
-            // execs), so record before suspending.
+            // The inline path commits to launching the client (it suspends the TUI
+            // and execs), so record before suspending.
             app.record_connect(host.alias());
             suspend_tui(terminal)?;
-            let status = run_ssh_inline(args, &[]);
+            let status = run_inline(protocol.binary(), args, &[]);
             restore_tui(terminal)?;
             // A long inline session (TUI suspended, no keypresses) must not make the
             // next on_tick spuriously idle-auto-lock the vault (#14).
             app.last_activity = std::time::Instant::now();
-            report_plain_exit(app, status);
+            report_plain_exit(app, protocol, status);
         }
-        ConnectMode::NewWtTab => match connect_new_tab(host.alias(), args, &[]) {
+        ConnectMode::NewWtTab => match connect_new_tab(protocol, host.alias(), args, &[]) {
             // Only stamp history once the tab actually spawned — a spawn failure
             // (e.g. wt.exe missing) launched nothing, so it must not count as a
             // connect (it would wrongly float the host up under the Recent sort).
             Ok(()) => {
                 app.record_connect(host.alias());
-                app.toast(format!("opened new tab: ssh {}", host.alias()), false);
+                app.toast(
+                    format!("opened new tab: {} {}", protocol.label(), host.alias()),
+                    false,
+                );
             }
             Err(e) => app.toast(format!("{e}"), true),
         },
@@ -692,19 +720,21 @@ fn connect_plain(
 /// down (zeroizing secrets) and surface the combined exit+outcome toast. The
 /// listener is a scope-guard: its `Drop` stops+joins+zeroizes even on an early
 /// return or panic before `stop_and_join`.
+#[allow(clippy::too_many_arguments)]
 fn arm_and_connect_inline(
     app: &mut App,
     terminal: &mut DefaultTerminal,
     host: &HostView,
     args: &[String],
     alias: &str,
+    protocol: Protocol,
     rc: &ResolvedConfig,
     kinds: MatchedKinds,
 ) -> Result<()> {
     let (password, passphrase) = gather_secrets(app, host, kinds);
     // Nothing actually resolved to a servable secret → just connect plainly.
     if password.is_none() && passphrase.is_none() {
-        return connect_plain(app, terminal, host, args, ConnectMode::Inline);
+        return connect_plain(app, terminal, host, args, ConnectMode::Inline, protocol);
     }
     let identity = resolved_identity(rc, alias, &os_tokens());
 
@@ -712,15 +742,15 @@ fn arm_and_connect_inline(
         Ok((listener, env)) => {
             app.record_connect(host.alias());
             suspend_tui(terminal)?;
-            let status = run_ssh_inline(args, &env);
+            let status = run_inline(protocol.binary(), args, &env);
             restore_tui(terminal)?;
             // See connect_plain: a long session must not trigger a spurious idle
             // auto-lock on the next tick (#14).
             app.last_activity = std::time::Instant::now();
             let outcome = listener.stop_and_join();
             let toast = match status {
-                Ok(s) => connect_toast(alias, s.code(), &outcome),
-                Err(e) => Some((format!("failed to launch ssh: {e}"), true)),
+                Ok(s) => connect_toast(protocol.label(), alias, s.code(), &outcome),
+                Err(e) => Some((format!("failed to launch {}: {e}", protocol.label()), true)),
             };
             if let Some((msg, is_err)) = toast {
                 app.toast(msg, is_err);
@@ -732,7 +762,7 @@ fn arm_and_connect_inline(
                 format!("auto-fill unavailable ({e}); connecting without it"),
                 false,
             );
-            connect_plain(app, terminal, host, args, ConnectMode::Inline)?;
+            connect_plain(app, terminal, host, args, ConnectMode::Inline, protocol)?;
         }
     }
     Ok(())
@@ -811,33 +841,44 @@ fn maybe_password_discoverability(app: &mut App, host: &HostView) {
     }
 }
 
-/// Surface a plain (no auto-fill) inline ssh exit as a toast.
-fn report_plain_exit(app: &mut App, status: std::io::Result<std::process::ExitStatus>) {
+/// Surface a plain (no auto-fill) inline exit as a toast, naming the launched
+/// program (`ssh` / `sftp`).
+fn report_plain_exit(
+    app: &mut App,
+    protocol: Protocol,
+    status: std::io::Result<std::process::ExitStatus>,
+) {
     match status {
         Ok(s) => {
-            if let Some((msg, is_err)) = describe_exit(&s) {
+            if let Some((msg, is_err)) = describe_exit(protocol.label(), &s) {
                 app.toast(msg, is_err);
             }
         }
-        Err(e) => app.toast(format!("failed to launch ssh: {e}"), true),
+        Err(e) => app.toast(format!("failed to launch {}: {e}", protocol.label()), true),
     }
 }
 
-/// The connect-time auto-fill outcome toast for `alias`: combine the ssh exit
+/// The connect-time auto-fill outcome toast for `alias`: combine the client exit
 /// `code` with the listener `outcome`, exhaustively over the reachable outcomes so
-/// a failed connect is diagnosable. `None` = no toast (a clean exit 0 with nothing
-/// notable, e.g. key auth that never prompted).
-fn connect_toast(alias: &str, code: Option<i32>, outcome: &Outcome) -> Option<(String, bool)> {
+/// a failed connect is diagnosable. `prog` names the launched client (`ssh` /
+/// `sftp`). `None` = no toast (a clean exit 0 with nothing notable, e.g. key auth
+/// that never prompted).
+fn connect_toast(
+    prog: &str,
+    alias: &str,
+    code: Option<i32>,
+    outcome: &Outcome,
+) -> Option<(String, bool)> {
     match outcome {
         Outcome::Served { kind } => {
             let k = kind.label().to_ascii_lowercase();
             match code {
                 Some(0) => Some((format!("auto-filled {k} · connected"), false)),
                 Some(255) => Some((
-                    format!("auto-filled {k}, but ssh authentication/connection failed"),
+                    format!("auto-filled {k}, but {prog} authentication/connection failed"),
                     true,
                 )),
-                _ => describe_exit_code(code),
+                _ => describe_exit_code(prog, code),
             }
         }
         Outcome::Declined {
@@ -866,7 +907,7 @@ fn connect_toast(alias: &str, code: Option<i32>, outcome: &Outcome) -> Option<(S
             true,
         )),
         Outcome::Declined { .. } | Outcome::TimedOut | Outcome::NotAttempted => {
-            describe_exit_code(code)
+            describe_exit_code(prog, code)
         }
     }
 }
@@ -1509,6 +1550,547 @@ fn open_connect_override(app: &mut App, host: usize) {
     open_overlay(app, Screen::ConnectOverride { host });
 }
 
+/// Open the inline SFTP transfer form for `host`, seeding the local path with the
+/// user's home directory (a sensible default source/destination).
+fn open_sftp_transfer(app: &mut App, host: usize) {
+    let local = dirs::home_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let local_cursor = local.len();
+    app.sftp_form = SftpForm {
+        host,
+        direction: SftpDirection::Get,
+        local,
+        local_cursor,
+        remote: String::new(),
+        remote_cursor: 0,
+        field: 0,
+    };
+    open_overlay(app, Screen::SftpTransfer);
+}
+
+/// Drive the SFTP transfer form: Tab/↑↓ move fields, Space/←→ flip direction,
+/// typing edits the focused path, Ctrl-S runs the transfer, Esc cancels.
+fn handle_sftp_transfer(
+    app: &mut App,
+    key: KeyEvent,
+    terminal: &mut DefaultTerminal,
+) -> Result<()> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Char('s') if ctrl => return submit_sftp_transfer(app, terminal),
+        KeyCode::Esc => close_overlay(app),
+        KeyCode::Tab | KeyCode::Down => {
+            app.sftp_form.field = (app.sftp_form.field + 1) % SFTP_FIELDS;
+        }
+        KeyCode::BackTab | KeyCode::Up => {
+            app.sftp_form.field = (app.sftp_form.field + SFTP_FIELDS - 1) % SFTP_FIELDS;
+        }
+        _ if app.sftp_form.field == 0 => {
+            // Direction field: Space / ←→ toggle Get↔Put; nothing else applies.
+            if matches!(
+                key.code,
+                KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right
+            ) {
+                app.sftp_form.direction = match app.sftp_form.direction {
+                    SftpDirection::Get => SftpDirection::Put,
+                    SftpDirection::Put => SftpDirection::Get,
+                };
+            }
+        }
+        _ => {
+            // A text path field (1 = local, 2 = remote).
+            let (s, cursor) = if app.sftp_form.field == 1 {
+                (&mut app.sftp_form.local, &mut app.sftp_form.local_cursor)
+            } else {
+                (&mut app.sftp_form.remote, &mut app.sftp_form.remote_cursor)
+            };
+            match key.code {
+                KeyCode::Char(c) if !ctrl => insert_char(s, cursor, c),
+                KeyCode::Backspace => backspace(s, cursor),
+                KeyCode::Delete => delete_forward(s, cursor),
+                KeyCode::Left => *cursor = prev_boundary(s, *cursor),
+                KeyCode::Right => *cursor = next_boundary(s, *cursor),
+                KeyCode::Home => *cursor = 0,
+                KeyCode::End => *cursor = s.len(),
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate the form, stage an `sftp -b` batch file, and run the transfer inline.
+fn submit_sftp_transfer(app: &mut App, terminal: &mut DefaultTerminal) -> Result<()> {
+    let Some(host) = app.hosts.get(app.sftp_form.host).cloned() else {
+        close_overlay(app);
+        app.toast("host is no longer available", true);
+        return Ok(());
+    };
+    let alias = host.alias().to_string();
+    let local = app.sftp_form.local.trim().to_string();
+    let remote = app.sftp_form.remote.trim().to_string();
+    let direction = app.sftp_form.direction;
+
+    if local.is_empty() || remote.is_empty() {
+        app.toast("both a local and a remote path are required", true);
+        return Ok(());
+    }
+    // sftp's batch parser has no escape for a literal `"` and a control character
+    // (e.g. a newline) would corrupt the single-line command — refuse rather than
+    // build a malformed/ambiguous command (mirrors the config writer's stance).
+    let Some(batch) = sftp_batch_line(direction, &local, &remote) else {
+        app.toast(
+            "paths must not contain a double-quote or control character",
+            true,
+        );
+        return Ok(());
+    };
+    let temp = match stage_batch(&batch) {
+        Ok(p) => p,
+        Err(e) => {
+            app.toast(format!("could not stage transfer: {e}"), true);
+            return Ok(());
+        }
+    };
+    // Guard deletes the batch file on every exit path (success, failure, panic).
+    let _cleanup = TempCleanup(temp.clone());
+
+    let mut args = vec!["-b".to_string(), temp.display().to_string()];
+    args.extend(Protocol::Sftp.build_args(&host, &ConnectOverrides::default()));
+
+    close_overlay(app);
+    execute_sftp_transfer(app, terminal, &host, &alias, &args)
+}
+
+/// Run a one-shot `sftp -b` transfer inline (suspend/restore the TUI, exactly
+/// like an inline connect, so sftp's own progress meter is visible). A stored
+/// *passphrase* always auto-fills; a stored *password* auto-fills only when its
+/// resolved target was already consented this session (same gate as connect) —
+/// otherwise sftp prompts for it on the inherited TTY.
+fn execute_sftp_transfer(
+    app: &mut App,
+    terminal: &mut DefaultTerminal,
+    host: &HostView,
+    alias: &str,
+    args: &[String],
+) -> Result<()> {
+    let label = Protocol::Sftp.label();
+    let (listener, env) = arm_sftp_secrets(app, host, alias);
+    app.record_connect(host.alias());
+    suspend_tui(terminal)?;
+    let status = run_inline(Protocol::Sftp.binary(), args, &env);
+    restore_tui(terminal)?;
+    // A long transfer (TUI suspended) must not trigger a spurious idle auto-lock
+    // on the next tick (#14).
+    app.last_activity = Instant::now();
+    let toast = match (status, listener) {
+        (Ok(s), Some(l)) => connect_toast(label, alias, s.code(), &l.stop_and_join()),
+        (Ok(s), None) => describe_exit(label, &s),
+        (Err(e), _) => Some((format!("failed to launch {label}: {e}"), true)),
+    };
+    if let Some((msg, is_err)) = toast {
+        app.toast(msg, is_err);
+    }
+    Ok(())
+}
+
+/// Arm a connect-time askpass listener for an inline SFTP transfer. The host's
+/// stored *passphrase* (local key decryption) is always safe to auto-fill; the
+/// *password* (server-facing) is armed only when its resolved `<user@host>` is
+/// already session-consented (the same `confirmed_password_targets` gate the
+/// connect path uses) and auto-fill is enabled — so a both-secret host works
+/// without a manual prompt while an un-consented password is never released.
+/// Returns `(None, empty)` when there's nothing to arm or the alias won't resolve.
+fn arm_sftp_secrets(
+    app: &App,
+    host: &HostView,
+    alias: &str,
+) -> (
+    Option<AskpassListener>,
+    Vec<(std::ffi::OsString, std::ffi::OsString)>,
+) {
+    let Some(candidacy) = app.vault_secret_kinds(host) else {
+        return (None, Vec::new());
+    };
+    // A `Match exec` predicate anywhere would make `ssh -G` execute it — skip the
+    // resolve (and arming) and let sftp prompt, mirroring connect dispatch.
+    if has_match_exec(&app.config.render()) {
+        return (None, Vec::new());
+    }
+    let Ok(rc) = resolve_config_with_options(&[], alias) else {
+        return (None, Vec::new());
+    };
+    // Decide which kinds to arm: passphrase always; password only when the gate
+    // below allows it.
+    let arm_password = should_arm_sftp_password(
+        candidacy.password,
+        app.password_autofill_enabled,
+        app.confirmed_password_targets
+            .contains(&resolved_target(&rc)),
+        crate::os::askpass::ssh_kbdint_prefix_supported(),
+    );
+    let kinds = MatchedKinds {
+        password: arm_password,
+        passphrase: candidacy.passphrase,
+    };
+    if !kinds.any() {
+        return (None, Vec::new());
+    }
+    let (password, passphrase) = gather_secrets(app, host, kinds);
+    if password.is_none() && passphrase.is_none() {
+        return (None, Vec::new());
+    }
+    let identity = resolved_identity(&rc, alias, &os_tokens());
+    match arm_connect(identity, password, passphrase) {
+        Ok((listener, env)) => (Some(listener), env),
+        Err(_) => (None, Vec::new()),
+    }
+}
+
+/// Whether an inline SFTP transfer may auto-fill the server **password**. A
+/// server-facing secret is only released when it is a candidate, the session has
+/// auto-fill enabled, the resolved target is already consented this session, and
+/// the client can isolate keyboard-interactive (#6). Pure, so the consent gate is
+/// unit-tested (mirrors the connect path's gate, the most security-sensitive bit).
+fn should_arm_sftp_password(
+    is_candidate: bool,
+    autofill_enabled: bool,
+    target_consented: bool,
+    kbdint_supported: bool,
+) -> bool {
+    is_candidate && autofill_enabled && target_consented && kbdint_supported
+}
+
+/// Build the single `sftp -b` batch command for a transfer, or `None` if either
+/// path can't be expressed safely (see [`sftp_quote`]). `get` pulls remote→local;
+/// `put` pushes local→remote. Each path is quoted independently.
+fn sftp_batch_line(direction: SftpDirection, local: &str, remote: &str) -> Option<String> {
+    let (local, remote) = (sftp_quote(local)?, sftp_quote(remote)?);
+    Some(match direction {
+        SftpDirection::Get => format!("get {remote} {local}\n"),
+        SftpDirection::Put => format!("put {local} {remote}\n"),
+    })
+}
+
+/// A temp-file guard: removes the staged batch file on drop so it never lingers,
+/// even on an early return or a transfer that fails to launch.
+struct TempCleanup(std::path::PathBuf);
+
+impl Drop for TempCleanup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Dual-pane SFTP browser (Phase 3, M3.3)
+// ---------------------------------------------------------------------------
+
+/// Open the browser for `host`: seed the local pane at the user's home and kick
+/// off the initial remote listing (`.` → resolved to the absolute home + listed).
+fn open_sftp_browser(app: &mut App, host: usize) {
+    let Some(alias) = app.hosts.get(host).map(|h| h.alias().to_string()) else {
+        return;
+    };
+    // Defense in depth (CWE-88), mirroring connect_by_alias: an empty or '-'-leading
+    // config-controlled alias is flag-smuggling bait and not a usable destination.
+    if alias.is_empty() || alias.starts_with('-') {
+        app.toast(
+            format!("refusing to browse: unsafe host alias '{alias}'"),
+            true,
+        );
+        return;
+    }
+    // Always seed an ABSOLUTE local cwd: a relative "." would let `browser_up`
+    // walk to "" (Path::new(".").parent() == Some("")), which read_local_dir can't
+    // read — locking the local pane. Fall back to the current dir, then root.
+    let local_cwd = dirs::home_dir()
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| std::path::PathBuf::from(std::path::MAIN_SEPARATOR_STR));
+    let local_entries = read_local_dir(&local_cwd);
+    let mut session = SftpSession::open(&alias);
+    session.request(SftpOp::List(".".to_string()));
+    app.sftp_browser = Some(SftpBrowser {
+        host,
+        focus: SftpPane::Remote,
+        local_cwd,
+        local_entries,
+        local_sel: 0,
+        remote_cwd: String::new(),
+        remote_entries: Vec::new(),
+        remote_sel: 0,
+        remote_loading: true,
+        status: "connecting…".to_string(),
+        session,
+    });
+    app.screen = Screen::SftpBrowser;
+}
+
+/// Route a keypress in the dual-pane browser. Tab switches panes; j/k move; Enter
+/// descends a directory or transfers a file (download from remote / upload from
+/// local); Backspace goes up; `r` refreshes; `?` opens help; Esc closes (dropping
+/// the session, which tears down the ControlMaster).
+fn handle_sftp_browser(app: &mut App, key: KeyEvent, terminal: &mut DefaultTerminal) -> Result<()> {
+    match key.code {
+        KeyCode::Esc => {
+            // Dropping the browser drops its SftpSession → ControlMaster teardown.
+            // (Esc only — `q` is the app-quit chord on the list and not rebound here.)
+            app.sftp_browser = None;
+            app.screen = Screen::List;
+        }
+        KeyCode::Char('?') => open_overlay(app, Screen::Help),
+        KeyCode::Tab => {
+            if let Some(b) = app.sftp_browser.as_mut() {
+                b.focus = match b.focus {
+                    SftpPane::Local => SftpPane::Remote,
+                    SftpPane::Remote => SftpPane::Local,
+                };
+            }
+        }
+        KeyCode::Char('j') | KeyCode::Down => browser_move(app, 1),
+        KeyCode::Char('k') | KeyCode::Up => browser_move(app, -1),
+        KeyCode::Char('r') => browser_refresh(app),
+        KeyCode::Backspace => browser_up(app),
+        KeyCode::Enter => return browser_activate(app, terminal),
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Move the selection in the focused pane, clamped to its entry count.
+fn browser_move(app: &mut App, delta: i32) {
+    let Some(b) = app.sftp_browser.as_mut() else {
+        return;
+    };
+    match b.focus {
+        SftpPane::Local => b.local_sel = clamp_idx(b.local_sel, b.local_entries.len(), delta),
+        SftpPane::Remote => b.remote_sel = clamp_idx(b.remote_sel, b.remote_entries.len(), delta),
+    }
+}
+
+/// Shift `cur` by `delta`, clamped to `[0, len-1]` (or 0 when empty).
+fn clamp_idx(cur: usize, len: usize, delta: i32) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    (cur as i32 + delta).clamp(0, len as i32 - 1) as usize
+}
+
+/// Re-read the focused pane's current directory.
+fn browser_refresh(app: &mut App) {
+    let Some(b) = app.sftp_browser.as_mut() else {
+        return;
+    };
+    match b.focus {
+        SftpPane::Local => {
+            b.local_entries = read_local_dir(&b.local_cwd);
+            b.local_sel = b.local_sel.min(b.local_entries.len().saturating_sub(1));
+        }
+        SftpPane::Remote => {
+            let path = current_remote_path(b);
+            request_remote_listing(b, path);
+        }
+    }
+}
+
+/// The path to (re)list for the remote pane: the resolved cwd, or the `.` home
+/// sentinel while the cwd is still unresolved.
+fn current_remote_path(b: &SftpBrowser) -> String {
+    if b.remote_cwd.is_empty() {
+        ".".to_string()
+    } else {
+        b.remote_cwd.clone()
+    }
+}
+
+/// Mark the remote pane loading and dispatch a listing op for `path`. The single
+/// site that requests a remote listing, so loading/status stay in sync.
+fn request_remote_listing(b: &mut SftpBrowser, path: String) {
+    b.remote_loading = true;
+    b.status = "loading…".to_string();
+    b.session.request(SftpOp::List(path));
+}
+
+/// Go up one directory in the focused pane.
+fn browser_up(app: &mut App) {
+    let Some(b) = app.sftp_browser.as_mut() else {
+        return;
+    };
+    match b.focus {
+        SftpPane::Local => {
+            if let Some(parent) = b.local_cwd.parent().map(|p| p.to_path_buf()) {
+                b.local_cwd = parent;
+                b.local_entries = read_local_dir(&b.local_cwd);
+                b.local_sel = 0;
+            }
+        }
+        SftpPane::Remote => {
+            if !b.remote_cwd.is_empty() {
+                let parent = remote_parent(&b.remote_cwd);
+                navigate_remote(b, parent);
+            }
+        }
+    }
+}
+
+/// Point the remote pane at `path` and request its listing. Clears the stale
+/// entries first so a keypress arriving before the new listing can't act on a row
+/// from the directory we just left (it would build a path under the new cwd).
+fn navigate_remote(b: &mut SftpBrowser, path: String) {
+    b.remote_cwd = path.clone();
+    b.remote_sel = 0;
+    b.remote_entries.clear();
+    request_remote_listing(b, path);
+}
+
+/// What activating (Enter) the focused selection does, computed under a short
+/// immutable borrow so the action can then re-borrow `app` as needed.
+enum BrowseAct {
+    Noop,
+    Up,
+    LocalDescend(String),
+    RemoteDescend(String),
+    Upload(String),
+    Download(String),
+}
+
+/// Enter on the focused selection: a directory navigates, `..` goes up, a file
+/// transfers (download when the remote pane is focused, upload when local is).
+fn browser_activate(app: &mut App, terminal: &mut DefaultTerminal) -> Result<()> {
+    let Some(b) = app.sftp_browser.as_ref() else {
+        return Ok(());
+    };
+    let act = match b.focus {
+        SftpPane::Local => match b.local_entries.get(b.local_sel) {
+            None => BrowseAct::Noop,
+            Some(e) if e.is_dir && e.name == ".." => BrowseAct::Up,
+            Some(e) if e.is_dir => BrowseAct::LocalDescend(e.name.clone()),
+            Some(e) => BrowseAct::Upload(e.name.clone()),
+        },
+        SftpPane::Remote => match b.remote_entries.get(b.remote_sel) {
+            None => BrowseAct::Noop,
+            Some(e) if e.name == ".." => BrowseAct::Up,
+            // A directory OR a symlink Enters as a descend: `ls -la <path>` follows
+            // a symlink-to-dir and lists its target — the common case. `ls -l` can't
+            // tell a symlink's target type, so we can't route a symlink-to-FILE to a
+            // download; it descends to a single-entry view instead (Backspace to go
+            // back). To download a remote symlink-to-file, use the transfer modal
+            // and type its path. (The local pane stats symlinks, so it routes
+            // correctly there — this asymmetry is inherent to the `ls -l` listing.)
+            Some(e) if e.is_dir || e.is_link => {
+                BrowseAct::RemoteDescend(remote_join(&b.remote_cwd, &e.name))
+            }
+            Some(e) => BrowseAct::Download(e.name.clone()),
+        },
+    };
+    match act {
+        BrowseAct::Noop => Ok(()),
+        BrowseAct::Up => {
+            browser_up(app);
+            Ok(())
+        }
+        BrowseAct::LocalDescend(name) => {
+            if let Some(b) = app.sftp_browser.as_mut() {
+                b.local_cwd = b.local_cwd.join(name);
+                b.local_entries = read_local_dir(&b.local_cwd);
+                b.local_sel = 0;
+            }
+            Ok(())
+        }
+        BrowseAct::RemoteDescend(path) => {
+            if let Some(b) = app.sftp_browser.as_mut() {
+                navigate_remote(b, path);
+            }
+            Ok(())
+        }
+        BrowseAct::Upload(name) => browser_transfer(app, terminal, SftpDirection::Put, &name),
+        BrowseAct::Download(name) => browser_transfer(app, terminal, SftpDirection::Get, &name),
+    }
+}
+
+/// Transfer the file `name` between the two panes' current directories, running
+/// the `sftp -b` inline (suspend/restore, reusing the Phase 2 executor so sftp's
+/// progress meter shows), then refresh the destination pane.
+fn browser_transfer(
+    app: &mut App,
+    terminal: &mut DefaultTerminal,
+    direction: SftpDirection,
+    name: &str,
+) -> Result<()> {
+    let Some(b) = app.sftp_browser.as_ref() else {
+        return Ok(());
+    };
+    // Until the initial `pwd` resolves the absolute home, remote_cwd is empty and
+    // `remote_join("", name)` would yield `/name` — i.e. the filesystem ROOT, not
+    // the home the user sees. Refuse a transfer rather than write to the wrong place
+    // (a fast Tab→Enter in the local pane before the first listing arrives).
+    if b.remote_cwd.is_empty() {
+        set_browser_status(
+            app,
+            "remote not ready yet — wait for the listing".to_string(),
+        );
+        return Ok(());
+    }
+    let Some(host) = app.hosts.get(b.host).cloned() else {
+        return Ok(());
+    };
+    let alias = host.alias().to_string();
+    let local = b.local_cwd.join(name).display().to_string();
+    let remote = remote_join(&b.remote_cwd, name);
+
+    let Some(batch) = sftp_batch_line(direction, &local, &remote) else {
+        set_browser_status(
+            app,
+            "path contains a \" or control character — cannot transfer".to_string(),
+        );
+        return Ok(());
+    };
+    let temp = match stage_batch(&batch) {
+        Ok(p) => p,
+        Err(e) => {
+            set_browser_status(app, format!("could not stage transfer: {e}"));
+            return Ok(());
+        }
+    };
+    let _cleanup = TempCleanup(temp.clone());
+    // Reuse the browse session's ControlMaster (unix) so this transfer rides the
+    // already-authenticated connection instead of handshaking from scratch.
+    let mut args = b
+        .session
+        .control_args()
+        .into_iter()
+        .chain(["-b".to_string(), temp.display().to_string()])
+        .collect::<Vec<_>>();
+    args.extend(Protocol::Sftp.build_args(&host, &ConnectOverrides::default()));
+
+    execute_sftp_transfer(app, terminal, &host, &alias, &args)?;
+
+    // Refresh the side that just received the file.
+    match direction {
+        SftpDirection::Get => {
+            if let Some(b) = app.sftp_browser.as_mut() {
+                b.local_entries = read_local_dir(&b.local_cwd);
+                b.local_sel = b.local_sel.min(b.local_entries.len().saturating_sub(1));
+            }
+        }
+        SftpDirection::Put => {
+            if let Some(b) = app.sftp_browser.as_mut() {
+                let path = current_remote_path(b);
+                request_remote_listing(b, path);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Set the browser's status line (no-op when not browsing).
+fn set_browser_status(app: &mut App, msg: String) {
+    if let Some(b) = app.sftp_browser.as_mut() {
+        b.status = msg;
+    }
+}
+
 /// Build [`ConnectOverrides`] from the override form, surfacing a validation
 /// error as a toast + highlighted field. `None` means validation failed and the
 /// caller should abort.
@@ -1542,7 +2124,16 @@ fn connect_with_overrides(
         return Ok(());
     };
     close_overlay(app);
-    connect_by_alias(app, terminal, &alias, mode, PasswordChoice::Ask, None, ov)
+    connect_by_alias(
+        app,
+        terminal,
+        &alias,
+        mode,
+        Protocol::Ssh,
+        PasswordChoice::Ask,
+        None,
+        ov,
+    )
 }
 
 /// Copy the `ssh ...` command line for the override modal's host + overrides.
@@ -2242,11 +2833,15 @@ fn handle_action_menu(
                     close_overlay(app);
                     match sel {
                         action_idx::CONNECT_INLINE => {
-                            connect_selected(app, terminal, ConnectMode::Inline)?
+                            connect_selected(app, terminal, ConnectMode::Inline, Protocol::Ssh)?
                         }
                         action_idx::CONNECT_NEW_TAB => {
-                            connect_selected(app, terminal, ConnectMode::NewWtTab)?
+                            connect_selected(app, terminal, ConnectMode::NewWtTab, Protocol::Ssh)?
                         }
+                        action_idx::SFTP_INLINE => {
+                            connect_selected(app, terminal, ConnectMode::Inline, Protocol::Sftp)?
+                        }
+                        action_idx::SFTP_TRANSFER => open_sftp_transfer(app, host_idx),
                         action_idx::CONNECT_OVERRIDES => open_connect_override(app, host_idx),
                         action_idx::COPY_COMMAND => copy_command(app),
                         action_idx::EDIT => open_edit(app),
@@ -2523,10 +3118,65 @@ mod tests {
     }
 
     #[test]
+    fn sftp_batch_line_builds_get_and_put_with_quoting() {
+        // get: remote source first, local destination second.
+        assert_eq!(
+            sftp_batch_line(SftpDirection::Get, "/home/me/out.txt", "/etc/hostname"),
+            Some("get /etc/hostname /home/me/out.txt\n".to_string())
+        );
+        // put: local source first, remote destination second.
+        assert_eq!(
+            sftp_batch_line(SftpDirection::Put, "/home/me/in.txt", "/srv/in.txt"),
+            Some("put /home/me/in.txt /srv/in.txt\n".to_string())
+        );
+        // Paths with whitespace are wrapped in double quotes; each independently.
+        assert_eq!(
+            sftp_batch_line(SftpDirection::Put, "C:\\My Docs\\a.txt", "/srv/up load.txt"),
+            Some("put \"C:\\My Docs\\a.txt\" \"/srv/up load.txt\"\n".to_string())
+        );
+        // A backslash-bearing Windows path with no spaces is left bare (not quoted,
+        // not escaped) — it round-trips verbatim.
+        assert_eq!(
+            sftp_batch_line(SftpDirection::Put, "C:\\id\\a.txt", "/srv/a.txt"),
+            Some("put C:\\id\\a.txt /srv/a.txt\n".to_string())
+        );
+        // A path with a quote or control character is refused (no batch built).
+        assert_eq!(
+            sftp_batch_line(SftpDirection::Put, "/home/me/a\nb.txt", "/srv/x"),
+            None
+        );
+        assert_eq!(
+            sftp_batch_line(SftpDirection::Get, "/srv/x", "/home/me/a\"b.txt"),
+            None
+        );
+    }
+
+    #[test]
+    fn clamp_idx_bounds() {
+        assert_eq!(clamp_idx(0, 0, 1), 0); // empty list
+        assert_eq!(clamp_idx(0, 3, -1), 0); // can't go below 0
+        assert_eq!(clamp_idx(2, 3, 1), 2); // can't exceed len-1
+        assert_eq!(clamp_idx(1, 3, 1), 2);
+        assert_eq!(clamp_idx(2, 3, -1), 1);
+    }
+
+    #[test]
+    fn sftp_password_arming_requires_all_four_gates() {
+        // The server password arms only when ALL of: candidate, autofill enabled,
+        // target consented, kbd-interactive isolatable.
+        assert!(should_arm_sftp_password(true, true, true, true));
+        assert!(!should_arm_sftp_password(false, true, true, true)); // not a candidate
+        assert!(!should_arm_sftp_password(true, false, true, true)); // autofill off
+        assert!(!should_arm_sftp_password(true, true, false, true)); // not consented
+        assert!(!should_arm_sftp_password(true, true, true, false)); // old OpenSSH (#6)
+    }
+
+    #[test]
     fn connect_toast_maps_outcome_and_exit() {
         use crate::os::askpass::{DeclineReason, Outcome};
         // Served + clean exit -> a success toast naming the kind.
         let t = connect_toast(
+            "ssh",
             "h",
             Some(0),
             &Outcome::Served {
@@ -2539,6 +3189,7 @@ mod tests {
         );
         // Served + 255 -> served-but-auth-failed (error).
         let t = connect_toast(
+            "ssh",
             "h",
             Some(255),
             &Outcome::Served {
@@ -2546,8 +3197,19 @@ mod tests {
             },
         );
         assert!(t.is_some_and(|(m, e)| e && m.contains("auto-filled password")));
+        // The program name is threaded into the served-but-failed wording.
+        let t = connect_toast(
+            "sftp",
+            "h",
+            Some(255),
+            &Outcome::Served {
+                kind: SecretKind::Password,
+            },
+        );
+        assert!(t.is_some_and(|(m, e)| e && m.contains("sftp authentication")));
         // Keyboard-interactive decline -> an informational withheld toast.
         let t = connect_toast(
+            "ssh",
             "h",
             Some(255),
             &Outcome::Declined {
@@ -2557,6 +3219,7 @@ mod tests {
         assert!(t.is_some_and(|(m, e)| !e && m.contains("keyboard-interactive")));
         // Withheld / no-match + 255 -> a decline-aware, alias-named diagnostic.
         let t = connect_toast(
+            "ssh",
             "web1",
             Some(255),
             &Outcome::Declined {
@@ -2565,13 +3228,16 @@ mod tests {
         );
         assert!(t.is_some_and(|(m, e)| e && m.contains("web1") && m.contains("withheld")));
         // NotAttempted + 255 -> a "never requested", alias-named diagnostic.
-        let t = connect_toast("web1", Some(255), &Outcome::NotAttempted);
+        let t = connect_toast("ssh", "web1", Some(255), &Outcome::NotAttempted);
         assert!(t.is_some_and(|(m, e)| e && m.contains("web1") && m.contains("never requested")));
         // Nothing served, clean exit (key auth never prompted) -> no toast.
-        assert_eq!(connect_toast("h", Some(0), &Outcome::NotAttempted), None);
+        assert_eq!(
+            connect_toast("ssh", "h", Some(0), &Outcome::NotAttempted),
+            None
+        );
         // A detached/stalled teardown (TimedOut) folds into the exit summary:
         // 255 -> error toast, clean exit -> no toast.
-        assert!(connect_toast("h", Some(255), &Outcome::TimedOut).is_some_and(|(_, e)| e));
-        assert_eq!(connect_toast("h", Some(0), &Outcome::TimedOut), None);
+        assert!(connect_toast("ssh", "h", Some(255), &Outcome::TimedOut).is_some_and(|(_, e)| e));
+        assert_eq!(connect_toast("ssh", "h", Some(0), &Outcome::TimedOut), None);
     }
 }
