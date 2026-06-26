@@ -17,8 +17,9 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::app::{
     App, ConfirmAction, ConnectMode, EditForm, FormMode, GenOrigin, ListFocus, PickOrigin,
-    SFTP_FIELDS, Screen, SftpDirection, SftpForm, VaultEntryForm, VaultUnlock, form_from_view,
-    form_idx, override_form_from_host, override_idx, overrides_from_form, view_from_form,
+    SFTP_FIELDS, Screen, SftpBrowser, SftpDirection, SftpForm, SftpPane, VaultEntryForm,
+    VaultUnlock, form_from_view, form_idx, override_form_from_host, override_idx,
+    overrides_from_form, read_local_dir, view_from_form,
 };
 use crate::config::model::HostView;
 use crate::os::askpass::{
@@ -33,6 +34,7 @@ use crate::os::known_hosts::remove_entry;
 use crate::os::resolve::{
     ResolvedConfig, has_match_exec, is_host_known, resolve_config_with_options, tofu_lookup_key,
 };
+use crate::os::sftp::{SftpOp, SftpSession, batch_path_ok, remote_join, remote_parent};
 use crate::os::ssh_dir;
 use crate::os::vault::{
     self, MatchedKinds, Secret, SecretKind, Vault, VaultEntry, match_vault_kinds,
@@ -60,6 +62,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent, terminal: &mut DefaultTerminal) 
         Screen::PickJump { origin } => handle_pick_jump(app, key, origin),
         Screen::ConnectOverride { host } => handle_connect_override(app, key, host, terminal)?,
         Screen::SftpTransfer => handle_sftp_transfer(app, key, terminal)?,
+        Screen::SftpBrowser => handle_sftp_browser(app, key, terminal)?,
         Screen::Vault => handle_vault(app, key),
         Screen::VaultUnlock => handle_vault_unlock(app, key),
         Screen::VaultEntry { editing } => handle_vault_entry(app, key, editing),
@@ -273,6 +276,11 @@ fn handle_list(app: &mut App, key: KeyEvent, terminal: &mut DefaultTerminal) -> 
             connect_selected(app, terminal, ConnectMode::NewWtTab, Protocol::Ssh)?
         }
         KeyCode::Char('F') => connect_selected(app, terminal, ConnectMode::Inline, Protocol::Sftp)?,
+        KeyCode::Char('b') => {
+            if let Some(h) = app.selected_host() {
+                open_sftp_browser(app, h);
+            }
+        }
         KeyCode::Char('O') => {
             if let Some(h) = app.selected_host() {
                 open_connect_override(app, h);
@@ -1779,6 +1787,261 @@ fn write_sftp_batch(contents: &str) -> std::io::Result<std::path::PathBuf> {
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
     }
     Ok(path)
+}
+
+// ---------------------------------------------------------------------------
+// Dual-pane SFTP browser (Phase 3, M3.3)
+// ---------------------------------------------------------------------------
+
+/// Open the browser for `host`: seed the local pane at the user's home and kick
+/// off the initial remote listing (`.` → resolved to the absolute home + listed).
+fn open_sftp_browser(app: &mut App, host: usize) {
+    let Some(alias) = app.hosts.get(host).map(|h| h.alias().to_string()) else {
+        return;
+    };
+    let local_cwd = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    let local_entries = read_local_dir(&local_cwd);
+    let mut session = SftpSession::open(&alias);
+    session.request(SftpOp::List(".".to_string()));
+    app.sftp_browser = Some(SftpBrowser {
+        host,
+        focus: SftpPane::Remote,
+        local_cwd,
+        local_entries,
+        local_sel: 0,
+        remote_cwd: String::new(),
+        remote_entries: Vec::new(),
+        remote_sel: 0,
+        remote_loading: true,
+        status: "connecting…".to_string(),
+        session,
+    });
+    app.screen = Screen::SftpBrowser;
+}
+
+/// Route a keypress in the dual-pane browser. Tab switches panes; j/k move; Enter
+/// descends a directory or transfers a file (download from remote / upload from
+/// local); Backspace goes up; `r` refreshes; Esc/`q` closes (dropping the session,
+/// which tears down the ControlMaster).
+fn handle_sftp_browser(app: &mut App, key: KeyEvent, terminal: &mut DefaultTerminal) -> Result<()> {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            // Dropping the browser drops its SftpSession → ControlMaster teardown.
+            app.sftp_browser = None;
+            app.screen = Screen::List;
+        }
+        KeyCode::Tab => {
+            if let Some(b) = app.sftp_browser.as_mut() {
+                b.focus = match b.focus {
+                    SftpPane::Local => SftpPane::Remote,
+                    SftpPane::Remote => SftpPane::Local,
+                };
+            }
+        }
+        KeyCode::Char('j') | KeyCode::Down => browser_move(app, 1),
+        KeyCode::Char('k') | KeyCode::Up => browser_move(app, -1),
+        KeyCode::Char('r') => browser_refresh(app),
+        KeyCode::Backspace => browser_up(app),
+        KeyCode::Enter => return browser_activate(app, terminal),
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Move the selection in the focused pane, clamped to its entry count.
+fn browser_move(app: &mut App, delta: i32) {
+    let Some(b) = app.sftp_browser.as_mut() else {
+        return;
+    };
+    match b.focus {
+        SftpPane::Local => b.local_sel = clamp_idx(b.local_sel, b.local_entries.len(), delta),
+        SftpPane::Remote => b.remote_sel = clamp_idx(b.remote_sel, b.remote_entries.len(), delta),
+    }
+}
+
+/// Shift `cur` by `delta`, clamped to `[0, len-1]` (or 0 when empty).
+fn clamp_idx(cur: usize, len: usize, delta: i32) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    (cur as i32 + delta).clamp(0, len as i32 - 1) as usize
+}
+
+/// Re-read the focused pane's current directory.
+fn browser_refresh(app: &mut App) {
+    let Some(b) = app.sftp_browser.as_mut() else {
+        return;
+    };
+    match b.focus {
+        SftpPane::Local => {
+            b.local_entries = read_local_dir(&b.local_cwd);
+            b.local_sel = b.local_sel.min(b.local_entries.len().saturating_sub(1));
+        }
+        SftpPane::Remote => {
+            let path = if b.remote_cwd.is_empty() {
+                ".".to_string()
+            } else {
+                b.remote_cwd.clone()
+            };
+            b.remote_loading = true;
+            b.status = "loading…".to_string();
+            b.session.request(SftpOp::List(path));
+        }
+    }
+}
+
+/// Go up one directory in the focused pane.
+fn browser_up(app: &mut App) {
+    let Some(b) = app.sftp_browser.as_mut() else {
+        return;
+    };
+    match b.focus {
+        SftpPane::Local => {
+            if let Some(parent) = b.local_cwd.parent().map(|p| p.to_path_buf()) {
+                b.local_cwd = parent;
+                b.local_entries = read_local_dir(&b.local_cwd);
+                b.local_sel = 0;
+            }
+        }
+        SftpPane::Remote => {
+            if !b.remote_cwd.is_empty() {
+                let parent = remote_parent(&b.remote_cwd);
+                navigate_remote(b, parent);
+            }
+        }
+    }
+}
+
+/// Point the remote pane at `path` and request its listing.
+fn navigate_remote(b: &mut SftpBrowser, path: String) {
+    b.remote_cwd = path.clone();
+    b.remote_sel = 0;
+    b.remote_loading = true;
+    b.status = "loading…".to_string();
+    b.session.request(SftpOp::List(path));
+}
+
+/// What activating (Enter) the focused selection does, computed under a short
+/// immutable borrow so the action can then re-borrow `app` as needed.
+enum BrowseAct {
+    Noop,
+    Up,
+    LocalDescend(String),
+    RemoteDescend(String),
+    Upload(String),
+    Download(String),
+}
+
+/// Enter on the focused selection: a directory navigates, `..` goes up, a file
+/// transfers (download when the remote pane is focused, upload when local is).
+fn browser_activate(app: &mut App, terminal: &mut DefaultTerminal) -> Result<()> {
+    let Some(b) = app.sftp_browser.as_ref() else {
+        return Ok(());
+    };
+    let act = match b.focus {
+        SftpPane::Local => match b.local_entries.get(b.local_sel) {
+            None => BrowseAct::Noop,
+            Some(e) if e.is_dir && e.name == ".." => BrowseAct::Up,
+            Some(e) if e.is_dir => BrowseAct::LocalDescend(e.name.clone()),
+            Some(e) => BrowseAct::Upload(e.name.clone()),
+        },
+        SftpPane::Remote => match b.remote_entries.get(b.remote_sel) {
+            None => BrowseAct::Noop,
+            Some(e) if e.name == ".." => BrowseAct::Up,
+            Some(e) if e.is_dir => BrowseAct::RemoteDescend(remote_join(&b.remote_cwd, &e.name)),
+            Some(e) => BrowseAct::Download(e.name.clone()),
+        },
+    };
+    match act {
+        BrowseAct::Noop => Ok(()),
+        BrowseAct::Up => {
+            browser_up(app);
+            Ok(())
+        }
+        BrowseAct::LocalDescend(name) => {
+            if let Some(b) = app.sftp_browser.as_mut() {
+                b.local_cwd = b.local_cwd.join(name);
+                b.local_entries = read_local_dir(&b.local_cwd);
+                b.local_sel = 0;
+            }
+            Ok(())
+        }
+        BrowseAct::RemoteDescend(path) => {
+            if let Some(b) = app.sftp_browser.as_mut() {
+                navigate_remote(b, path);
+            }
+            Ok(())
+        }
+        BrowseAct::Upload(name) => browser_transfer(app, terminal, SftpDirection::Put, &name),
+        BrowseAct::Download(name) => browser_transfer(app, terminal, SftpDirection::Get, &name),
+    }
+}
+
+/// Transfer the file `name` between the two panes' current directories, running
+/// the `sftp -b` inline (suspend/restore, reusing the Phase 2 executor so sftp's
+/// progress meter shows), then refresh the destination pane.
+fn browser_transfer(
+    app: &mut App,
+    terminal: &mut DefaultTerminal,
+    direction: SftpDirection,
+    name: &str,
+) -> Result<()> {
+    let Some(b) = app.sftp_browser.as_ref() else {
+        return Ok(());
+    };
+    let Some(host) = app.hosts.get(b.host).cloned() else {
+        return Ok(());
+    };
+    let alias = host.alias().to_string();
+    let local = b.local_cwd.join(name).display().to_string();
+    let remote = remote_join(&b.remote_cwd, name);
+
+    if !batch_path_ok(&local) || !batch_path_ok(&remote) {
+        set_browser_status(app, "path contains a \" — cannot transfer".to_string());
+        return Ok(());
+    }
+
+    let batch = sftp_batch_line(direction, &local, &remote);
+    let temp = match write_sftp_batch(&batch) {
+        Ok(p) => p,
+        Err(e) => {
+            set_browser_status(app, format!("could not stage transfer: {e}"));
+            return Ok(());
+        }
+    };
+    let _cleanup = TempCleanup(temp.clone());
+    let mut args = vec!["-b".to_string(), temp.display().to_string()];
+    args.extend(Protocol::Sftp.build_args(&host, &ConnectOverrides::default()));
+
+    execute_sftp_transfer(app, terminal, &host, &alias, &args)?;
+
+    // Refresh the side that just received the file.
+    match direction {
+        SftpDirection::Get => {
+            if let Some(b) = app.sftp_browser.as_mut() {
+                b.local_entries = read_local_dir(&b.local_cwd);
+            }
+        }
+        SftpDirection::Put => {
+            if let Some(b) = app.sftp_browser.as_mut() {
+                let path = if b.remote_cwd.is_empty() {
+                    ".".to_string()
+                } else {
+                    b.remote_cwd.clone()
+                };
+                b.remote_loading = true;
+                b.session.request(SftpOp::List(path));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Set the browser's status line (no-op when not browsing).
+fn set_browser_status(app: &mut App, msg: String) {
+    if let Some(b) = app.sftp_browser.as_mut() {
+        b.status = msg;
+    }
 }
 
 /// Build [`ConnectOverrides`] from the override form, surfacing a validation

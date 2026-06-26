@@ -66,6 +66,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Screen::KeyManager => keys::draw(f, app, body_a),
         Screen::KnownHosts => known_hosts::draw(f, app, body_a),
         Screen::Vault => vault::draw(f, app, body_a),
+        Screen::SftpBrowser => sftp::draw_browser(f, app, body_a),
         _ => list::draw(f, app, body_a),
     }
     draw_footer(f, app, &base, footer_a);
@@ -105,6 +106,7 @@ fn draw_title(f: &mut Frame, app: &App, base: &Screen, area: Rect) {
         Screen::KeyManager => "Keys",
         Screen::KnownHosts => "Known hosts",
         Screen::Vault => "Passwords",
+        Screen::SftpBrowser => "SFTP browser",
         _ => "SSH Manager",
     };
     let count = match base {
@@ -198,6 +200,7 @@ fn draw_footer(f: &mut Frame, app: &App, base: &Screen, area: Rect) {
             ("Enter", "connect"),
             ("t", "new-tab"),
             ("F", "sftp"),
+            ("b", "browse"),
             ("O", "overrides"),
             ("e", "edit"),
             ("a", "add"),
@@ -261,6 +264,14 @@ fn draw_footer(f: &mut Frame, app: &App, base: &Screen, area: Rect) {
             ("p", "pw-autofill"),
             ("L", "lock"),
             ("Esc", "back"),
+        ]),
+        (Screen::SftpBrowser, _) => widgets::footer_hints(&[
+            ("Tab", "pane"),
+            ("j/k", "move"),
+            ("Enter", "open/transfer"),
+            ("Bksp", "up"),
+            ("r", "refresh"),
+            ("q", "quit"),
         ]),
         _ => widgets::footer_hints(&[("?", "help"), ("q", "quit")]),
     };

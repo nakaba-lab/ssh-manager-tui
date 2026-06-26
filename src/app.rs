@@ -21,6 +21,7 @@ use crate::os::keys::KeyInfo;
 use crate::os::known_hosts::{HostSpec, KnownHostEntry};
 use crate::os::liveness::{Liveness, LivenessProbe, ProbeTarget};
 use crate::os::resolve::ResolvedConfig;
+use crate::os::sftp::{RemoteEntry, SftpEvent, SftpSession};
 use crate::os::vault::{MatchedKinds, SecretKind, Vault, match_vault_kinds};
 use crate::os::{self, keys, known_hosts};
 
@@ -143,6 +144,9 @@ pub enum Screen {
     /// [`App::sftp_form`]. Submitting suspends the TUI and runs the transfer
     /// inline, just like an inline connect.
     SftpTransfer,
+    /// Dual-pane SFTP browser (local | remote). A full base screen, not an
+    /// overlay; all state lives in [`App::sftp_browser`].
+    SftpBrowser,
     /// Password vault: list of stored secrets (login passwords / passphrases).
     Vault,
     /// Master-password prompt modal — unlock an existing vault, or create one.
@@ -489,6 +493,72 @@ pub struct SftpForm {
 /// Number of focusable fields in the SFTP transfer form.
 pub const SFTP_FIELDS: usize = 3;
 
+/// Which pane of the dual-pane SFTP browser has focus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SftpPane {
+    Local,
+    Remote,
+}
+
+/// One entry in the local pane of the SFTP browser.
+#[derive(Debug, Clone)]
+pub struct LocalEntry {
+    pub name: String,
+    pub is_dir: bool,
+}
+
+/// Read a local directory into sorted entries (directories first, then files,
+/// each alphabetical, case-insensitive), prepending a `..` row when `path` has a
+/// parent. Unreadable entries are silently skipped (best-effort, like the rest of
+/// the browser). Never fails — an unreadable directory yields just the `..` row.
+pub fn read_local_dir(path: &std::path::Path) -> Vec<LocalEntry> {
+    let mut entries: Vec<LocalEntry> = std::fs::read_dir(path)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| LocalEntry {
+            name: e.file_name().to_string_lossy().into_owned(),
+            is_dir: e.file_type().map(|t| t.is_dir()).unwrap_or(false),
+        })
+        .collect();
+    entries.sort_by(|a, b| {
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    if path.parent().is_some() {
+        entries.insert(
+            0,
+            LocalEntry {
+                name: "..".to_string(),
+                is_dir: true,
+            },
+        );
+    }
+    entries
+}
+
+/// State for the dual-pane SFTP browser (local | remote). The browse session
+/// runs each remote op as a short-lived background `sftp -b` child; results are
+/// drained per tick by [`App::drain_sftp_browser`]. Held in `App::sftp_browser`
+/// (`None` when not browsing) because it owns a non-clonable [`SftpSession`].
+pub struct SftpBrowser {
+    pub host: usize,
+    pub focus: SftpPane,
+    pub local_cwd: std::path::PathBuf,
+    pub local_entries: Vec<LocalEntry>,
+    pub local_sel: usize,
+    /// Absolute remote directory; empty until the initial `pwd` resolves it.
+    pub remote_cwd: String,
+    pub remote_entries: Vec<RemoteEntry>,
+    pub remote_sel: usize,
+    /// True while a remote listing op is in flight (drives a spinner).
+    pub remote_loading: bool,
+    /// Last status / error line shown in the browser footer area.
+    pub status: String,
+    pub session: SftpSession,
+}
+
 pub struct App {
     pub should_quit: bool,
     pub screen: Screen,
@@ -527,6 +597,9 @@ pub struct App {
 
     // --- inline SFTP transfer form ---
     pub sftp_form: SftpForm,
+
+    // --- dual-pane SFTP browser (None when not browsing) ---
+    pub sftp_browser: Option<SftpBrowser>,
 
     // --- S3 keys ---
     pub keys: Vec<KeyInfo>,
@@ -616,6 +689,7 @@ impl App {
             form: EditForm::default(),
             override_form: OverrideForm::default(),
             sftp_form: SftpForm::default(),
+            sftp_browser: None,
             keys,
             keys_state: ListState::default(),
             key_host_ctx: None,
@@ -949,6 +1023,56 @@ impl App {
             }
         }
         rank_changed
+    }
+
+    /// Drain completed SFTP browse-session ops into the browser state (no-op when
+    /// not browsing). Called per tick, like [`drain_liveness`](Self::drain_liveness),
+    /// so the UI thread never blocks on a remote op. Returns true if anything
+    /// changed (so the caller redraws).
+    pub fn drain_sftp_browser(&mut self) -> bool {
+        let Some(b) = self.sftp_browser.as_mut() else {
+            return false;
+        };
+        let events = b.session.drain();
+        if events.is_empty() {
+            return false;
+        }
+        for event in events {
+            match event {
+                SftpEvent::Listing { path, cwd, entries } => {
+                    // Resolve the initial "." listing to its absolute home; ignore
+                    // any stale listing that isn't the directory we're now showing.
+                    let is_initial = b.remote_cwd.is_empty() && path == ".";
+                    if is_initial {
+                        if let Some(home) = cwd {
+                            b.remote_cwd = home;
+                        }
+                    } else if path != b.remote_cwd {
+                        continue;
+                    }
+                    let mut sorted = entries;
+                    sorted.sort_by(|a, z| {
+                        z.is_dir
+                            .cmp(&a.is_dir)
+                            .then_with(|| a.name.to_lowercase().cmp(&z.name.to_lowercase()))
+                    });
+                    let mut list = vec![RemoteEntry::parent()];
+                    list.extend(sorted);
+                    b.remote_entries = list;
+                    b.remote_sel = b.remote_sel.min(b.remote_entries.len().saturating_sub(1));
+                    b.remote_loading = false;
+                    b.status.clear();
+                }
+                SftpEvent::Done { op } => {
+                    b.status = format!("{op} ok");
+                }
+                SftpEvent::Failed { op, msg } => {
+                    b.remote_loading = false;
+                    b.status = format!("{op} failed: {msg}");
+                }
+            }
+        }
+        true
     }
 
     /// Per-tick housekeeping: expire transient toasts and auto-lock an idle vault.
