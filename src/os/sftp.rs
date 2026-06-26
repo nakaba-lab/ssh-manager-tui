@@ -184,26 +184,40 @@ impl SftpSession {
     /// Open a session for `alias`. Cheap: no connection is made until the first
     /// op runs (which, on unix, also establishes the shared ControlMaster).
     pub fn open(alias: &str) -> Self {
-        let (tx, rx) = mpsc::channel();
-
         // A private ControlMaster socket under a per-process temp path (unix only;
         // OpenSSH for Windows has no ControlMaster). A random nonce keys it to THIS
         // session so a stale socket (a failed `-O exit`) can never be reused by a
-        // later browse of a different host.
+        // later browse of a different host. If `temp_dir()` is pathologically deep
+        // the socket path could exceed the AF_UNIX `sun_path` limit (~104 bytes) and
+        // fail to bind, so fall back to no master (ops connect individually).
         #[cfg(unix)]
-        let control = Some(std::env::temp_dir().join(format!(
-            "sshm-sftp-cm-{}-{}",
-            std::process::id(),
-            nonce()
-        )));
+        let control = {
+            let p = std::env::temp_dir().join(format!(
+                "sshm-sftp-cm-{}-{}",
+                std::process::id(),
+                nonce()
+            ));
+            (p.as_os_str().len() < 100).then_some(p)
+        };
+        Self::with_control(
+            alias,
+            #[cfg(unix)]
+            control,
+        )
+    }
 
+    /// Shared constructor: build `common_args` from the optional ControlMaster path.
+    fn with_control(alias: &str, #[cfg(unix)] control: Option<std::path::PathBuf>) -> Self {
+        let (tx, rx) = mpsc::channel();
         // `-o BatchMode=yes` makes every op fail fast instead of hanging on a
-        // prompt; on unix the control options multiplex ops over one connection.
+        // prompt; on unix the control options (when present) multiplex ops over one
+        // connection.
         #[cfg(unix)]
         let common_args = {
-            let path = control.as_ref().expect("control path set on unix");
             let mut a = vec!["-o".to_string(), "BatchMode=yes".to_string()];
-            a.extend(control_options(path));
+            if let Some(path) = &control {
+                a.extend(control_options(path));
+            }
             a
         };
         #[cfg(not(unix))]
@@ -218,6 +232,17 @@ impl SftpSession {
             #[cfg(unix)]
             control,
         }
+    }
+
+    /// Test-only constructor that never sets up a ControlMaster, so the unix `Drop`
+    /// performs no `ssh -O exit` spawn — keeping `apply_sftp_event` tests I/O-free.
+    #[cfg(test)]
+    pub fn open_no_master(alias: &str) -> Self {
+        Self::with_control(
+            alias,
+            #[cfg(unix)]
+            None,
+        )
     }
 
     /// The ControlMaster options to reuse this session's shared connection for an
@@ -410,19 +435,38 @@ pub fn sftp_quote(p: &str) -> Option<String> {
     if p.contains('"') || p.chars().any(|c| c.is_control()) {
         return None;
     }
-    if p.chars().any(char::is_whitespace) {
-        Some(format!("\"{p}\""))
+    // A leading '-' would be parsed as a flag by the in-batch `ls`/`get`/`put`
+    // (which precede no `--` sentinel). `./` makes it an unambiguous relative path;
+    // absolute paths (remote `/…`, or a local drive/`/`) never start with '-', so
+    // this only affects an operator-typed relative path in the transfer form.
+    let normalized = if p.starts_with('-') {
+        format!("./{p}")
     } else {
-        Some(p.to_string())
+        p.to_string()
+    };
+    if normalized.chars().any(char::is_whitespace) {
+        Some(format!("\"{normalized}\""))
+    } else {
+        Some(normalized)
     }
 }
 
 /// A short random hex nonce for unique, unguessable temp paths (control socket,
-/// batch files). Falls back to the pid on the (vanishingly rare) RNG failure.
+/// batch files). On the vanishingly rare RNG failure it falls back to the pid plus
+/// a process-global counter, so concurrent callers still get distinct names (the
+/// counter is what keeps `stage_batch`'s `create_new` from colliding).
 fn nonce() -> String {
     match crate::os::vault::random_bytes(8) {
         Ok(bytes) => bytes.iter().map(|b| format!("{b:02x}")).collect(),
-        Err(_) => format!("{:x}", std::process::id()),
+        Err(_) => {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+            format!(
+                "{:x}-{}",
+                std::process::id(),
+                SEQ.fetch_add(1, Ordering::Relaxed)
+            )
+        }
     }
 }
 
@@ -495,6 +539,11 @@ mod tests {
         assert_eq!(sftp_quote("/bad\nq"), None);
         assert_eq!(sftp_quote("/bad\rq"), None);
         assert_eq!(sftp_quote("/bad\tq"), None);
+        // A leading '-' is normalised to `./-…` so it can't be read as a flag;
+        // a '-' elsewhere is untouched.
+        assert_eq!(sftp_quote("-rf"), Some("./-rf".to_string()));
+        assert_eq!(sftp_quote("-a b"), Some("\"./-a b\"".to_string()));
+        assert_eq!(sftp_quote("/x/-y"), Some("/x/-y".to_string()));
     }
 
     #[test]

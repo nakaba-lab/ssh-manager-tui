@@ -1721,16 +1721,17 @@ fn arm_sftp_secrets(
     let Ok(rc) = resolve_config_with_options(&[], alias) else {
         return (None, Vec::new());
     };
-    // Decide which kinds to arm: passphrase always; password only when consented,
-    // enabled, and the client can isolate keyboard-interactive (#6).
-    let password = candidacy.password
-        && app.password_autofill_enabled
-        && app
-            .confirmed_password_targets
-            .contains(&resolved_target(&rc))
-        && crate::os::askpass::ssh_kbdint_prefix_supported();
+    // Decide which kinds to arm: passphrase always; password only when the gate
+    // below allows it.
+    let arm_password = should_arm_sftp_password(
+        candidacy.password,
+        app.password_autofill_enabled,
+        app.confirmed_password_targets
+            .contains(&resolved_target(&rc)),
+        crate::os::askpass::ssh_kbdint_prefix_supported(),
+    );
     let kinds = MatchedKinds {
-        password,
+        password: arm_password,
         passphrase: candidacy.passphrase,
     };
     if !kinds.any() {
@@ -1745,6 +1746,20 @@ fn arm_sftp_secrets(
         Ok((listener, env)) => (Some(listener), env),
         Err(_) => (None, Vec::new()),
     }
+}
+
+/// Whether an inline SFTP transfer may auto-fill the server **password**. A
+/// server-facing secret is only released when it is a candidate, the session has
+/// auto-fill enabled, the resolved target is already consented this session, and
+/// the client can isolate keyboard-interactive (#6). Pure, so the consent gate is
+/// unit-tested (mirrors the connect path's gate, the most security-sensitive bit).
+fn should_arm_sftp_password(
+    is_candidate: bool,
+    autofill_enabled: bool,
+    target_consented: bool,
+    kbdint_supported: bool,
+) -> bool {
+    is_candidate && autofill_enabled && target_consented && kbdint_supported
 }
 
 /// Build the single `sftp -b` batch command for a transfer, or `None` if either
@@ -1951,9 +1966,13 @@ fn browser_activate(app: &mut App, terminal: &mut DefaultTerminal) -> Result<()>
         SftpPane::Remote => match b.remote_entries.get(b.remote_sel) {
             None => BrowseAct::Noop,
             Some(e) if e.name == ".." => BrowseAct::Up,
-            // A directory OR a symlink descends: `ls -la <path>` follows a
-            // symlink-to-dir and lists its target. (A symlink-to-file lists just
-            // that one entry — harmless; the user goes back up.)
+            // A directory OR a symlink Enters as a descend: `ls -la <path>` follows
+            // a symlink-to-dir and lists its target — the common case. `ls -l` can't
+            // tell a symlink's target type, so we can't route a symlink-to-FILE to a
+            // download; it descends to a single-entry view instead (Backspace to go
+            // back). To download a remote symlink-to-file, use the transfer modal
+            // and type its path. (The local pane stats symlinks, so it routes
+            // correctly there — this asymmetry is inherent to the `ls -l` listing.)
             Some(e) if e.is_dir || e.is_link => {
                 BrowseAct::RemoteDescend(remote_join(&b.remote_cwd, &e.name))
             }
@@ -1997,6 +2016,17 @@ fn browser_transfer(
     let Some(b) = app.sftp_browser.as_ref() else {
         return Ok(());
     };
+    // Until the initial `pwd` resolves the absolute home, remote_cwd is empty and
+    // `remote_join("", name)` would yield `/name` — i.e. the filesystem ROOT, not
+    // the home the user sees. Refuse a transfer rather than write to the wrong place
+    // (a fast Tab→Enter in the local pane before the first listing arrives).
+    if b.remote_cwd.is_empty() {
+        set_browser_status(
+            app,
+            "remote not ready yet — wait for the listing".to_string(),
+        );
+        return Ok(());
+    }
     let Some(host) = app.hosts.get(b.host).cloned() else {
         return Ok(());
     };
@@ -3123,6 +3153,17 @@ mod tests {
         assert_eq!(clamp_idx(2, 3, 1), 2); // can't exceed len-1
         assert_eq!(clamp_idx(1, 3, 1), 2);
         assert_eq!(clamp_idx(2, 3, -1), 1);
+    }
+
+    #[test]
+    fn sftp_password_arming_requires_all_four_gates() {
+        // The server password arms only when ALL of: candidate, autofill enabled,
+        // target consented, kbd-interactive isolatable.
+        assert!(should_arm_sftp_password(true, true, true, true));
+        assert!(!should_arm_sftp_password(false, true, true, true)); // not a candidate
+        assert!(!should_arm_sftp_password(true, false, true, true)); // autofill off
+        assert!(!should_arm_sftp_password(true, true, false, true)); // not consented
+        assert!(!should_arm_sftp_password(true, true, true, false)); // old OpenSSH (#6)
     }
 
     #[test]

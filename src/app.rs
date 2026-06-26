@@ -516,14 +516,24 @@ pub fn read_local_dir(path: &std::path::Path) -> Vec<LocalEntry> {
         .into_iter()
         .flatten()
         .flatten()
-        .map(|e| LocalEntry {
-            name: e.file_name().to_string_lossy().into_owned(),
-            // `metadata` follows symlinks, so a symlink-to-directory counts as a
-            // directory (you can descend into it); `file_type` would not, which
-            // would wrongly route Enter on it to a file transfer.
-            is_dir: std::fs::metadata(e.path())
-                .map(|m| m.is_dir())
-                .unwrap_or(false),
+        .map(|e| {
+            // `file_type` is free (from the dir read) for the common case; only a
+            // symlink needs an extra `metadata` stat to follow it, so a
+            // symlink-to-directory counts as a directory (Enter descends into it)
+            // rather than being misrouted to a file transfer. A broken symlink fails
+            // the stat and falls back to "not a directory".
+            let ft = e.file_type().ok();
+            let is_dir = match ft {
+                Some(t) if t.is_symlink() => std::fs::metadata(e.path())
+                    .map(|m| m.is_dir())
+                    .unwrap_or(false),
+                Some(t) => t.is_dir(),
+                None => false,
+            };
+            LocalEntry {
+                name: e.file_name().to_string_lossy().into_owned(),
+                is_dir,
+            }
         })
         .collect();
     entries.sort_by(|a, b| {
@@ -610,6 +620,13 @@ pub fn apply_sftp_event(b: &mut SftpBrowser, event: SftpEvent) {
             }
             b.remote_loading = false;
             b.status = friendly_sftp_error(&msg);
+            // `navigate_remote` cleared the old entries before this (failed) listing,
+            // so reseed the synthetic `..` row — otherwise the pane is empty and a
+            // user can't select a row to go back up (Backspace still works too).
+            if b.remote_entries.is_empty() {
+                b.remote_entries = vec![RemoteEntry::parent()];
+                b.remote_sel = 0;
+            }
         }
     }
 }
@@ -1453,7 +1470,9 @@ mod tests {
             remote_sel: 0,
             remote_loading: true,
             status: String::new(),
-            session: SftpSession::open("test-host"),
+            // No ControlMaster, so the session's unix Drop spawns no `ssh -O exit`
+            // and these tests stay genuinely I/O-free.
+            session: SftpSession::open_no_master("test-host"),
         }
     }
 
@@ -1548,6 +1567,43 @@ mod tests {
             },
         );
         assert!(b.status.contains("connect once"));
+    }
+
+    #[test]
+    fn apply_failed_reseeds_parent_row_when_pane_empty() {
+        // navigate_remote clears entries before a listing; if that listing fails,
+        // the pane must still show the `..` row so the user can go back up.
+        let mut b = test_browser();
+        b.remote_cwd = "/now".to_string();
+        b.remote_entries.clear();
+        apply_sftp_event(
+            &mut b,
+            SftpEvent::Failed {
+                path: Some("/now".to_string()),
+                msg: "Permission denied".to_string(),
+            },
+        );
+        assert_eq!(b.remote_entries.len(), 1);
+        assert_eq!(b.remote_entries[0].name, "..");
+        assert!(!b.remote_loading);
+        assert_eq!(b.status, "Permission denied");
+    }
+
+    #[test]
+    fn apply_failed_on_unresolved_home_is_applied() {
+        // The initial '.' failure (remote_cwd still empty) is NOT a stale failure
+        // and must surface, not be skipped by the path gate.
+        let mut b = test_browser();
+        apply_sftp_event(
+            &mut b,
+            SftpEvent::Failed {
+                path: Some(".".to_string()),
+                msg: "Connection refused".to_string(),
+            },
+        );
+        assert!(!b.remote_loading);
+        assert_eq!(b.status, "Connection refused");
+        assert_eq!(b.remote_entries[0].name, "..");
     }
 
     #[test]

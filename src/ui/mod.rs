@@ -22,6 +22,31 @@ use ratatui::widgets::Paragraph;
 
 use crate::app::{App, GenOrigin, PickOrigin, Screen};
 
+/// Host-list footer hints. Kept to the most-used keys plus the `o` action menu
+/// and `?` help (which surface new-tab, overrides, sort, keys, passwords, the
+/// SFTP actions, …). Must render within 80 columns — see `footers_fit_80_cols`.
+const LIST_FOOTER: &[(&str, &str)] = &[
+    ("j/k", "move"),
+    ("/", "search"),
+    ("Enter", "ssh"),
+    ("o", "menu"),
+    ("a", "add"),
+    ("F", "sftp"),
+    ("b", "browse"),
+    ("?", "help"),
+];
+
+/// SFTP browser footer hints (must render within 80 columns).
+const SFTP_BROWSER_FOOTER: &[(&str, &str)] = &[
+    ("Tab", "pane"),
+    ("j/k", "move"),
+    ("Enter", "open/xfer"),
+    ("Bksp", "up"),
+    ("r", "refresh"),
+    ("?", "help"),
+    ("Esc", "back"),
+];
+
 /// The non-modal screen rendered underneath the current screen (which may be a
 /// modal overlay).
 fn base_screen(app: &App) -> Screen {
@@ -194,19 +219,7 @@ fn draw_footer(f: &mut Frame, app: &App, base: &Screen, area: Rect) {
             ("?", "help"),
             ("q", "quit"),
         ]),
-        // Kept to a single 80-col line: the most-used keys plus the `o` action
-        // menu and `?` help, which surface everything else (new-tab, overrides,
-        // sort, keys, passwords, SFTP actions, …).
-        (Screen::List, _) => widgets::footer_hints(&[
-            ("j/k", "move"),
-            ("/", "search"),
-            ("Enter", "connect"),
-            ("o", "menu"),
-            ("a", "add"),
-            ("F", "sftp"),
-            ("b", "browse"),
-            ("?", "help"),
-        ]),
+        (Screen::List, _) => widgets::footer_hints(LIST_FOOTER),
         (Screen::Edit { .. }, a) if a.form.mode == crate::app::FormMode::Editing => {
             widgets::footer_hints(&[("Enter", "commit"), ("Esc", "cancel field")])
         }
@@ -262,15 +275,7 @@ fn draw_footer(f: &mut Frame, app: &App, base: &Screen, area: Rect) {
             ("L", "lock"),
             ("Esc", "back"),
         ]),
-        (Screen::SftpBrowser, _) => widgets::footer_hints(&[
-            ("Tab", "pane"),
-            ("j/k", "move"),
-            ("Enter", "open/transfer"),
-            ("Bksp", "up"),
-            ("r", "refresh"),
-            ("?", "help"),
-            ("Esc", "back"),
-        ]),
+        (Screen::SftpBrowser, _) => widgets::footer_hints(SFTP_BROWSER_FOOTER),
         _ => widgets::footer_hints(&[("?", "help"), ("q", "quit")]),
     };
     f.render_widget(Paragraph::new(hints), area);
@@ -306,4 +311,26 @@ fn draw_toast(f: &mut Frame, app: &App, area: Rect) {
         height: 1,
     };
     f.render_widget(Paragraph::new(Span::styled(text, style)), toast_area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn footers_fit_80_cols() {
+        // The host-list and SFTP-browser footers render on a single, non-wrapping
+        // line; a >80-col footer silently clips its trailing hints on an 80-column
+        // terminal (the regression this guards against).
+        assert!(
+            widgets::footer_hints(LIST_FOOTER).width() <= 80,
+            "list footer is {} cols",
+            widgets::footer_hints(LIST_FOOTER).width()
+        );
+        assert!(
+            widgets::footer_hints(SFTP_BROWSER_FOOTER).width() <= 80,
+            "sftp browser footer is {} cols",
+            widgets::footer_hints(SFTP_BROWSER_FOOTER).width()
+        );
+    }
 }
