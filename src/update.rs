@@ -2808,7 +2808,7 @@ fn submit_vault_unlock(app: &mut App) {
                 if creating {
                     "vault created"
                 } else if app.password_autofill_enabled {
-                    "vault unlocked — passwords & passphrases auto-fill on connect"
+                    "vault unlocked — passphrases auto-fill; passwords after a one-time per-host confirm"
                 } else {
                     "vault unlocked — passphrases auto-fill on connect; press p for passwords"
                 },
@@ -3480,10 +3480,12 @@ mod tests {
 
     #[test]
     fn consent_recorded_only_when_vault_unlocked() {
-        // The consent insert (both connect + browse paths) must fire only on a confirm
-        // AND an unlocked vault — so an idle auto-lock that fired while the modal was
-        // open can't resurrect consent past the lock boundary on a late confirm. A
-        // dropped `&& vault_unlocked` would otherwise pass the whole suite silently.
+        // Both consent-insert sites (connect + browse) route through this one
+        // predicate, so consent is recorded only on a confirm AND an unlocked vault —
+        // an idle auto-lock that fired while the modal was open then can't resurrect
+        // consent past the lock boundary on a late confirm. This pins the predicate's
+        // truth table; both sites sharing this single named fn (not a copied inline
+        // `&&`) is what keeps them from drifting apart.
         assert!(consent_should_be_recorded(true, true));
         assert!(!consent_should_be_recorded(true, false)); // vault locked mid-modal
         assert!(!consent_should_be_recorded(false, true)); // declined
