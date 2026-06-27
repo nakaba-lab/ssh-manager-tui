@@ -172,11 +172,20 @@ fn draw_title(f: &mut Frame, app: &App, base: &Screen, area: Rect) {
         ),
         Span::styled(count, Style::default().fg(theme::FAINT)),
     ];
+    // The `[PATH ssh]` warning is security-relevant (an untrusted Git/MSYS `ssh` is
+    // resolved), so it is pushed BEFORE the vault chip — on a narrow terminal the
+    // cosmetic chip clips first, never the warning.
+    if app.ssh_path_warning {
+        spans.push(Span::styled(
+            "  [PATH ssh]",
+            Style::default().fg(theme::WARN),
+        ));
+    }
     // Vault status chip (List only): surfaces the otherwise-hidden `P` entry point
     // and a coarse lock/unlock state. The boolean lock state leaks no per-host
     // affiliation, so it is safe to show (unlike a per-host "has secret" cue).
     if matches!(base, Screen::List) {
-        spans.push(Span::styled("   ", Style::default().fg(theme::FAINT)));
+        spans.push(Span::raw("   "));
         spans.push(Span::styled(
             "P",
             Style::default()
@@ -191,12 +200,6 @@ fn draw_title(f: &mut Frame, app: &App, base: &Screen, area: Rect) {
             Span::styled(" vault", Style::default().fg(theme::DIM))
         };
         spans.push(state);
-    }
-    if app.ssh_path_warning {
-        spans.push(Span::styled(
-            "  [PATH ssh]",
-            Style::default().fg(theme::WARN),
-        ));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
