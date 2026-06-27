@@ -156,7 +156,9 @@ fn parse_ls_l_line(line: &str) -> Option<RemoteEntry> {
 /// exists, to avoid carrying unreachable command-builders.
 #[derive(Debug, Clone)]
 pub enum SftpOp {
-    /// List a directory (`ls -la <path>`); `"."` resolves + lists the home dir.
+    /// List a directory. [`list_batch`] builds this as `cd <path>` then a bare
+    /// `ls -la` (and `"."` resolves + lists the home dir via `pwd` + `ls -la`) — NOT
+    /// `ls -la <path>`, whose entry names would each be path-prefixed.
     List(String),
 }
 
@@ -200,6 +202,12 @@ fn list_batch(path: &str) -> Option<String> {
     // `remote_join(cwd, name)` then doubles it (`/dir//dir/sub`) and the `.`/`..`
     // rows are no longer dropped (their names are `/dir/.`, not `.`). Changing the
     // session's cwd first and listing it with a bare `ls -la` yields simple names.
+    //
+    // INVARIANT: `cd` MUST stay UNPREFIXED. A `-`-prefixed command (`-cd <path>`)
+    // tells `sftp -b` to ignore the error and continue, so a failed `cd` would fall
+    // through to the bare `ls -la` and silently list the PREVIOUS cwd (the home dir)
+    // as if it were `<path>`. Unprefixed, a failed `cd` aborts the batch → the op
+    // exits non-zero → `run_op` reports `Failed` instead of a stale listing.
     Some(format!("cd {}\nls -la\n", sftp_quote(path)?))
 }
 
@@ -320,6 +328,15 @@ impl SftpSession {
         self.arm.is_some()
     }
 
+    /// Whether any dispatched op worker is still running. The UI's per-tick watchdog
+    /// uses this to detect a lost completion (a worker that finished without
+    /// reporting an event), which would otherwise leave `remote_loading` stuck true
+    /// and — for an armed session — freeze the remote pane behind the serialization
+    /// guard.
+    pub fn has_inflight(&self) -> bool {
+        self.handles.iter().any(|h| !h.is_finished())
+    }
+
     /// Number of dispatched op worker threads tracked so far — lets a test observe
     /// whether a dispatch actually happened (vs was dropped by the serialization
     /// guard) rather than only inspecting status strings.
@@ -405,8 +422,9 @@ impl Drop for SftpSession {
 
 /// The BatchMode option pair for an op. Armed ops pass `BatchMode=no` to override
 /// the `-b`-implied `batchmode yes` (sftp injects it into the spawned ssh), which
-/// is what re-enables the armed `SSH_ASKPASS` helper for the password prompt.
-fn batchmode_args(armed: bool) -> [&'static str; 2] {
+/// is what re-enables the armed `SSH_ASKPASS` helper for the password prompt. Shared
+/// with the inline-transfer path in `update.rs` so both keep identical semantics.
+pub(crate) fn batchmode_args(armed: bool) -> [&'static str; 2] {
     if armed {
         ["-o", "BatchMode=no"]
     } else {
@@ -517,17 +535,21 @@ fn run_op(alias: &str, common_args: &[String], arm: Option<SftpArm>, op: SftpOp)
 ///   (`contains(": Permission denied (")` plus `ends_with(").")`).
 /// - `Permission denied, please try again.` — the per-attempt password-reject
 ///   message, the FIRST stderr line of an armed wrong-password op (`starts_with`).
-/// - `Authentication failed…` (`starts_with`).
+/// - `Authentication failed…` — either the bare line-leading form (`starts_with`) or
+///   the `Received disconnect from <host> port <p>:2: Authentication failed.`
+///   disconnect-wrapped form (some sshd / `NumberOfPasswordPrompts=1`), matched by
+///   anchoring on a leading `Received disconnect`. Deliberately NOT a bare `contains`,
+///   so an arbitrary banner/MOTD line that merely mentions the phrase can't match.
 /// - `Too many authentication failures` (`contains`).
 ///
 /// A bare directory `Permission denied` (no `(method)`) and host-key failures are
 /// deliberately negatives.
 ///
-/// **False-positive note**: the two `contains`-based clauses key on message shape,
-/// not exact equality, so a crafted server banner line that contains
-/// `": Permission denied ("` or `"Too many authentication failures"` could produce
-/// a false positive. This is fail-safe: a false positive only disarms the session
-/// (no password is re-sent); it never causes the server to authenticate.
+/// **False-positive note**: the remaining shape-based clauses (`": Permission denied ("`
+/// and `"Too many authentication failures"`) key on substring, not exact equality, so a
+/// crafted server banner containing one could still produce a false positive. This is
+/// fail-safe: a false positive only disarms the session (no password is re-sent); it
+/// never causes the server to authenticate.
 pub fn is_auth_failure(stderr: &str) -> bool {
     stderr.lines().map(str::trim).any(|line| {
         let denied_with_methods = line.contains(": Permission denied (") && line.ends_with(").");
@@ -537,7 +559,11 @@ pub fn is_auth_failure(stderr: &str) -> bool {
             // exhaustion line comes last), so without this clause the circuit-breaker
             // would never trip on the real armed-wrong-password case (caught by E2E).
             || line.starts_with("Permission denied, please try again")
+            // `Authentication failed`: the bare leading form OR the disconnect-wrapped
+            // form (`Received disconnect ...: Authentication failed.`). Anchored so a
+            // banner that merely contains the phrase does not match.
             || line.starts_with("Authentication failed")
+            || (line.starts_with("Received disconnect") && line.contains("Authentication failed"))
             || line.contains("Too many authentication failures")
     })
 }
@@ -693,6 +719,47 @@ mod tests {
         // An unsafe path can't be expressed → no batch (the op fails fast).
         assert_eq!(list_batch("/bad\"quote"), None);
         assert_eq!(list_batch("/bad\nnewline"), None);
+
+        // Batch-abort invariant: NO command line may be `-`-prefixed. `sftp -b` treats
+        // a leading `-` as "ignore this command's error and continue", which would let
+        // a failed `cd` fall through to the bare `ls -la` and list the stale previous
+        // cwd. A leading-'-' PATH is normalised to `./-…` by sftp_quote, so the `cd`
+        // line still starts with "cd", never "-". (review: cd-unprefixed safety)
+        for p in [".", "/var/log", "/srv/new dir", "-rf", "/x/-y"] {
+            let script = list_batch(p).unwrap();
+            assert!(
+                script.lines().all(|l| !l.starts_with('-')),
+                "no batch command may be '-'-prefixed (would suppress the cd abort): {script:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn home_listing_pwd_preamble_is_not_surfaced_as_an_entry() {
+        // The home branch runs `pwd\nls -la\n`, so the combined stdout fed to
+        // parse_ls_l begins with sftp's `Remote working directory: <path>` line. It
+        // must NOT become a bogus directory entry: that line has too few `ls -la`
+        // columns (its "name" remainder is empty), so the parser drops it. (review:
+        // INFO — guards the home-branch parse against the pwd preamble)
+        let stdout = "\
+Remote working directory: /home/deploy
+total 12
+drwxr-xr-x    4 deploy deploy 4096 Jan 15 10:30 .
+drwxr-xr-x   20 root   root   4096 Jan 15 10:30 ..
+-rw-r--r--    1 deploy deploy  220 Jan 15 10:30 .bashrc
+drwxr-xr-x    2 deploy deploy 4096 Jan 15 10:30 projects
+";
+        let entries = parse_ls_l(stdout);
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        // Only the two real files survive: no `Remote`/`working`/`directory:` row, and
+        // `.`/`..`/`total` are dropped as before.
+        assert_eq!(names, vec![".bashrc", "projects"]);
+        assert!(
+            !names
+                .iter()
+                .any(|n| n.contains("working") || n.contains("directory")),
+            "the pwd preamble line must not leak as an entry"
+        );
     }
 
     #[test]
@@ -891,6 +958,46 @@ srwxr-xr-x    1 user  group      0 Jan 15 10:30 sock";
         // just first_error_line).
         assert!(is_auth_failure(
             "************ AUTHORIZED USE ONLY ************\nWelcome banner line 2\nuser@host: Permission denied (publickey,password)."
+        ));
+    }
+
+    #[test]
+    fn is_auth_failure_recognizes_disconnect_wrapped_auth() {
+        // OpenSSH (and some non-OpenSSH sshd, or `NumberOfPasswordPrompts=1`) wrap
+        // the auth verdict in a `Received disconnect ...:` prefix, so the
+        // `Authentication failed` phrase is no longer at the START of the line. The
+        // breaker must still trip when a served password was rejected — match the
+        // phrase anywhere on the line, not only at its start. (review: breaker
+        // lockout-safety false-negative)
+        assert!(is_auth_failure(
+            "Received disconnect from 10.0.0.1 port 22:2: Authentication failed."
+        ));
+        // Still seen behind a leading banner (full-stderr scan).
+        assert!(is_auth_failure(
+            "Welcome\nReceived disconnect from h port 22:2: Authentication failed."
+        ));
+        // A bare directory-ACL denial must STAY a negative (no auth phrase).
+        assert!(!is_auth_failure(
+            "Received message too long\nremote open(\"/root/x\"): Permission denied"
+        ));
+    }
+
+    #[test]
+    fn is_auth_failure_ignores_authentication_failed_inside_a_banner() {
+        // The `Authentication failed` clause is anchored to the bare leading form or
+        // the `Received disconnect ...:` disconnect-wrapped form. An arbitrary
+        // banner/MOTD line that merely CONTAINS the phrase must NOT trip the breaker —
+        // otherwise an auth-SUCCEEDED session whose later cd/ls fails would be wrongly
+        // disarmed and the user told the stored secret was rejected. (review F4)
+        assert!(!is_auth_failure(
+            "*** NOTICE: repeated Authentication failed events are logged and audited ***"
+        ));
+        assert!(!is_auth_failure(
+            "banner: see https://host/why-Authentication-failed for help"
+        ));
+        // ...but a genuine disconnect-wrapped auth line behind that banner still trips.
+        assert!(is_auth_failure(
+            "*** NOTICE: ... ***\nReceived disconnect from h port 22:2: Authentication failed."
         ));
     }
 }

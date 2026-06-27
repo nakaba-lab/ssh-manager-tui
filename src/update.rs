@@ -1663,11 +1663,28 @@ fn submit_sftp_transfer(app: &mut App, terminal: &mut DefaultTerminal) -> Result
     execute_sftp_transfer(app, terminal, &host, &alias, &args)
 }
 
+/// Prepend the per-transfer `BatchMode` option to an inline `sftp -b` arg vector.
+/// `sftp -b` injects `-o BatchMode=yes` into the spawned `ssh`, disabling
+/// `SSH_ASKPASS`; an ARMED transfer must override that with `-o BatchMode=no` placed
+/// before `-b` (the same first-wins ordering the browse path's `run_op` relies on) so
+/// the askpass listener can serve the stored secret. An un-armed transfer keeps the
+/// implied `BatchMode=yes` (it has no live askpass env, so it must never claim `=no`).
+/// Pure, so the armed/un-armed arg shape is unit-tested without spawning anything.
+fn sftp_transfer_args(armed: bool, base: &[String]) -> Vec<String> {
+    let bm = crate::os::sftp::batchmode_args(armed);
+    let mut out = Vec::with_capacity(base.len() + 2);
+    out.push(bm[0].to_string());
+    out.push(bm[1].to_string());
+    out.extend_from_slice(base);
+    out
+}
+
 /// Run a one-shot `sftp -b` transfer inline (suspend/restore the TUI, exactly
 /// like an inline connect, so sftp's own progress meter is visible). A stored
 /// *passphrase* always auto-fills; a stored *password* auto-fills only when its
-/// resolved target was already consented this session (same gate as connect) —
-/// otherwise sftp prompts for it on the inherited TTY.
+/// resolved target was already consented this session (same gate as connect). When
+/// nothing is armed the transfer runs `BatchMode=yes` and fails fast on a host that
+/// needs an interactive password (`sftp -b` never prompts) — same as before.
 fn execute_sftp_transfer(
     app: &mut App,
     terminal: &mut DefaultTerminal,
@@ -1677,30 +1694,56 @@ fn execute_sftp_transfer(
 ) -> Result<()> {
     let label = Protocol::Sftp.label();
     let (listener, env) = arm_sftp_secrets(app, host, alias);
+    // The askpass env is live iff a listener was armed; key BatchMode on that exactly
+    // as `run_op` does, so `-o BatchMode=no` is only ever emitted with a live helper.
+    let args = sftp_transfer_args(listener.is_some(), args);
     app.record_connect(host.alias());
     suspend_tui(terminal)?;
-    let status = run_inline(Protocol::Sftp.binary(), args, &env);
+    let status = run_inline(Protocol::Sftp.binary(), &args, &env);
     restore_tui(terminal)?;
     // A long transfer (TUI suspended) must not trigger a spurious idle auto-lock
     // on the next tick (#14).
     app.last_activity = Instant::now();
+    let exit_code = match &status {
+        Ok(s) => s.code(),
+        Err(_) => None,
+    };
     let toast = match (status, listener) {
         (Ok(s), Some(l)) => connect_toast(label, alias, s.code(), &l.stop_and_join()),
         (Ok(s), None) => describe_exit(label, &s),
         (Err(e), _) => Some((format!("failed to launch {label}: {e}"), true)),
     };
-    if let Some((msg, is_err)) = toast {
+    if let Some((msg, is_err)) = transfer_toast(toast, exit_code) {
         app.toast(msg, is_err);
     }
     Ok(())
 }
 
+/// Escalate an inline-transfer toast to a sticky error on a non-zero child exit. A
+/// one-shot `sftp -b` transfer exiting non-zero (missing file, permission denied,
+/// disk full, remote abort) is a real FAILURE — unlike a remote shell, where a
+/// non-zero exit is normal — so it must not surface as the success-styled,
+/// auto-dismissing toast `describe_exit_code` produces for code 1. Forces `is_err`
+/// true on any non-zero `exit_code`; leaves a clean exit / launch error untouched.
+fn transfer_toast(base: Option<(String, bool)>, exit_code: Option<i32>) -> Option<(String, bool)> {
+    base.map(|(msg, is_err)| (msg, is_err || matches!(exit_code, Some(c) if c != 0)))
+}
+
 /// The shared SFTP arming recipe: the connect_plan-parity gate decision plus the
 /// gathered vault secrets and resolved identity, or `None` when the host is not an
 /// auto-fill candidate. Both arming entry points (the inline transfer and the
-/// browser) build on this so their gates can never diverge again (GAP 1/2). Does
-/// NOT gate on System32-ssh — `compute_sftp_arm` adds that as an explicit wrapper.
+/// browser) build on this so their gates can never diverge (GAP 1/2) — including the
+/// System32-ssh gate below, which BOTH must honor: a secret is auto-filled only when
+/// the resolved client is the trusted System32 OpenSSH build (on unix `is_system32`
+/// is always true, so the gate is a Windows-only no-op elsewhere).
 fn sftp_arm_recipe(app: &App, host: &HostView, alias: &str) -> Option<crate::os::sftp::SftpArm> {
+    // Never arm against the Git/MSYS `[PATH ssh]` fallback build (its force/console
+    // handling differs, and a planted bare `ssh`/`sftp` would receive the live
+    // SSH_ASKPASS token); only the System32 OpenSSH client is trusted for auto-fill.
+    // Shared here so the browse AND inline-transfer paths inherit it identically.
+    if !crate::os::binaries::tools().is_system32 {
+        return None;
+    }
     let candidacy = app.vault_secret_kinds(host)?;
     if has_match_exec(&app.config.render()) {
         return None;
@@ -1736,7 +1779,9 @@ fn sftp_arm_recipe(app: &App, host: &HostView, alias: &str) -> Option<crate::os:
 /// connect path uses) and auto-fill is enabled — so a both-secret host works
 /// without a manual prompt while an un-consented password is never released.
 /// Returns `(None, empty)` when there's nothing to arm or the alias won't resolve.
-/// Delegates gate logic to `sftp_arm_recipe` (no System32 requirement here).
+/// Delegates ALL gate logic — including the System32-ssh requirement — to the shared
+/// `sftp_arm_recipe`, so this inline-transfer path can never arm against an untrusted
+/// `[PATH ssh]` build that the browse path would refuse.
 fn arm_sftp_secrets(
     app: &App,
     host: &HostView,
@@ -1752,20 +1797,6 @@ fn arm_sftp_secrets(
         Ok((listener, env)) => (Some(listener), env),
         Err(_) => (None, Vec::new()),
     }
-}
-
-/// Build the per-session SFTP browse arming recipe for `host`, or `None` when the
-/// host is not a full auto-fill candidate. Same gate truth as the connect path
-/// (via `sftp_arm_kinds`), plus the System32-ssh requirement (never arm against
-/// the Git/MSYS `[PATH ssh]` build, whose force/console handling differs).
-/// Delegates shared gate logic to `sftp_arm_recipe`.
-fn compute_sftp_arm(app: &App, host: &HostView, alias: &str) -> Option<crate::os::sftp::SftpArm> {
-    // Never arm against the Git/MSYS [PATH ssh] fallback build (its force/console
-    // handling differs); only the System32 OpenSSH client is trusted for auto-fill.
-    if !crate::os::binaries::tools().is_system32 {
-        return None;
-    }
-    sftp_arm_recipe(app, host, alias)
 }
 
 /// The SFTP-transfer/browser arming decision, at full parity with `connect_plan`.
@@ -1861,7 +1892,7 @@ fn open_sftp_browser(app: &mut App, host: usize) {
     let local_entries = read_local_dir(&local_cwd);
     let mut session = SftpSession::open(&alias);
     if let Some(h) = app.hosts.get(host)
-        && let Some(arm) = compute_sftp_arm(app, h, &alias)
+        && let Some(arm) = sftp_arm_recipe(app, h, &alias)
     {
         session.arm(arm);
     }
@@ -2065,13 +2096,17 @@ fn browser_activate(app: &mut App, terminal: &mut DefaultTerminal) -> Result<()>
         SftpPane::Remote => match b.remote_entries.get(b.remote_sel) {
             None => BrowseAct::Noop,
             Some(e) if e.name == ".." => BrowseAct::Up,
-            // A directory OR a symlink Enters as a descend: `ls -la <path>` follows
-            // a symlink-to-dir and lists its target — the common case. `ls -l` can't
-            // tell a symlink's target type, so we can't route a symlink-to-FILE to a
-            // download; it descends to a single-entry view instead (Backspace to go
-            // back). To download a remote symlink-to-file, use the transfer modal
-            // and type its path. (The local pane stats symlinks, so it routes
-            // correctly there — this asymmetry is inherent to the `ls -l` listing.)
+            // A directory OR a symlink Enters as a descend: listing the path (via
+            // `cd <path>` + bare `ls -la`, see `list_batch`) follows a symlink-to-dir
+            // and lists its target — the common case. `ls -l` can't tell a symlink's
+            // target type, so we can't route a symlink-to-FILE to a download. Under the
+            // cd+ls listing such a symlink simply FAILS the descend: `cd <symlink-to-
+            // file>` errors, the unprefixed-cd abort INVARIANT (list_batch) makes the
+            // batch return non-zero, and run_op reports Failed — so the pane stays put
+            // with an error status and the reseeded `..` row (no stuck loading; the
+            // watchdog covers the flag). To download a remote symlink-to-file, use the
+            // transfer modal and type its path. (The local pane stats symlinks, so it
+            // routes correctly there — this asymmetry is inherent to the `ls -l` listing.)
             Some(e) if e.is_dir || e.is_link => {
                 BrowseAct::RemoteDescend(remote_join(&b.remote_cwd, &e.name))
             }
@@ -2474,11 +2509,10 @@ fn handle_vault(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Char('p') => toggle_password_autofill(app),
         KeyCode::Char('L') => {
-            // Lock: drop the decrypted vault from memory, and forget the session's
-            // password-confirm consents (they must not survive a re-unlock).
-            app.vault = None;
-            app.vault_reveal = false;
-            app.confirmed_password_targets.clear();
+            // Lock via the shared teardown: drops the decrypted vault, forgets the
+            // session password-confirm consents (must not survive a re-unlock), scrubs
+            // typed form secrets, and disarms an open SFTP browser. (review: lock parity)
+            app.lock_vault();
             app.screen = Screen::List;
             app.toast("vault locked", false);
         }
@@ -2984,6 +3018,26 @@ fn close_overlay(app: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a real `App` over a throwaway config file (mirrors `app::tests::
+    /// app_fixture`) so the few update-layer helpers that need full state can be
+    /// table-tested. The scratch dir is removed once the config is loaded into memory.
+    fn app_fixture(config_body: &str) -> App {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("sshm-upd-{}-{}", std::process::id(), n));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(config_body.as_bytes())
+            .unwrap();
+        let app = App::new(path).expect("App::new over scratch config");
+        let _ = std::fs::remove_dir_all(&dir);
+        app
+    }
 
     // The secret-field editing helpers must behave identically to the plain
     // ones — they only differ in scrubbing the freed heap buffer, which must not
@@ -3492,6 +3546,157 @@ mod tests {
         assert!(
             b.remote_loading,
             "remote_loading must remain true after dropped dispatch"
+        );
+    }
+
+    #[test]
+    fn unarmed_session_pipelines_listing_while_in_flight() {
+        use crate::app::SftpPane;
+        // The complement of the armed-only guard (comment in `request_remote_listing`:
+        // "An un-armed session pipelines as before"): an un-armed in-flight session
+        // MUST still dispatch, since no password is sent and there is no lockout risk.
+        // Pins the `is_armed()` conjunct — dropping it (unconditional
+        // `if b.remote_loading { return; }`) would silently kill un-armed pipelining
+        // and every armed-only test would still pass. (review: LOW)
+        let mut b = SftpBrowser {
+            host: 0,
+            focus: SftpPane::Remote,
+            local_cwd: std::path::PathBuf::from("/"),
+            local_entries: Vec::new(),
+            local_sel: 0,
+            remote_cwd: "/x".to_string(),
+            remote_entries: Vec::new(),
+            remote_sel: 0,
+            remote_loading: true, // an op already in flight
+            status: "loading…".to_string(),
+            session: crate::os::sftp::SftpSession::open_no_master("h"),
+        };
+        // NOT armed (the default for open_no_master).
+        assert!(!b.session.is_armed(), "precondition: session is un-armed");
+        assert_eq!(
+            b.session.pending_ops(),
+            0,
+            "precondition: nothing dispatched"
+        );
+
+        // Use an UNSAFE path (newline): `request_remote_listing` still dispatches a
+        // worker (the serialization guard keys on is_armed()/remote_loading, NOT the
+        // path), so `pending_ops()` rises to 1 — the discriminating observation — but
+        // `run_op`'s `list_batch` returns `None` for it and short-circuits to a Failed
+        // event BEFORE launching a real `sftp -b` child. So this keeps the test free of
+        // process/network I/O (no orphaned sftp) while still proving the dispatch.
+        request_remote_listing(&mut b, "/unsafe\nx".to_string());
+
+        assert_eq!(
+            b.session.pending_ops(),
+            1,
+            "un-armed session must still dispatch while a listing is in flight"
+        );
+    }
+
+    #[test]
+    fn unarmed_inline_transfer_emits_batchmode_yes_not_no() {
+        // Verifies the two HALVES of the HIGH-fix transfer wiring in isolation: that
+        // `arm_sftp_secrets` returns `None` for an un-armed host (no unlocked vault),
+        // and that the shaper then maps `false -> BatchMode=yes` (never BatchMode=no —
+        // emitting it with no live askpass env would, per run_op, invite a CONIN$
+        // console prompt that corrupts the TUI on Windows). It does NOT drive the real
+        // call site `sftp_transfer_args(listener.is_some(), ...)` in
+        // execute_sftp_transfer — that fn takes a DefaultTerminal and spawns a real
+        // sftp child, so the glue line itself is not unit-testable here. (review F6)
+        let app = app_fixture("Host h\n  HostName h\n");
+        let host = app.hosts[0].clone();
+        let (listener, env) = arm_sftp_secrets(&app, &host, "h");
+        assert!(
+            listener.is_none(),
+            "no vault unlocked -> the inline transfer must not arm a listener"
+        );
+        assert!(env.is_empty(), "no arming -> no askpass env");
+
+        let base = vec![
+            "-b".to_string(),
+            "/tmp/batch".to_string(),
+            "--".to_string(),
+            "h".to_string(),
+        ];
+        let args = sftp_transfer_args(listener.is_some(), &base);
+        assert_eq!(
+            &args[0..2],
+            &["-o".to_string(), "BatchMode=yes".to_string()],
+            "an un-armed transfer must run BatchMode=yes"
+        );
+        assert!(
+            !args.iter().any(|a| a == "BatchMode=no"),
+            "BatchMode=no must never ship without a live askpass env"
+        );
+    }
+
+    #[test]
+    fn transfer_toast_marks_a_nonzero_exit_as_a_sticky_error() {
+        // A one-shot `sftp -b` transfer exiting non-zero (missing file, permission
+        // denied, disk full) is a real FAILURE — unlike a remote shell, where a
+        // non-zero exit is normal — so it must not show as the success-styled,
+        // auto-dismissing toast describe_exit_code produces for code 1. (review F2)
+        // exit 0: base styling preserved (here the base is a success toast).
+        assert_eq!(
+            transfer_toast(Some(("done".to_string(), false)), Some(0)),
+            Some(("done".to_string(), false))
+        );
+        // non-zero: escalated to a sticky error even though the base said is_err=false.
+        assert_eq!(
+            transfer_toast(
+                Some(("sftp exited with code 1".to_string(), false)),
+                Some(1)
+            ),
+            Some(("sftp exited with code 1".to_string(), true))
+        );
+        // an already-error toast (e.g. signal / 255) stays an error.
+        assert_eq!(
+            transfer_toast(Some(("boom".to_string(), true)), None),
+            Some(("boom".to_string(), true))
+        );
+        // no toast (clean exit 0 → None) stays no toast.
+        assert_eq!(transfer_toast(None, Some(0)), None);
+    }
+
+    #[test]
+    fn inline_transfer_emits_batchmode_no_only_when_armed() {
+        // `sftp -b` injects `-o BatchMode=yes` into the spawned ssh, which disables
+        // SSH_ASKPASS. An ARMED inline transfer must prepend `-o BatchMode=no` (before
+        // `-b`, mirroring the browse path) so the askpass listener can serve the stored
+        // secret; without it the vault password is never sent and the transfer fails
+        // "Permission denied" on Windows (no ControlMaster fallback). (review: HIGH)
+        let base = vec![
+            "-b".to_string(),
+            "/tmp/batch".to_string(),
+            "--".to_string(),
+            "host".to_string(),
+        ];
+
+        let armed = sftp_transfer_args(true, &base);
+        assert_eq!(
+            &armed[0..2],
+            &["-o".to_string(), "BatchMode=no".to_string()],
+            "armed transfer must lead with -o BatchMode=no"
+        );
+        let bm_pos = armed.iter().position(|a| a == "BatchMode=no").unwrap();
+        let b_pos = armed.iter().position(|a| a == "-b").unwrap();
+        assert!(bm_pos < b_pos, "BatchMode=no must precede -b");
+        assert_eq!(
+            &armed[2..],
+            &base[..],
+            "the base args must follow unchanged"
+        );
+
+        let un = sftp_transfer_args(false, &base);
+        assert_eq!(
+            &un[0..2],
+            &["-o".to_string(), "BatchMode=yes".to_string()],
+            "un-armed transfer keeps sftp's implied BatchMode=yes"
+        );
+        assert!(
+            !un.iter().any(|a| a == "BatchMode=no"),
+            "un-armed transfer must never emit BatchMode=no (no live askpass env)"
         );
     }
 }

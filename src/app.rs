@@ -624,21 +624,37 @@ pub fn apply_sftp_event(b: &mut SftpBrowser, event: SftpEvent) {
                 return;
             }
             b.remote_loading = false;
-            // Circuit-breaker (armed sessions): an auth failure over the FULL stderr
-            // (carried as `auth_failure`, so a leading server Banner can't mask it).
-            // `served` distinguishes a real password rejection from a transient
-            // arm_connect failure that degraded to an un-armed op.
+            // Circuit-breaker (armed sessions). Disarm only on `served && auth_failure`:
+            //   * `auth_failure` is classified over the FULL stderr (a leading banner
+            //     can't mask it) and recognizes the disconnect-wrapped
+            //     `Received disconnect ...: Authentication failed.` form, so a real
+            //     rejection is not missed.
+            //   * `served` (reliable even when teardown's join times out — the listener
+            //     latches each release) means a stored secret was actually released to
+            //     ssh this op. It is KIND-AGNOSTIC: a *password* release reached the
+            //     SERVER (the lockout this bounds), whereas a *passphrase* release only
+            //     decrypted a LOCAL key — disarming on the latter is a harmless fail-safe
+            //     over-disarm (no server-facing secret was sent).
+            // We require BOTH, not `served` alone: a released secret whose auth SUCCEEDED
+            // and then hit a benign command error (e.g. `cd` into a forbidden/missing
+            // dir) also reports `served` but is NOT an auth failure — disarming there
+            // would needlessly kill auto-fill on ordinary browsing.
             if b.session.is_armed() && auth_failure {
                 if served {
-                    // The stored password was sent and rejected -> disarm so it is
-                    // not re-sent on the next navigation (bounds lockout exposure).
+                    // A stored secret was released and the server still rejected auth ->
+                    // disarm so a server-facing password is not re-sent on the next
+                    // navigation (bounds lockout exposure).
                     b.session.disarm();
                     b.status =
-                        "stored password rejected — re-check the vault, or press F".to_string();
+                        "stored secret rejected — re-check the vault, or press F".to_string();
                 } else {
-                    // Armed session but THIS op could not start its listener, so it ran
-                    // un-armed (no password sent) — transient; keep the session armed.
-                    b.status = "could not arm auto-fill — try again, or press F".to_string();
+                    // Armed but no secret was released this op: either arming failed (ran
+                    // un-armed) OR the server withheld it (publickey-only /
+                    // keyboard-interactive / a method we don't auto-fill). No password
+                    // was sent, so keep the session armed; the message stays
+                    // cause-neutral rather than misattributing it to a failed arm.
+                    b.status =
+                        "auto-fill did not complete — press F to enter it, or retry".to_string();
                 }
             } else {
                 b.status = friendly_sftp_error(&msg, auth_failure);
@@ -651,6 +667,36 @@ pub fn apply_sftp_event(b: &mut SftpBrowser, event: SftpEvent) {
                 b.remote_sel = 0;
             }
         }
+    }
+}
+
+/// Per-tick watchdog: if the remote pane is marked loading but no worker op is
+/// still in flight, treat the in-flight listing as lost and clear the stuck flag, so
+/// an armed session's serialization guard does not drop every later listing and
+/// freeze the pane; the user can retry with `r`. Returns true if it fired.
+///
+/// The lost-event case it primarily guards (a worker that finished without reporting)
+/// has no present trigger — `run_op` returns an event on every normal path. There is,
+/// however, one BENIGN false-positive: `SftpSession::drain` empties the channel and
+/// only then reaps finished handles, so if a worker `tx.send`s its event in the sliver
+/// between the drain's last `try_recv` and its handle-reap, that drain collects no
+/// event yet drops the now-finished handle — this watchdog then fires spuriously. It
+/// is self-correcting: the still-queued event applies on the very next tick (it keys on
+/// `remote_cwd`/`path`, not `remote_loading`), clearing the status — worst case a
+/// one-frame flicker. (review: INFO)
+pub(crate) fn sftp_loading_watchdog(b: &mut SftpBrowser) -> bool {
+    if b.remote_loading && !b.session.has_inflight() {
+        b.remote_loading = false;
+        b.status = "listing did not complete — press r to retry".to_string();
+        // Reseed the synthetic `..` row if the pane was cleared, so a user can still
+        // navigate up (mirrors the failed-listing recovery in `apply_sftp_event`).
+        if b.remote_entries.is_empty() {
+            b.remote_entries = vec![RemoteEntry::parent()];
+            b.remote_sel = 0;
+        }
+        true
+    } else {
+        false
     }
 }
 
@@ -1142,13 +1188,16 @@ impl App {
             return false;
         };
         let events = b.session.drain();
-        if events.is_empty() {
-            return false;
-        }
+        let mut changed = !events.is_empty();
         for event in events {
             apply_sftp_event(b, event);
         }
-        true
+        // Recover a stuck `remote_loading` if a completion event was lost (no worker
+        // still in flight) — otherwise an armed session would freeze the remote pane.
+        if sftp_loading_watchdog(b) {
+            changed = true;
+        }
+        changed
     }
 
     /// Per-tick housekeeping: expire transient toasts and auto-lock an idle vault.
@@ -1169,22 +1218,33 @@ impl App {
         changed
     }
 
+    /// Lock the vault: drop+zeroize the decrypted vault and EVERY secret derived from
+    /// it that could outlive the lock — the session password-confirm consents, any
+    /// typed-but-unsaved entry/unlock form secret, and an open SFTP browser's armed
+    /// session (its `SftpArm` holds independent copies of the vault secrets). The
+    /// single teardown both lock paths (manual `L` and idle auto-lock) route through,
+    /// so they can never drift on what a lock must scrub. Does NOT change `screen` or
+    /// toast — each caller owns its own UX. (review: lock-teardown parity)
+    pub(crate) fn lock_vault(&mut self) {
+        self.vault = None;
+        self.vault_reveal = false;
+        self.confirmed_password_targets.clear();
+        // Scrub any typed-but-unsaved secret in the entry/unlock forms too (both
+        // Drop-zeroize when replaced), so a lock leaves nothing behind.
+        self.vault_entry = VaultEntryForm::default();
+        self.vault_unlock = VaultUnlock::default();
+        // A locked vault must not keep auto-filling an already-open browser: disarm
+        // its session (drops + zeroizes the held SftpArm secrets).
+        if let Some(b) = self.sftp_browser.as_mut() {
+            b.session.disarm();
+        }
+    }
+
     /// Drop (zeroize) the vault if it has been unlocked and idle past
     /// [`VAULT_IDLE_LOCK`]. Returns true if it locked this tick. (#14)
     fn idle_autolock(&mut self) -> bool {
         if self.vault.is_some() && self.last_activity.elapsed() >= VAULT_IDLE_LOCK {
-            self.vault = None;
-            self.vault_reveal = false;
-            self.confirmed_password_targets.clear();
-            // Scrub any typed-but-unsaved secret in the entry/unlock forms too
-            // (both Drop-zeroize when replaced), so a lock leaves nothing behind.
-            self.vault_entry = VaultEntryForm::default();
-            self.vault_unlock = VaultUnlock::default();
-            // A locked vault must not keep auto-filling an already-open browser:
-            // disarm its session (drops + zeroizes the held SftpArm secrets).
-            if let Some(b) = self.sftp_browser.as_mut() {
-                b.session.disarm();
-            }
+            self.lock_vault();
             // Bounce off any vault screen to the safe list view. `Screen::VaultUnlock`
             // is intentionally NOT matched: it is only reachable while the vault is
             // locked (see `open_vault`), so the `vault.is_some()` guard above already
@@ -1537,6 +1597,74 @@ mod tests {
     }
 
     #[test]
+    fn watchdog_clears_stuck_loading_when_no_op_is_in_flight() {
+        // A lost completion event (e.g. a worker that panicked before reporting)
+        // would leave `remote_loading` stuck true; for an ARMED session the
+        // serialization guard then drops every later listing and freezes the pane.
+        // The per-tick watchdog recovers it. (review: INFO — no present trigger)
+        let mut b = test_browser(); // remote_loading: true, no op dispatched
+        assert!(
+            !b.session.has_inflight(),
+            "precondition: no worker op is in flight"
+        );
+        assert!(
+            sftp_loading_watchdog(&mut b),
+            "watchdog must fire when loading is stuck with nothing in flight"
+        );
+        assert!(!b.remote_loading, "the stuck loading flag is cleared");
+        assert!(b.status.contains("retry"), "status invites a retry");
+        // A synthetic `..` row is reseeded so the user can still navigate up.
+        assert_eq!(
+            b.remote_entries.first().map(|e| e.name.as_str()),
+            Some("..")
+        );
+        // Idempotent: a second pass (loading already false) does nothing.
+        assert!(!sftp_loading_watchdog(&mut b));
+    }
+
+    #[test]
+    fn lock_vault_disarms_an_open_browser_and_clears_secrets() {
+        use crate::os::askpass::ResolvedIdentity;
+        use crate::os::sftp::SftpArm;
+        use crate::os::vault::Vault;
+
+        let mut app = app_fixture("Host h\n  HostName h\n");
+        // An unlocked vault, a session password-confirm consent, and an open browser
+        // whose session is ARMED (holds independent copies of the vault secrets).
+        app.vault = Some(Vault::create("pw").unwrap());
+        app.confirmed_password_targets
+            .insert("deploy@h".to_string());
+        let mut b = test_browser();
+        b.session.arm(SftpArm {
+            identity: ResolvedIdentity {
+                user: "deploy".into(),
+                host: "h".into(),
+                host_key_alias: None,
+                identity_paths: Vec::new(),
+            },
+            password: None,
+            passphrase: None,
+        });
+        assert!(b.session.is_armed(), "precondition: browser is armed");
+        app.sftp_browser = Some(b);
+
+        app.lock_vault();
+
+        // Locking drops the vault and the consents AND disarms the open browser — the
+        // shared teardown both the manual `L` and idle auto-lock route through, so the
+        // armed browser can never keep auto-filling past a lock. (review: lock parity)
+        assert!(app.vault.is_none(), "vault dropped on lock");
+        assert!(
+            app.confirmed_password_targets.is_empty(),
+            "session consents forgotten on lock"
+        );
+        assert!(
+            !app.sftp_browser.as_ref().unwrap().session.is_armed(),
+            "an open browser must be disarmed on lock"
+        );
+    }
+
+    #[test]
     fn apply_stale_listing_is_ignored() {
         let mut b = test_browser();
         b.remote_cwd = "/home/me".to_string();
@@ -1687,7 +1815,8 @@ mod tests {
         );
         // First auth failure on an armed session disarms it (no second bad attempt).
         assert!(!b.session.is_armed());
-        assert!(b.status.contains("password"));
+        // The disarm status names the rejected secret (kind-agnostic wording).
+        assert!(b.status.contains("rejected"));
     }
 
     #[test]
@@ -1734,8 +1863,8 @@ mod tests {
         assert!(!b.session.is_armed());
         assert!(b.status.contains("rejected"));
 
-        // served=false: armed but arm_connect failed so the op ran un-armed (no
-        // password sent) -> stay armed, transient message.
+        // served=false: armed but no secret was released (arm_connect failed → ran
+        // un-armed, or the server withheld it) -> stay armed, cause-neutral message.
         b.session.arm(make_arm());
         assert!(b.session.is_armed());
         apply_sftp_event(
@@ -1748,7 +1877,7 @@ mod tests {
             },
         );
         assert!(b.session.is_armed());
-        assert!(b.status.contains("could not arm"));
+        assert!(b.status.contains("did not complete"));
     }
 
     #[test]

@@ -11,8 +11,8 @@
 
 use std::collections::HashSet;
 use std::io::{self, Read, Write};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use zeroize::Zeroizing;
@@ -663,6 +663,21 @@ pub fn outcome_from(results: &[ServeResult], password_armed: bool) -> Outcome {
 /// in which case we return [`Outcome::TimedOut`] rather than freeze the UI thread.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
+/// The outcome to report when teardown's bounded join gives up on a stalled
+/// worker. If a secret was already released this connect (`served`, recorded by
+/// the worker in the served-latch as each `Served` lands), report it as
+/// [`Outcome::Served`] — the worker's accumulated outcome never made it down the
+/// `done` channel, but the release demonstrably happened, so a consumer (the SFTP
+/// circuit-breaker) must still see it and disarm. Otherwise the worker simply
+/// stalled with nothing served: [`Outcome::TimedOut`]. (review: served lost to the
+/// teardown TimedOut race)
+fn timed_out_outcome(served: Option<SecretKind>) -> Outcome {
+    match served {
+        Some(kind) => Outcome::Served { kind },
+        None => Outcome::TimedOut,
+    }
+}
+
 /// Per-connection handshake read budget (unix): a client that connects but never
 /// sends its `[token][prompt]` yields a timeout `Err` instead of parking the worker
 /// forever. The real helper writes immediately on connect, so this is generous.
@@ -681,6 +696,12 @@ pub struct AskpassListener {
     done: std::sync::mpsc::Receiver<Outcome>,
     stop: Arc<AtomicBool>,
     addr: String,
+    /// The kind of the most recent secret the worker actually released, written as
+    /// each `Served` lands. On the normal path the worker's `done`-channel `Outcome`
+    /// already carries this; the latch only matters when teardown times out joining a
+    /// stalled worker (its `Outcome` never sent), so a served secret is still surfaced
+    /// rather than masked as `TimedOut`. (review: served lost to the teardown race)
+    served_latch: Arc<Mutex<Option<SecretKind>>>,
     /// Windows-only: the worker publishes a duplicated handle to ITS OWN THREAD
     /// here so teardown can `CancelSynchronousIo` a stalled blocking pipe read.
     /// The worker clears+closes it (under the lock) right before returning, so a
@@ -739,7 +760,11 @@ impl AskpassListener {
                         }
                     }
                 }
-                Some(Outcome::TimedOut)
+                // A secret released before the stall is still a real outcome the
+                // worker's (never-sent) Outcome would have carried — surface it so a
+                // consumer (the SFTP breaker) does not miss a served-then-rejected
+                // password that raced teardown.
+                Some(timed_out_outcome(*self.served_latch.lock().unwrap()))
             }
         }
     }
@@ -785,6 +810,11 @@ pub fn arm_connect(
     let password_armed = password.is_some();
     let stop = Arc::new(AtomicBool::new(false));
     let stop_worker = Arc::clone(&stop);
+    // Records the kind of each secret the worker actually releases, so a stalled
+    // teardown (whose join times out before the worker's Outcome is sent) can still
+    // surface a `Served` rather than mask it as `TimedOut`.
+    let served_latch = Arc::new(Mutex::new(None::<SecretKind>));
+    let served_latch_worker = Arc::clone(&served_latch);
     let (done_tx, done) = std::sync::mpsc::channel();
     #[cfg(windows)]
     let cancel_slot = Arc::new(std::sync::Mutex::new(None::<isize>));
@@ -822,6 +852,11 @@ pub fn arm_connect(
         loop {
             match listener.serve_one(&mut secrets) {
                 Ok(r) => {
+                    // Latch a release as it happens so a stalled teardown can still
+                    // report it (the worker's final Outcome may never be sent).
+                    if let ServeResult::Served(kind) = &r {
+                        *served_latch_worker.lock().unwrap() = Some(*kind);
+                    }
                     results.push(r);
                     if stop_worker.load(Ordering::SeqCst) {
                         break;
@@ -866,6 +901,7 @@ pub fn arm_connect(
             done,
             stop,
             addr,
+            served_latch,
             #[cfg(windows)]
             cancel_slot,
         },
@@ -1513,6 +1549,86 @@ mod tests {
                 kind: SecretKind::Password
             }
         );
+    }
+
+    #[test]
+    fn timed_out_outcome_reports_a_served_secret() {
+        use super::{Outcome, timed_out_outcome};
+        use crate::os::vault::SecretKind;
+        // A stalled teardown with NOTHING served stays TimedOut.
+        assert_eq!(timed_out_outcome(None), Outcome::TimedOut);
+        // But a secret released BEFORE the stall is reported as Served so a consumer
+        // (the SFTP circuit-breaker) cannot miss a real password release that raced
+        // teardown and then re-send the rejected password. (review: served lost to
+        // the teardown TimedOut race)
+        assert_eq!(
+            timed_out_outcome(Some(SecretKind::Password)),
+            Outcome::Served {
+                kind: SecretKind::Password
+            }
+        );
+        assert_eq!(
+            timed_out_outcome(Some(SecretKind::Passphrase)),
+            Outcome::Served {
+                kind: SecretKind::Passphrase
+            }
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn served_outcome_survives_a_stalled_teardown() {
+        // End-to-end: a real password serve, then a SECOND peer stalls mid-handshake
+        // so teardown's join times out. The served latch must still surface Served
+        // (not TimedOut), or the breaker would miss the rejection. (unix-only: mirrors
+        // the stall mechanics of `teardown_is_bounded_when_a_peer_stalls_mid_handshake`)
+        use super::{
+            CHANNEL_ENV, Outcome, ResolvedIdentity, TOKEN_ENV, arm_connect, connect_client,
+            parse_token_hex, read_reply, write_request,
+        };
+        use crate::os::vault::{Secret, SecretKind};
+        use std::time::Duration;
+
+        let id = ResolvedIdentity {
+            user: "deploy".into(),
+            host: "web1".into(),
+            host_key_alias: None,
+            identity_paths: vec![],
+        };
+        let (listener, env) = arm_connect(id, Some(Secret::from("hunter2")), None).unwrap();
+        let get = |k: &str| {
+            env.iter()
+                .find(|(n, _)| n == k)
+                .map(|(_, v)| v.to_string_lossy().into_owned())
+        };
+        let addr = get(CHANNEL_ENV).unwrap();
+        let token = parse_token_hex(&get(TOKEN_ENV).unwrap()).unwrap();
+
+        // 1. A real serve: the password is released and the latch records it.
+        let mut c1 = connect_client(&addr).unwrap();
+        write_request(&mut c1, &token, "deploy@web1's password: ").unwrap();
+        assert_eq!(
+            read_reply(&mut c1).unwrap().as_deref().map(String::as_str),
+            Some("hunter2")
+        );
+        drop(c1);
+
+        // 2. Let the worker record the serve and loop back to accept, then a second
+        // peer connects and STALLS (sends nothing), parking the worker in read where
+        // the teardown wake can't reach it.
+        std::thread::sleep(Duration::from_millis(150));
+        let held = connect_client(&addr).unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+
+        // 3. The join times out, but a secret WAS served -> Served, not TimedOut.
+        let outcome = listener.stop_and_join();
+        assert_eq!(
+            outcome,
+            Outcome::Served {
+                kind: SecretKind::Password
+            }
+        );
+        drop(held);
     }
 
     #[cfg(unix)]
