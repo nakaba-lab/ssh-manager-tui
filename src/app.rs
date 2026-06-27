@@ -155,29 +155,44 @@ pub enum Screen {
     VaultEntry {
         editing: Option<usize>,
     },
-    /// One-time connect-time **password** consent modal, shown before arming a
-    /// stored password the first time the resolved `<user@host>` is targeted this
-    /// session. Carries **no secret** — only the resolved `target` (for display),
-    /// the armed `kinds`, and the `alias`/`mode` needed to resume the connect.
-    /// Enter confirms (arm the password); Esc/`n` declines (passphrase stays
-    /// armed, password withheld). A consent/typo guard, not a redirect defense.
+    /// One-time **password** consent modal, shown before arming a stored password
+    /// the first time the resolved `<user@host>` is targeted this session — from
+    /// either the connect path or the SFTP browser launch (see `origin`). Carries
+    /// **no secret** — only the resolved `target` (for display), the armed `kinds`,
+    /// the `alias`, and the `origin` needed to resume. Enter confirms (arm the
+    /// password); Esc/`n` declines (passphrase stays armed, password withheld). A
+    /// consent/typo guard, not a redirect defense.
     PasswordConfirm {
         alias: String,
+        kinds: MatchedKinds,
+        target: String,
+        origin: PasswordConfirmOrigin,
+    },
+}
+
+/// Where a [`Screen::PasswordConfirm`] modal was opened from — determines what its
+/// Enter (confirm) / Esc (decline) resumes. Both paths gate a server-facing
+/// password identically; the modal only differs in what it re-enters afterwards.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PasswordConfirmOrigin {
+    /// The connect path: resume `connect_by_alias` with the cached `ssh -G`
+    /// resolution (`rc`) so the Confirmed/Withheld re-entry need not re-run `ssh -G`
+    /// (which would execute any `Match exec` predicate a second time), plus the
+    /// `mode`/`protocol`/overrides needed to rebuild the same launch. Boxed values
+    /// keep the `Screen` enum small.
+    Connect {
         mode: ConnectMode,
         /// Which client (`ssh` / `sftp`) the resumed connect launches.
         protocol: Protocol,
-        kinds: MatchedKinds,
-        target: String,
-        /// The `ssh -G` resolution from the first (Ask) pass, cached so the
-        /// Confirmed/Withheld re-entry need not re-run `ssh -G` (which would
-        /// execute any `Match exec` predicate a second time). Boxed to keep the
-        /// `Screen` enum small.
         rc: Box<ResolvedConfig>,
         /// Ad-hoc overrides to re-apply on the resumed connect (empty for a plain
-        /// saved-host connect). Carried so the consent re-entry rebuilds the same
-        /// `ssh` args it would have without the detour through the modal.
+        /// saved-host connect).
         ov: Box<ConnectOverrides>,
     },
+    /// The SFTP browser launch (`b`): open the browser for this `host` index. On
+    /// confirm the consent is recorded first, so the browser's arm recipe then
+    /// releases the password; on decline the browser opens un-armed.
+    SftpBrowse { host: usize },
 }
 
 /// Which form a key/host picker was opened from — drives where it returns and
@@ -782,11 +797,17 @@ pub struct App {
     pub vault_entry: VaultEntryForm,
     /// When true, secrets are shown in the clear instead of masked.
     pub vault_reveal: bool,
-    /// Session opt-in for connect-time **password** auto-fill (off by default:
-    /// the password method is server-facing and can burn an auth attempt under
-    /// `force`). Passphrase auto-fill is unaffected. Not persisted across restart.
-    /// Toggled with `p` on the vault screen; read by connect dispatch + the
-    /// indicator (via [`App::vault_secret_kinds`]).
+    /// Whether a vault file exists on disk. Lets the breadcrumb distinguish
+    /// "locked" (a vault exists but `vault` is `None`) from "no vault yet" without
+    /// an fs stat per render frame. Seeded at startup; set true when one is created.
+    pub has_vault_file: bool,
+    /// Opt-in for connect-time **password** auto-fill (off by default: the password
+    /// method is server-facing and can burn an auth attempt under `force`).
+    /// Passphrase auto-fill is unaffected. **Persisted** across restart via
+    /// [`os::prefs`] (seeded at startup, saved on toggle) so a user who opted in
+    /// stays in; the per-target consent set is NOT persisted. Toggled with `p` on
+    /// the vault screen; read by connect dispatch + the indicator (via
+    /// [`App::vault_secret_kinds`]).
     pub password_autofill_enabled: bool,
     /// Resolved `<user@host>` targets the user has confirmed for connect-time
     /// **password** auto-fill this session (the one-time password-confirm modal's
@@ -860,7 +881,12 @@ impl App {
             vault_unlock: VaultUnlock::default(),
             vault_entry: VaultEntryForm::default(),
             vault_reveal: false,
-            password_autofill_enabled: false,
+            has_vault_file: crate::os::vault::default_path()
+                .map(|p| p.exists())
+                .unwrap_or(false),
+            // Seed the opt-in from the persisted preference (best-effort: a missing
+            // or corrupt prefs file falls back to the safe OFF default).
+            password_autofill_enabled: crate::os::prefs::Prefs::load().password_autofill_enabled,
             confirmed_password_targets: HashSet::new(),
             password_hint_shown: false,
             clipboard_clear_at: None,

@@ -16,10 +16,10 @@ use ratatui::crossterm::terminal::{
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::app::{
-    App, ConfirmAction, ConnectMode, EditForm, FormMode, GenOrigin, ListFocus, PickOrigin,
-    SFTP_FIELDS, Screen, SftpBrowser, SftpDirection, SftpForm, SftpPane, VaultEntryForm,
-    VaultUnlock, form_from_view, form_idx, override_form_from_host, override_idx,
-    overrides_from_form, read_local_dir, view_from_form,
+    App, ConfirmAction, ConnectMode, EditForm, FormMode, GenOrigin, ListFocus,
+    PasswordConfirmOrigin, PickOrigin, SFTP_FIELDS, Screen, SftpBrowser, SftpDirection, SftpForm,
+    SftpPane, VaultEntryForm, VaultUnlock, form_from_view, form_idx, override_form_from_host,
+    override_idx, overrides_from_form, read_local_dir, view_from_form,
 };
 use crate::config::model::HostView;
 use crate::os::askpass::{
@@ -68,12 +68,10 @@ pub fn handle_key(app: &mut App, key: KeyEvent, terminal: &mut DefaultTerminal) 
         Screen::VaultEntry { editing } => handle_vault_entry(app, key, editing),
         Screen::PasswordConfirm {
             alias,
-            mode,
-            protocol,
-            rc,
-            ov,
+            target,
+            origin,
             ..
-        } => handle_password_confirm(app, key, alias, mode, protocol, rc, *ov, terminal)?,
+        } => handle_password_confirm(app, key, alias, target, origin, terminal)?,
     }
     Ok(())
 }
@@ -88,40 +86,54 @@ fn handle_password_confirm(
     app: &mut App,
     key: KeyEvent,
     alias: String,
-    mode: ConnectMode,
-    protocol: Protocol,
-    rc: Box<ResolvedConfig>,
-    ov: ConnectOverrides,
+    target: String,
+    origin: PasswordConfirmOrigin,
     terminal: &mut DefaultTerminal,
 ) -> Result<()> {
-    match key.code {
-        KeyCode::Enter | KeyCode::Char('y') => {
-            close_overlay(app);
+    // Map the keypress to a consent decision; both origins share it (confirm =>
+    // release the password, decline => withhold it, passphrase unaffected).
+    let confirmed = match key.code {
+        KeyCode::Enter | KeyCode::Char('y') => true,
+        KeyCode::Esc | KeyCode::Char('n') => false,
+        _ => return Ok(()),
+    };
+    close_overlay(app);
+    match origin {
+        PasswordConfirmOrigin::Connect {
+            mode,
+            protocol,
+            rc,
+            ov,
+        } => {
+            let choice = if confirmed {
+                PasswordChoice::Confirmed
+            } else {
+                PasswordChoice::Withheld
+            };
+            // Confirmed re-entry persists the consent inside `connect_by_alias`.
             connect_by_alias(
                 app,
                 terminal,
                 &alias,
                 mode,
                 protocol,
-                PasswordChoice::Confirmed,
+                choice,
                 Some(*rc),
-                ov,
+                *ov,
             )?;
         }
-        KeyCode::Esc | KeyCode::Char('n') => {
-            close_overlay(app);
-            connect_by_alias(
-                app,
-                terminal,
-                &alias,
-                mode,
-                protocol,
-                PasswordChoice::Withheld,
-                Some(*rc),
-                ov,
-            )?;
+        PasswordConfirmOrigin::SftpBrowse { host } => {
+            // Record consent BEFORE opening so the browser's arm recipe sees it and
+            // releases the password; a decline opens the browser un-armed (passphrase
+            // ops still work, a password op fails with the existing "press F" hint).
+            // Gate on an unlocked vault for the same reason the connect path does: a
+            // lock that fired while the modal was open (idle auto-lock) must not be
+            // resurrected past the lock boundary by a late Enter.
+            if confirmed && app.vault.is_some() {
+                app.confirmed_password_targets.insert(target);
+            }
+            open_sftp_browser(app, host);
         }
-        _ => {}
     }
     Ok(())
 }
@@ -278,7 +290,7 @@ fn handle_list(app: &mut App, key: KeyEvent, terminal: &mut DefaultTerminal) -> 
         KeyCode::Char('F') => connect_selected(app, terminal, ConnectMode::Inline, Protocol::Sftp)?,
         KeyCode::Char('b') => {
             if let Some(h) = app.selected_host() {
-                open_sftp_browser(app, h);
+                browse_host(app, h);
             }
         }
         KeyCode::Char('O') => {
@@ -624,9 +636,13 @@ fn connect_by_alias(
 
     // Resolve the confirm target + fold in the session set / explicit choice. A
     // Confirmed choice persists the consent so a later Ask connect to the same
-    // resolved target skips the modal.
+    // resolved target skips the modal. Gate the insert on an unlocked vault so a
+    // lock that fired while the modal was open (e.g. idle auto-lock) can't be
+    // resurrected past the lock boundary by a late Enter — a locked vault arms
+    // nothing anyway, so recording consent would only leak it into the next session.
     let target = rc.as_ref().map(resolved_target);
     if choice == PasswordChoice::Confirmed
+        && app.vault.is_some()
         && let Some(t) = &target
     {
         app.confirmed_password_targets.insert(t.clone());
@@ -659,12 +675,14 @@ fn connect_by_alias(
                 app,
                 Screen::PasswordConfirm {
                     alias: alias.to_string(),
-                    mode,
-                    protocol,
                     kinds,
                     target,
-                    rc: Box::new(rc),
-                    ov: Box::new(ov),
+                    origin: PasswordConfirmOrigin::Connect {
+                        mode,
+                        protocol,
+                        rc: Box::new(rc),
+                        ov: Box::new(ov),
+                    },
                 },
             );
             Ok(())
@@ -1729,18 +1747,24 @@ fn transfer_toast(base: Option<(String, bool)>, exit_code: Option<i32>) -> Optio
     base.map(|(msg, is_err)| (msg, is_err || matches!(exit_code, Some(c) if c != 0)))
 }
 
-/// The shared SFTP arming recipe: the connect_plan-parity gate decision plus the
-/// gathered vault secrets and resolved identity, or `None` when the host is not an
-/// auto-fill candidate. Both arming entry points (the inline transfer and the
-/// browser) build on this so their gates can never diverge (GAP 1/2) — including the
-/// System32-ssh gate below, which BOTH must honor: a secret is auto-filled only when
-/// the resolved client is the trusted System32 OpenSSH build (on unix `is_system32`
-/// is always true, so the gate is a Windows-only no-op elsewhere).
-fn sftp_arm_recipe(app: &App, host: &HostView, alias: &str) -> Option<crate::os::sftp::SftpArm> {
+/// The connect-parity gate inputs shared by every SFTP arming path (the inline
+/// transfer recipe AND the browser's pre-launch consent check). Computing these in
+/// ONE place means the consent nudge can never disagree with what actually arms
+/// (GAP 1/2). `None` when the host is not an auto-fill candidate at all: the client
+/// isn't the trusted System32 OpenSSH build (on unix `is_system32` is always true,
+/// so a Windows-only no-op elsewhere), the vault holds no match, a `Match exec`
+/// blocks resolution, or the alias won't resolve.
+struct SftpArmGate {
+    rc: ResolvedConfig,
+    candidacy: MatchedKinds,
+    is_proxied: bool,
+    is_known: bool,
+}
+
+fn sftp_arm_gate(app: &App, host: &HostView, alias: &str) -> Option<SftpArmGate> {
     // Never arm against the Git/MSYS `[PATH ssh]` fallback build (its force/console
     // handling differs, and a planted bare `ssh`/`sftp` would receive the live
     // SSH_ASKPASS token); only the System32 OpenSSH client is trusted for auto-fill.
-    // Shared here so the browse AND inline-transfer paths inherit it identically.
     if !crate::os::binaries::tools().is_system32 {
         return None;
     }
@@ -1751,6 +1775,25 @@ fn sftp_arm_recipe(app: &App, host: &HostView, alias: &str) -> Option<crate::os:
     let rc = resolve_config_with_options(&[], alias).ok()?;
     let is_proxied = host.is_proxied() || rc.proxy_jump.is_some() || rc.proxy_command.is_some();
     let is_known = tofu_lookup_key(&rc).is_some_and(|k| is_host_known(&k, &known_hosts_files(&rc)));
+    Some(SftpArmGate {
+        rc,
+        candidacy,
+        is_proxied,
+        is_known,
+    })
+}
+
+/// The shared SFTP arming recipe: the connect_plan-parity gate decision plus the
+/// gathered vault secrets and resolved identity, or `None` when the host is not an
+/// auto-fill candidate. Both arming entry points (the inline transfer and the
+/// browser) build on the shared [`sftp_arm_gate`] so their gates can never diverge.
+fn sftp_arm_recipe(app: &App, host: &HostView, alias: &str) -> Option<crate::os::sftp::SftpArm> {
+    let SftpArmGate {
+        rc,
+        candidacy,
+        is_proxied,
+        is_known,
+    } = sftp_arm_gate(app, host, alias)?;
     let kinds = sftp_arm_kinds(
         candidacy,
         app.password_autofill_enabled,
@@ -1770,6 +1813,66 @@ fn sftp_arm_recipe(app: &App, host: &HostView, alias: &str) -> Option<crate::os:
         password,
         passphrase,
     })
+}
+
+/// Whether opening the browser for this host would auto-fill a stored **password**
+/// *if only* the resolved target were consented — i.e. the password is a candidate,
+/// auto-fill is on, the client isolates keyboard-interactive, and the host is
+/// trusted and not proxied, but the target is not yet in the session consent set.
+/// Returns the resolved `<user@host>` to consent to (and the kinds that will then
+/// arm, for the modal's display). `None` when the password would arm anyway (already
+/// consented), when no password is involved, or when a non-consent gate blocks it —
+/// in all those cases the browser just opens, exactly as before. This is the ONLY
+/// new gate the browse path adds; it never *widens* what arms, only collects the
+/// same consent the connect path already requires (closing GAP: the browser had no
+/// place to gather it, forcing an inline-connect-then-browse workaround).
+fn sftp_password_consent_needed(
+    app: &App,
+    host: &HostView,
+    alias: &str,
+) -> Option<(String, MatchedKinds)> {
+    let SftpArmGate {
+        rc,
+        candidacy,
+        is_proxied,
+        is_known,
+    } = sftp_arm_gate(app, host, alias)?;
+    let target = resolved_target(&rc);
+    if !browser_should_prompt_password(
+        candidacy.password,
+        app.password_autofill_enabled,
+        app.confirmed_password_targets.contains(&target),
+        crate::os::askpass::ssh_kbdint_prefix_supported(),
+        is_proxied,
+        is_known,
+    ) {
+        return None;
+    }
+    let kinds = MatchedKinds {
+        password: true,
+        passphrase: candidacy.passphrase,
+    };
+    Some((target, kinds))
+}
+
+/// The pure consent-nudge predicate: whether the browser should show the password
+/// consent modal, given the already-computed gates. It fires for **exactly** the
+/// inputs where the only thing withholding the password is the missing consent — so
+/// it is `should_arm_sftp_password` with the consent flag flipped to "not yet given"
+/// (plus the two blanket gates), and never widens what the recipe would otherwise
+/// arm. Pure, so this equivalence is unit-tested against the arm predicate directly.
+fn browser_should_prompt_password(
+    candidate_password: bool,
+    autofill_enabled: bool,
+    target_consented: bool,
+    kbdint_supported: bool,
+    is_proxied: bool,
+    is_known: bool,
+) -> bool {
+    !is_proxied
+        && is_known
+        && !target_consented
+        && should_arm_sftp_password(candidate_password, autofill_enabled, true, kbdint_supported)
 }
 
 /// Arm a connect-time askpass listener for an inline SFTP transfer. The host's
@@ -1867,6 +1970,47 @@ impl Drop for TempCleanup {
 // ---------------------------------------------------------------------------
 // Dual-pane SFTP browser (Phase 3, M3.3)
 // ---------------------------------------------------------------------------
+
+/// The `b` browse entry point: if a stored password would auto-fill but the
+/// resolved target isn't yet session-consented, collect that consent via the shared
+/// [`Screen::PasswordConfirm`] modal FIRST (so the browser arms it on resume);
+/// otherwise open the browser directly. This is what removes the old
+/// inline-sftp → Ctrl+C → browse workaround for password-only hosts: the consent the
+/// browser needs can now be given in-flow instead of only as a connect-path side
+/// effect. The cheap pre-checks (no `ssh -G`) keep the common case at one resolve.
+fn browse_host(app: &mut App, host: usize) {
+    // Compute the modal (if any) in a scope that ends every immutable borrow of
+    // `app` before the mutable open below. Only a password candidate with auto-fill
+    // on can possibly need consent, so the expensive `ssh -G` gate in
+    // `sftp_password_consent_needed` runs only then — every other host opens with the
+    // single resolve `open_sftp_browser` already does.
+    let modal = {
+        let Some(h) = app.hosts.get(host) else {
+            return;
+        };
+        let maybe_password =
+            app.password_autofill_enabled && app.vault_secret_kinds(h).is_some_and(|k| k.password);
+        if maybe_password {
+            let alias = h.alias().to_string();
+            sftp_password_consent_needed(app, h, &alias)
+                .map(|(target, kinds)| (alias, target, kinds))
+        } else {
+            None
+        }
+    };
+    match modal {
+        Some((alias, target, kinds)) => open_overlay(
+            app,
+            Screen::PasswordConfirm {
+                alias,
+                kinds,
+                target,
+                origin: PasswordConfirmOrigin::SftpBrowse { host },
+            },
+        ),
+        None => open_sftp_browser(app, host),
+    }
+}
 
 /// Open the browser for `host`: seed the local pane at the user's home and kick
 /// off the initial remote listing (`.` → resolved to the absolute home + listed).
@@ -2520,11 +2664,12 @@ fn handle_vault(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Flip the session-scoped connect-time **password** auto-fill opt-in. Off by
-/// default because the password method is server-facing under `SSH_ASKPASS=force`
-/// and a server offering keyboard-interactive (not `password`) would burn an auth
-/// attempt; passphrase auto-fill is always on and unaffected. Enabling also still
-/// requires a one-time per-target confirm at connect time.
+/// Flip the connect-time **password** auto-fill opt-in. Off by default because the
+/// password method is server-facing under `SSH_ASKPASS=force` and a server offering
+/// keyboard-interactive (not `password`) would burn an auth attempt; passphrase
+/// auto-fill is always on and unaffected. Enabling also still requires a one-time
+/// per-target confirm at connect time. The new value is **persisted** so the opt-in
+/// survives restart; the per-target consent set is not.
 fn toggle_password_autofill(app: &mut App) {
     app.password_autofill_enabled = !app.password_autofill_enabled;
     if app.password_autofill_enabled {
@@ -2536,6 +2681,16 @@ fn toggle_password_autofill(app: &mut App) {
         // Disabling drops any consents so re-enabling re-asks per target.
         app.confirmed_password_targets.clear();
         app.toast("password auto-fill OFF", false);
+    }
+    // Persist the opt-in (the user's #2 request). A write failure is non-fatal — the
+    // session still honors the in-memory toggle — but surfaced as a sticky error so
+    // a silently-unsaved preference doesn't mislead. The error toast replaces the
+    // ON/OFF one above (the failure is the more important thing to show).
+    let prefs = crate::os::prefs::Prefs {
+        password_autofill_enabled: app.password_autofill_enabled,
+    };
+    if let Err(e) = prefs.save() {
+        app.toast(format!("auto-fill preference not saved: {e}"), true);
     }
 }
 
@@ -2631,16 +2786,22 @@ fn submit_vault_unlock(app: &mut App) {
         Ok(v) => {
             let n = v.entries.len();
             app.vault = Some(v);
+            // A fresh create means a vault file now exists on disk (the breadcrumb's
+            // locked-vs-absent cue keys off this without an fs stat per frame).
+            app.has_vault_file = true;
             app.vault_state.select((n > 0).then_some(0));
             // Replacing the struct drops the old one, whose Drop scrubs the password.
             app.vault_unlock = VaultUnlock::default();
             app.prev_screen = None;
             app.screen = Screen::Vault;
+            // On unlock, nudge discoverability: stored passphrases auto-fill on the
+            // next connect with no further opt-in, while the server-facing password
+            // stays behind the `p` toggle (front-loaded so it survives toast clipping).
             app.toast(
                 if creating {
                     "vault created"
                 } else {
-                    "vault unlocked"
+                    "vault unlocked — passphrases auto-fill on connect; press p for passwords"
                 },
                 false,
             );
@@ -3317,6 +3478,54 @@ mod tests {
         assert!(!should_arm_sftp_password(true, false, true, true)); // autofill off
         assert!(!should_arm_sftp_password(true, true, false, true)); // not consented
         assert!(!should_arm_sftp_password(true, true, true, false)); // old OpenSSH (#6)
+    }
+
+    #[test]
+    fn browser_prompts_password_iff_consent_is_the_sole_blocker() {
+        // The browse-time consent modal must fire for EXACTLY the inputs where the
+        // only thing withholding the password is the missing consent — never widen
+        // what arms. Property: prompt(c, a, consented, k, prox, known) is true iff the
+        // password WOULD arm given consent (`should_arm_sftp_password(.., true, ..)`
+        // plus the two blanket gates) AND it is not already consented. Checked across
+        // the full truth table so the predicate can't drift from the arm logic.
+        for &c in &[false, true] {
+            for &a in &[false, true] {
+                for &consented in &[false, true] {
+                    for &k in &[false, true] {
+                        for &prox in &[false, true] {
+                            for &known in &[false, true] {
+                                let would_arm_if_consented =
+                                    !prox && known && should_arm_sftp_password(c, a, true, k);
+                                let expected = would_arm_if_consented && !consented;
+                                assert_eq!(
+                                    browser_should_prompt_password(c, a, consented, k, prox, known),
+                                    expected,
+                                    "c={c} a={a} consented={consented} k={k} prox={prox} known={known}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Spot-check the headline case: a known, non-proxied, kbd-isolatable password
+        // host with autofill on but NOT yet consented -> prompt (this is the case the
+        // old inline-sftp -> Ctrl+C -> browse workaround existed to satisfy).
+        assert!(browser_should_prompt_password(
+            true, true, false, true, false, true
+        ));
+        // Already consented -> no prompt (the recipe arms it directly).
+        assert!(!browser_should_prompt_password(
+            true, true, true, true, false, true
+        ));
+        // Un-trusted (TOFU) or proxied -> no prompt even un-consented (a nudge that
+        // could never pay off, since the blanket gates withhold the password anyway).
+        assert!(!browser_should_prompt_password(
+            true, true, false, true, false, false
+        ));
+        assert!(!browser_should_prompt_password(
+            true, true, false, true, true, true
+        ));
     }
 
     #[test]
