@@ -127,4 +127,35 @@ mod tests {
         assert_eq!(parse(&json), on);
         assert!(parse(&json).password_autofill_enabled);
     }
+
+    #[test]
+    fn write_atomic_overwrites_in_place() {
+        // P5's core promise — persisting an opt-in OVER an existing prefs file —
+        // goes through the swap (`#[cfg(windows)]` pre-remove then rename), this
+        // project's most error-prone area. `write_atomic` takes an explicit path
+        // (unlike the vault, which can't be redirected on Windows), so exercise the
+        // overwrite directly in a scratch dir: write A, overwrite with longer B, read
+        // back == B. Both an enlarging and a shrinking overwrite are covered so a
+        // rename that left stale tail bytes would be caught.
+        let dir =
+            std::env::temp_dir().join(crate::secure_fs::temp_name(".sshm-prefstest").unwrap());
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sshm-prefs.json");
+
+        write_atomic(&path, b"AA").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "AA");
+        write_atomic(&path, b"BBBBBBBB").unwrap(); // grow
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "BBBBBBBB");
+        write_atomic(&path, b"c").unwrap(); // shrink — no stale tail
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "c");
+
+        // And a real Prefs survives the save-shaped serialize -> write -> load cycle.
+        let on = Prefs {
+            password_autofill_enabled: true,
+        };
+        write_atomic(&path, serde_json::to_string_pretty(&on).unwrap().as_bytes()).unwrap();
+        assert_eq!(parse(&std::fs::read_to_string(&path).unwrap()), on);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
