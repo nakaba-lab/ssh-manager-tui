@@ -9,6 +9,7 @@ pub mod history;
 pub mod keys;
 pub mod known_hosts;
 pub mod liveness;
+pub mod prefs;
 pub mod resolve;
 pub mod sftp;
 pub mod vault;

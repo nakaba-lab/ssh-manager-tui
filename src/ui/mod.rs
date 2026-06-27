@@ -172,6 +172,26 @@ fn draw_title(f: &mut Frame, app: &App, base: &Screen, area: Rect) {
         ),
         Span::styled(count, Style::default().fg(theme::FAINT)),
     ];
+    // Vault status chip (List only): surfaces the otherwise-hidden `P` entry point
+    // and a coarse lock/unlock state. The boolean lock state leaks no per-host
+    // affiliation, so it is safe to show (unlike a per-host "has secret" cue).
+    if matches!(base, Screen::List) {
+        spans.push(Span::styled("   ", Style::default().fg(theme::FAINT)));
+        spans.push(Span::styled(
+            "P",
+            Style::default()
+                .fg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD),
+        ));
+        let state = if app.vault.is_some() {
+            Span::styled(" vault unlocked", Style::default().fg(theme::UP))
+        } else if app.has_vault_file {
+            Span::styled(" vault locked", Style::default().fg(theme::DIM))
+        } else {
+            Span::styled(" vault", Style::default().fg(theme::DIM))
+        };
+        spans.push(state);
+    }
     if app.ssh_path_warning {
         spans.push(Span::styled(
             "  [PATH ssh]",
