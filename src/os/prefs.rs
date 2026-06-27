@@ -51,7 +51,11 @@ impl Prefs {
 
     /// Persist atomically and owner-private. Surfaced to the caller (which toasts a
     /// failure) but never panics or corrupts an existing file. The data is
-    /// regenerable, so — unlike the vault — no `.bak` crash-recovery copy is kept.
+    /// regenerable, so — unlike the vault — no `.bak` crash-recovery copy is kept; a
+    /// rename failure on Windows (after the pre-remove) can leave no file, reverting
+    /// the opt-in to its OFF default on next launch (the toast tells the user the save
+    /// failed). On unix the rename replaces atomically, so a failure leaves the old
+    /// value intact.
     pub fn save(&self) -> anyhow::Result<()> {
         let Some(path) = default_path() else {
             anyhow::bail!("cannot resolve ~/.ssh for preferences");
@@ -63,10 +67,8 @@ impl Prefs {
 }
 
 /// Write `bytes` to `path` atomically and owner-private via the shared `secure_fs`
-/// primitives: an O_EXCL, owner-only temp is fsynced then renamed in. Windows
-/// `rename` fails if the destination exists, so it is removed first (the same
-/// convention the config/vault writers use); prefs are regenerable, so the brief
-/// "neither file exists" window a crash there could leave is harmless.
+/// primitives: an O_EXCL, owner-only temp is fsynced then renamed in. Prefs are
+/// regenerable, so unlike the vault there is no `.bak` dance.
 fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     crate::secure_fs::create_dir_private(dir)?;
@@ -84,7 +86,11 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         return Err(e);
     }
 
-    let _ = fs::remove_file(path); // Windows rename won't clobber an existing dest.
+    // Windows `rename` won't clobber an existing dest, so remove it first; unix
+    // `rename` replaces atomically, so the pre-remove (which briefly leaves no file)
+    // is Windows-only — keeping unix free of that loss window.
+    #[cfg(windows)]
+    let _ = fs::remove_file(path);
     if let Err(e) = fs::rename(&tmp, path) {
         let _ = fs::remove_file(&tmp);
         return Err(e);

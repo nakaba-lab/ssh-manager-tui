@@ -66,14 +66,22 @@ pub fn handle_key(app: &mut App, key: KeyEvent, terminal: &mut DefaultTerminal) 
         Screen::Vault => handle_vault(app, key),
         Screen::VaultUnlock => handle_vault_unlock(app, key),
         Screen::VaultEntry { editing } => handle_vault_entry(app, key, editing),
-        Screen::PasswordConfirm {
-            alias,
-            target,
-            origin,
-            ..
-        } => handle_password_confirm(app, key, alias, target, origin, terminal)?,
+        Screen::PasswordConfirm { target, origin, .. } => {
+            handle_password_confirm(app, key, target, origin, terminal)?
+        }
     }
     Ok(())
+}
+
+/// Whether a confirmed password consent should actually be recorded: only when the
+/// vault is still unlocked. Shared by BOTH consent-insert sites (connect + browse)
+/// so they stay symmetric, and so an idle auto-lock that fired while the modal was
+/// open can't be resurrected past the lock boundary by a late confirm (a locked
+/// vault arms nothing, so a recorded consent would only leak into the next session).
+/// Pure, so the load-bearing guard is unit-tested — a dropped `&& vault_unlocked`
+/// would otherwise pass the whole suite silently.
+fn consent_should_be_recorded(confirmed: bool, vault_unlocked: bool) -> bool {
+    confirmed && vault_unlocked
 }
 
 /// The one-time password-confirm modal: Enter/`y` confirms (re-enter the connect
@@ -81,11 +89,9 @@ pub fn handle_key(app: &mut App, key: KeyEvent, terminal: &mut DefaultTerminal) 
 /// still arms). The cached `rc` from the first pass is handed back so the re-entry
 /// reuses it instead of running `ssh -G` again. Closing the overlay first returns
 /// to the base screen (List) so the inline connect suspends/restores over it.
-#[allow(clippy::too_many_arguments)]
 fn handle_password_confirm(
     app: &mut App,
     key: KeyEvent,
-    alias: String,
     target: String,
     origin: PasswordConfirmOrigin,
     terminal: &mut DefaultTerminal,
@@ -100,6 +106,7 @@ fn handle_password_confirm(
     close_overlay(app);
     match origin {
         PasswordConfirmOrigin::Connect {
+            alias,
             mode,
             protocol,
             rc,
@@ -126,10 +133,10 @@ fn handle_password_confirm(
             // Record consent BEFORE opening so the browser's arm recipe sees it and
             // releases the password; a decline opens the browser un-armed (passphrase
             // ops still work, a password op fails with the existing "press F" hint).
-            // Gate on an unlocked vault for the same reason the connect path does: a
-            // lock that fired while the modal was open (idle auto-lock) must not be
-            // resurrected past the lock boundary by a late Enter.
-            if confirmed && app.vault.is_some() {
+            // The vault.is_some() gate (shared with the connect path) keeps an idle
+            // auto-lock that fired while the modal was open from resurrecting consent
+            // past the lock boundary on a late Enter.
+            if consent_should_be_recorded(confirmed, app.vault.is_some()) {
                 app.confirmed_password_targets.insert(target);
             }
             open_sftp_browser(app, host);
@@ -641,8 +648,7 @@ fn connect_by_alias(
     // resurrected past the lock boundary by a late Enter — a locked vault arms
     // nothing anyway, so recording consent would only leak it into the next session.
     let target = rc.as_ref().map(resolved_target);
-    if choice == PasswordChoice::Confirmed
-        && app.vault.is_some()
+    if consent_should_be_recorded(choice == PasswordChoice::Confirmed, app.vault.is_some())
         && let Some(t) = &target
     {
         app.confirmed_password_targets.insert(t.clone());
@@ -674,10 +680,10 @@ fn connect_by_alias(
             open_overlay(
                 app,
                 Screen::PasswordConfirm {
-                    alias: alias.to_string(),
                     kinds,
                     target,
                     origin: PasswordConfirmOrigin::Connect {
+                        alias: alias.to_string(),
                         mode,
                         protocol,
                         rc: Box::new(rc),
@@ -1992,17 +1998,16 @@ fn browse_host(app: &mut App, host: usize) {
             app.password_autofill_enabled && app.vault_secret_kinds(h).is_some_and(|k| k.password);
         if maybe_password {
             let alias = h.alias().to_string();
+            // The browser resumes by host index, so the modal needs no alias.
             sftp_password_consent_needed(app, h, &alias)
-                .map(|(target, kinds)| (alias, target, kinds))
         } else {
             None
         }
     };
     match modal {
-        Some((alias, target, kinds)) => open_overlay(
+        Some((target, kinds)) => open_overlay(
             app,
             Screen::PasswordConfirm {
-                alias,
                 kinds,
                 target,
                 origin: PasswordConfirmOrigin::SftpBrowse { host },
@@ -3471,6 +3476,18 @@ mod tests {
         assert_eq!(clamp_idx(2, 3, 1), 2); // can't exceed len-1
         assert_eq!(clamp_idx(1, 3, 1), 2);
         assert_eq!(clamp_idx(2, 3, -1), 1);
+    }
+
+    #[test]
+    fn consent_recorded_only_when_vault_unlocked() {
+        // The consent insert (both connect + browse paths) must fire only on a confirm
+        // AND an unlocked vault — so an idle auto-lock that fired while the modal was
+        // open can't resurrect consent past the lock boundary on a late confirm. A
+        // dropped `&& vault_unlocked` would otherwise pass the whole suite silently.
+        assert!(consent_should_be_recorded(true, true));
+        assert!(!consent_should_be_recorded(true, false)); // vault locked mid-modal
+        assert!(!consent_should_be_recorded(false, true)); // declined
+        assert!(!consent_should_be_recorded(false, false));
     }
 
     #[test]
