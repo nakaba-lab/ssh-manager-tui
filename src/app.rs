@@ -159,11 +159,10 @@ pub enum Screen {
     /// the first time the resolved `<user@host>` is targeted this session — from
     /// either the connect path or the SFTP browser launch (see `origin`). Carries
     /// **no secret** — only the resolved `target` (for display), the armed `kinds`,
-    /// the `alias`, and the `origin` needed to resume. Enter confirms (arm the
-    /// password); Esc/`n` declines (passphrase stays armed, password withheld). A
-    /// consent/typo guard, not a redirect defense.
+    /// and the `origin` needed to resume. Enter confirms (arm the password); Esc/`n`
+    /// declines (passphrase stays armed, password withheld). A consent/typo guard,
+    /// not a redirect defense.
     PasswordConfirm {
-        alias: String,
         kinds: MatchedKinds,
         target: String,
         origin: PasswordConfirmOrigin,
@@ -175,12 +174,14 @@ pub enum Screen {
 /// password identically; the modal only differs in what it re-enters afterwards.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PasswordConfirmOrigin {
-    /// The connect path: resume `connect_by_alias` with the cached `ssh -G`
-    /// resolution (`rc`) so the Confirmed/Withheld re-entry need not re-run `ssh -G`
-    /// (which would execute any `Match exec` predicate a second time), plus the
-    /// `mode`/`protocol`/overrides needed to rebuild the same launch. Boxed values
-    /// keep the `Screen` enum small.
+    /// The connect path: resume `connect_by_alias` for `alias` with the cached
+    /// `ssh -G` resolution (`rc`) so the Confirmed/Withheld re-entry need not re-run
+    /// `ssh -G` (which would execute any `Match exec` predicate a second time), plus
+    /// the `mode`/`protocol`/overrides needed to rebuild the same launch. `alias`
+    /// lives here (not on the shared modal) because only this path resumes by alias —
+    /// the browser resumes by host index. Boxed values keep the `Screen` enum small.
     Connect {
+        alias: String,
         mode: ConnectMode,
         /// Which client (`ssh` / `sftp`) the resumed connect launches.
         protocol: Protocol,
@@ -1271,12 +1272,19 @@ impl App {
     fn idle_autolock(&mut self) -> bool {
         if self.vault.is_some() && self.last_activity.elapsed() >= VAULT_IDLE_LOCK {
             self.lock_vault();
-            // Bounce off any vault screen to the safe list view. `Screen::VaultUnlock`
+            // Bounce off any vault screen to the safe list view, INCLUDING an open
+            // password-consent modal (else it would hover over a now-locked vault; the
+            // lock already cleared consent + disarmed, so the modal is moot). Clear
+            // prev_screen too since PasswordConfirm is an overlay. `Screen::VaultUnlock`
             // is intentionally NOT matched: it is only reachable while the vault is
             // locked (see `open_vault`), so the `vault.is_some()` guard above already
             // excludes it — don't "fix" the apparent asymmetry.
-            if matches!(self.screen, Screen::Vault | Screen::VaultEntry { .. }) {
+            if matches!(
+                self.screen,
+                Screen::Vault | Screen::VaultEntry { .. } | Screen::PasswordConfirm { .. }
+            ) {
                 self.screen = Screen::List;
+                self.prev_screen = None;
             }
             self.toast("vault auto-locked (idle)", false);
             return true;

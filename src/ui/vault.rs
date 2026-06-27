@@ -228,7 +228,7 @@ pub fn draw_password_confirm(
         )),
         Line::from(""),
         Line::from(Span::styled(
-            "  Enter send · Esc skip (connect without it)",
+            "  Enter send · Esc skip (continue without it)",
             Style::default().fg(theme::FAINT),
         )),
     ];
