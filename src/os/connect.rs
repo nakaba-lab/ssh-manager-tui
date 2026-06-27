@@ -214,15 +214,101 @@ pub fn resolve_options(ov: &ConnectOverrides) -> Vec<String> {
     a
 }
 
+/// While the TUI is suspended for an inline child, raw mode is OFF, so a Ctrl+C is
+/// no longer read as a key event — on Windows it becomes a CTRL_C_EVENT delivered to
+/// every process on the console, and sshm's default handler would call ExitProcess,
+/// killing the whole TUI instead of just ending the child session. This guard makes
+/// sshm CONSUME Ctrl+C/Ctrl+Break for the duration of the inline run so the child
+/// (`ssh`/`sftp`) handles it while sshm survives and restores the TUI.
+#[cfg(windows)]
+mod interrupt {
+    use windows_sys::Win32::System::Console::{
+        CTRL_BREAK_EVENT, CTRL_C_EVENT, SetConsoleCtrlHandler,
+    };
+
+    /// Return TRUE (`1`) for Ctrl+C/Ctrl+Break so the default handler (ExitProcess)
+    /// never runs for sshm. A *real* handler routine like this is NOT inherited by
+    /// child processes (unlike the NULL "ignore" flag), so the inline `ssh`/`sftp`
+    /// child keeps its own default Ctrl+C handling. Close/logoff/shutdown fall
+    /// through (`0`). The `BOOL` return is `i32` in windows-sys.
+    unsafe extern "system" fn consume_ctrl_c(ctrl_type: u32) -> i32 {
+        match ctrl_type {
+            CTRL_C_EVENT | CTRL_BREAK_EVENT => 1,
+            _ => 0,
+        }
+    }
+
+    /// Installs the consume-Ctrl+C handler on construction and removes it on drop.
+    pub struct InlineInterruptGuard;
+
+    impl InlineInterruptGuard {
+        pub fn install() -> Self {
+            // SAFETY: registering a console control handler is a documented,
+            // thread-safe Win32 call; `consume_ctrl_c` is a valid handler routine.
+            unsafe {
+                SetConsoleCtrlHandler(Some(consume_ctrl_c), 1);
+            }
+            InlineInterruptGuard
+        }
+    }
+
+    impl Drop for InlineInterruptGuard {
+        fn drop(&mut self) {
+            // SAFETY: removing the same handler we added; idempotent and harmless if
+            // it was already gone.
+            unsafe {
+                SetConsoleCtrlHandler(Some(consume_ctrl_c), 0);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use windows_sys::Win32::System::Console::{CTRL_CLOSE_EVENT, CTRL_SHUTDOWN_EVENT};
+
+        #[test]
+        fn consumes_interactive_interrupts_but_passes_terminating_ones() {
+            // SAFETY: the handler reads only its `ctrl_type` argument; no global state.
+            // Ctrl+C / Ctrl+Break are CONSUMED (return 1) so sshm survives the inline
+            // session instead of being terminated by the default ExitProcess handler.
+            assert_eq!(unsafe { consume_ctrl_c(CTRL_C_EVENT) }, 1);
+            assert_eq!(unsafe { consume_ctrl_c(CTRL_BREAK_EVENT) }, 1);
+            // Close / shutdown MUST fall through (return 0) so the default handler can
+            // still tear sshm down — consuming those would block a clean exit.
+            assert_eq!(unsafe { consume_ctrl_c(CTRL_CLOSE_EVENT) }, 0);
+            assert_eq!(unsafe { consume_ctrl_c(CTRL_SHUTDOWN_EVENT) }, 0);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+mod interrupt {
+    /// No-op on unix: a parent-side SIGINT-ignore would need a libc dependency this
+    /// Windows-first crate avoids, and the Ctrl+C-kills-the-TUI failure this guards
+    /// against is Windows-specific in practice (the CTRL_C_EVENT broadcast). The type
+    /// exists on every platform so `run_inline` references it uniformly (keeping the
+    /// Linux clippy gate from seeing a Windows-only symbol).
+    pub struct InlineInterruptGuard;
+
+    impl InlineInterruptGuard {
+        pub fn install() -> Self {
+            InlineInterruptGuard
+        }
+    }
+}
+
 /// Run `program` (an OpenSSH client) with inherited stdio in the current console
 /// and wait for it. The caller is responsible for suspending/restoring the TUI
 /// around this call. Used for both `ssh` and `sftp` so the two share one launch
-/// path (stdio inheritance, env bundle) and can never drift.
+/// path (stdio inheritance, env bundle) and can never drift. A Ctrl+C during the
+/// session ends the child, not sshm (see [`interrupt::InlineInterruptGuard`]).
 pub fn run_inline(
     program: &Path,
     args: &[String],
     env: &[(OsString, OsString)],
 ) -> io::Result<std::process::ExitStatus> {
+    let _interrupt = interrupt::InlineInterruptGuard::install();
     Command::new(program)
         .args(args)
         .envs(env.iter().map(|(k, v)| (k, v)))
