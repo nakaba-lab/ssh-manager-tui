@@ -239,23 +239,33 @@ mod interrupt {
     }
 
     /// Installs the consume-Ctrl+C handler on construction and removes it on drop.
-    pub struct InlineInterruptGuard;
+    /// `installed` records whether `SetConsoleCtrlHandler` actually accepted the
+    /// registration, so Drop only deregisters what was really added. A failed install
+    /// (only plausible under memory exhaustion, where the process is already doomed)
+    /// is NOT masked as success: sshm simply stays on its default handler, so a Ctrl+C
+    /// would end the whole TUI — the pre-fix behavior — rather than being silently
+    /// believed handled. This os-layer type has no in-TUI log/toast channel, so the
+    /// failure is recorded in the flag but not otherwise surfaced.
+    pub struct InlineInterruptGuard {
+        installed: bool,
+    }
 
     impl InlineInterruptGuard {
         pub fn install() -> Self {
             // SAFETY: registering a console control handler is a documented,
             // thread-safe Win32 call; `consume_ctrl_c` is a valid handler routine.
-            unsafe {
-                SetConsoleCtrlHandler(Some(consume_ctrl_c), 1);
-            }
-            InlineInterruptGuard
+            // The BOOL return (`i32`) is nonzero on success — do not assume success.
+            let installed = unsafe { SetConsoleCtrlHandler(Some(consume_ctrl_c), 1) } != 0;
+            InlineInterruptGuard { installed }
         }
     }
 
     impl Drop for InlineInterruptGuard {
         fn drop(&mut self) {
-            // SAFETY: removing the same handler we added; idempotent and harmless if
-            // it was already gone.
+            if !self.installed {
+                return; // nothing was added; do not deregister an unrelated handler
+            }
+            // SAFETY: removing the same handler we added (Add = FALSE / 0).
             unsafe {
                 SetConsoleCtrlHandler(Some(consume_ctrl_c), 0);
             }
@@ -265,7 +275,9 @@ mod interrupt {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use windows_sys::Win32::System::Console::{CTRL_CLOSE_EVENT, CTRL_SHUTDOWN_EVENT};
+        use windows_sys::Win32::System::Console::{
+            CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
+        };
 
         #[test]
         fn consumes_interactive_interrupts_but_passes_terminating_ones() {
@@ -274,9 +286,13 @@ mod interrupt {
             // session instead of being terminated by the default ExitProcess handler.
             assert_eq!(unsafe { consume_ctrl_c(CTRL_C_EVENT) }, 1);
             assert_eq!(unsafe { consume_ctrl_c(CTRL_BREAK_EVENT) }, 1);
-            // Close / shutdown MUST fall through (return 0) so the default handler can
-            // still tear sshm down — consuming those would block a clean exit.
+            // Close / logoff / shutdown MUST all fall through (return 0) so the default
+            // handler can still tear sshm down — consuming any of them would block a
+            // clean exit. LOGOFF is asserted explicitly (the doc names it but it was
+            // previously unpinned, so widening the consume arm to include it would
+            // otherwise pass unnoticed).
             assert_eq!(unsafe { consume_ctrl_c(CTRL_CLOSE_EVENT) }, 0);
+            assert_eq!(unsafe { consume_ctrl_c(CTRL_LOGOFF_EVENT) }, 0);
             assert_eq!(unsafe { consume_ctrl_c(CTRL_SHUTDOWN_EVENT) }, 0);
         }
     }
@@ -284,11 +300,19 @@ mod interrupt {
 
 #[cfg(not(windows))]
 mod interrupt {
-    /// No-op on unix: a parent-side SIGINT-ignore would need a libc dependency this
-    /// Windows-first crate avoids, and the Ctrl+C-kills-the-TUI failure this guards
-    /// against is Windows-specific in practice (the CTRL_C_EVENT broadcast). The type
-    /// exists on every platform so `run_inline` references it uniformly (keeping the
-    /// Linux clippy gate from seeing a Windows-only symbol).
+    /// No-op on unix — and deliberately so, NOT because unix is immune. A real fix
+    /// would put the inline child in its own process group (or have the parent ignore
+    /// SIGINT for the inline window), both of which need a libc dependency this
+    /// Windows-first crate avoids. So on unix a terminal Ctrl+C during the
+    /// connect/auth phase or an `sftp` transfer — when the tty is in cooked mode
+    /// (ISIG on) — is still delivered to sshm and ENDS THE WHOLE TUI, the same class
+    /// of failure the Windows path fixes. It is less damaging here: `suspend_tui`
+    /// already left the alternate screen and disabled raw mode, so the process drops
+    /// cleanly to the shell rather than corrupting the terminal, and an established
+    /// interactive `ssh` session is unaffected (ssh raw-modes the tty itself and
+    /// forwards Ctrl+C to the remote). The type exists on every platform so
+    /// `run_inline` references it uniformly (keeping the Linux clippy gate from seeing
+    /// a Windows-only symbol).
     pub struct InlineInterruptGuard;
 
     impl InlineInterruptGuard {
