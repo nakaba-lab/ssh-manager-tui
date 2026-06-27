@@ -194,7 +194,13 @@ fn list_batch(path: &str) -> Option<String> {
     if path == "." {
         return Some("pwd\nls -la\n".to_string());
     }
-    Some(format!("ls -la {}\n", sftp_quote(path)?))
+    // `cd <path>` then a bare `ls -la` — NOT `ls -la <path>`. sftp's `ls` prefixes
+    // every entry with the path argument it was given (e.g. `/dir/.`, `/dir/..`,
+    // `/dir/sub`), so `ls -la <path>` would make each entry name an absolute path:
+    // `remote_join(cwd, name)` then doubles it (`/dir//dir/sub`) and the `.`/`..`
+    // rows are no longer dropped (their names are `/dir/.`, not `.`). Changing the
+    // session's cwd first and listing it with a bare `ls -la` yields simple names.
+    Some(format!("cd {}\nls -la\n", sftp_quote(path)?))
 }
 
 /// A live browse session against one saved host. Holds the channel the UI drains
@@ -673,14 +679,16 @@ mod tests {
     fn list_batch_scripts() {
         // The "." sentinel resolves the home dir via pwd, then lists it.
         assert_eq!(list_batch("."), Some("pwd\nls -la\n".to_string()));
-        // A concrete absolute path is just listed (quoted if it has whitespace).
+        // A concrete path is `cd`'d into, then listed with a bare `ls -la` (quoted
+        // if it has whitespace) — NOT `ls -la <path>`, which would prefix every
+        // entry name with the path. See the list_batch comment.
         assert_eq!(
             list_batch("/var/log"),
-            Some("ls -la /var/log\n".to_string())
+            Some("cd /var/log\nls -la\n".to_string())
         );
         assert_eq!(
             list_batch("/srv/new dir"),
-            Some("ls -la \"/srv/new dir\"\n".to_string())
+            Some("cd \"/srv/new dir\"\nls -la\n".to_string())
         );
         // An unsafe path can't be expressed → no batch (the op fails fast).
         assert_eq!(list_batch("/bad\"quote"), None);
