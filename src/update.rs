@@ -2795,11 +2795,15 @@ fn submit_vault_unlock(app: &mut App) {
             app.prev_screen = None;
             app.screen = Screen::Vault;
             // On unlock, nudge discoverability: stored passphrases auto-fill on the
-            // next connect with no further opt-in, while the server-facing password
-            // stays behind the `p` toggle (front-loaded so it survives toast clipping).
+            // next connect with no further opt-in. Only nudge "press p" when the
+            // (now-persisted, [`os::prefs`]) password opt-in is OFF — a returning user
+            // who already enabled it would otherwise be told to press a key that
+            // *disables* it. Front-loaded so the key info survives toast clipping.
             app.toast(
                 if creating {
                     "vault created"
+                } else if app.password_autofill_enabled {
+                    "vault unlocked — passwords & passphrases auto-fill on connect"
                 } else {
                     "vault unlocked — passphrases auto-fill on connect; press p for passwords"
                 },
@@ -3482,20 +3486,29 @@ mod tests {
 
     #[test]
     fn browser_prompts_password_iff_consent_is_the_sole_blocker() {
+        use crate::os::vault::MatchedKinds;
         // The browse-time consent modal must fire for EXACTLY the inputs where the
         // only thing withholding the password is the missing consent — never widen
-        // what arms. Property: prompt(c, a, consented, k, prox, known) is true iff the
-        // password WOULD arm given consent (`should_arm_sftp_password(.., true, ..)`
-        // plus the two blanket gates) AND it is not already consented. Checked across
-        // the full truth table so the predicate can't drift from the arm logic.
+        // what arms. The oracle is bound to the REAL arm function `sftp_arm_kinds`
+        // (not a hand-copied gate list): prompt iff arming WOULD release the password
+        // *given consent* but doesn't yet *because* consent is missing. So if a future
+        // blanket gate is added to `sftp_arm_kinds` but not mirrored in
+        // `browser_should_prompt_password`, GAP 1/2 re-opens and THIS test fails
+        // instead of silently desyncing. Checked across the full truth table.
         for &c in &[false, true] {
             for &a in &[false, true] {
                 for &consented in &[false, true] {
                     for &k in &[false, true] {
                         for &prox in &[false, true] {
                             for &known in &[false, true] {
+                                let candidacy = MatchedKinds {
+                                    password: c,
+                                    passphrase: false,
+                                };
+                                // What the real recipe WOULD arm if the target were consented.
                                 let would_arm_if_consented =
-                                    !prox && known && should_arm_sftp_password(c, a, true, k);
+                                    sftp_arm_kinds(candidacy, a, true, k, prox, known)
+                                        .is_some_and(|kinds| kinds.password);
                                 let expected = would_arm_if_consented && !consented;
                                 assert_eq!(
                                     browser_should_prompt_password(c, a, consented, k, prox, known),
