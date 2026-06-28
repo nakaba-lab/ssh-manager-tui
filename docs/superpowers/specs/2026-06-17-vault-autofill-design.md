@@ -544,6 +544,9 @@ Password auto-fill is **off by default** (see Problem caveat: it only fires for 
   **not persisted** across restart (persistence — e.g. a key in a sshm settings
   file or the vault header — is a follow-up). State plainly that, with no UI wired,
   the feature otherwise "ships dark".
+  > **Update (PR #32, 2026-06-28):** persistence shipped — the toggle is now saved to
+  > a non-secret `~/.ssh/sshm-prefs.json` (`os/prefs.rs`, owner-private atomic write).
+  > The default stays OFF; the per-target consent set is still never persisted.
 - **Toggle:** a keybinding (e.g. on `Screen::Vault`, surfaced in its footer/help)
   flips it for the session, mirroring the existing per-screen key-handling pattern.
 - **Discoverability while OFF:** because the indicator predicate masks the Password
@@ -869,7 +872,8 @@ warnings` on **both** OSes.
   worth revisiting if force-on-passphrase friction proves high.
 - Per-host **persistent** (cross-session, on-disk) trust for password confirm.
 - **Persisting** the password-autofill-enabled toggle across restarts (v1 is
-  in-memory, default OFF).
+  in-memory, default OFF). — ✅ shipped in PR #32 (`os/prefs.rs`,
+  `~/.ssh/sshm-prefs.json`); default still OFF, consent set still session-only.
 - **Per-key distinct passphrases** — sshm stores at most one passphrase per host, so
   a host whose effective config lists multiple IdentityFiles with *different*
   passphrases only auto-fills the matching key; others fall through to manual.

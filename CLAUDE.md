@@ -54,7 +54,10 @@ Three layers with a strict, enforced dependency direction:
   encrypted password vault (`os/vault.rs`: Argon2id + XChaCha20-Poly1305 over
   `~/.ssh/sshm-vault.json`, holding per-host login passwords and key passphrases
   — secrets never touch the SSH config, are zeroized on drop, and the file
-  header is AEAD-authenticated with range-checked KDF params). **Zero ratatui
+  header is AEAD-authenticated with range-checked KDF params), plus a small
+  **non-secret** preferences file (`os/prefs.rs`: plain JSON at
+  `~/.ssh/sshm-prefs.json`, owner-private atomic write — currently just the
+  persisted password-autofill opt-in; never holds a secret). **Zero ratatui
   dependency.**
 - **`ui/`** — pure rendering only. **Never mutates domain state** (only widget
   scroll/selection state).

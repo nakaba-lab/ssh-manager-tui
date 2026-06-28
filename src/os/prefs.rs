@@ -135,8 +135,9 @@ mod tests {
         // project's most error-prone area. `write_atomic` takes an explicit path
         // (unlike the vault, which can't be redirected on Windows), so exercise the
         // overwrite directly in a scratch dir: write A, overwrite with longer B, read
-        // back == B. Both an enlarging and a shrinking overwrite are covered so a
-        // rename that left stale tail bytes would be caught.
+        // back == B. Both an enlarging and a shrinking overwrite are covered, so a
+        // regression to an in-place write (which would leave a stale tail on the
+        // shrink) is caught — the rename-swap fully replaces the file.
         let dir =
             std::env::temp_dir().join(crate::secure_fs::temp_name(".sshm-prefstest").unwrap());
         std::fs::create_dir_all(&dir).unwrap();
