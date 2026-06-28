@@ -3370,6 +3370,13 @@ mod tests {
             connect_plan(Some(pp_only), false, true, false, true, true, false, "h"),
             ConnectPlan::Normal(None)
         );
+        // ...and ahead of the TOFU gate: untrusted + NOT-known degrades SILENTLY
+        // (Normal(None)), never the "not yet trusted" nudge a trusted-but-unknown host
+        // gets — pinning that the untrusted-client check precedes the is_known check.
+        assert_eq!(
+            connect_plan(Some(both), false, true, false, false, false, false, "h"),
+            ConnectPlan::Normal(None)
+        );
         // not yet known (TOFU) -> normal WITH the nudge toast.
         match connect_plan(Some(both), false, true, false, false, false, true, "h") {
             ConnectPlan::Normal(Some(msg)) => assert!(msg.contains("not yet trusted")),
