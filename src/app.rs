@@ -819,6 +819,11 @@ pub struct App {
     /// Whether the one-time-per-session "this host has a stored password — enable
     /// auto-fill" discoverability nudge has already fired (shown at most once).
     pub password_hint_shown: bool,
+    /// Whether the one-time-per-session "auto-fill off: untrusted ssh client
+    /// (`[PATH ssh]`)" nudge has fired. Set when a candidate connect is withheld
+    /// because the resolved client isn't System32 OpenSSH; keeps that toast from
+    /// repeating every connect (the breadcrumb `[PATH ssh]` warning is persistent).
+    pub untrusted_client_hint_shown: bool,
     /// When a vault secret was copied, the deadline to auto-clear the clipboard,
     /// plus a (non-reversible) hash of the copied secret so the clear only fires
     /// if the clipboard still holds it — never the plaintext, which stays sealed.
@@ -890,6 +895,7 @@ impl App {
             password_autofill_enabled: crate::os::prefs::Prefs::load().password_autofill_enabled,
             confirmed_password_targets: HashSet::new(),
             password_hint_shown: false,
+            untrusted_client_hint_shown: false,
             clipboard_clear_at: None,
             clipboard_hash: 0,
             clipboard_hash_key: {

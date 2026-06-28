@@ -430,6 +430,9 @@ enum ConnectPlan {
 /// password-confirm gate → arm. Every miss degrades to a normal connect (fails
 /// safe — never arms). `candidacy` is the opt-in-masked `vault_secret_kinds`
 /// result (so password is already dropped when disabled / vault locked).
+// The gate inputs are independent booleans by design (each a separate spec step);
+// bundling them into a struct would only move the positional noise to the call site.
+#[allow(clippy::too_many_arguments)]
 fn connect_plan(
     candidacy: Option<MatchedKinds>,
     host_has_match_exec: bool,
@@ -437,6 +440,7 @@ fn connect_plan(
     is_proxied: bool,
     is_known: bool,
     password_confirmed: bool,
+    client_trusted: bool,
     alias: &str,
 ) -> ConnectPlan {
     let Some(kinds) = candidacy else {
@@ -444,6 +448,16 @@ fn connect_plan(
     };
     if host_has_match_exec || !resolved || is_proxied {
         return ConnectPlan::Normal(None); // degrade silently (no env)
+    }
+    if !client_trusted {
+        // BLANKET gate for BOTH kinds: the resolved ssh client is the untrusted
+        // Git/MSYS `[PATH ssh]` fallback, not System32 OpenSSH. Arming would hand the
+        // live `SSH_ASKPASS` token to a binary a planted `ssh.exe` could shadow, so
+        // withhold the secret entirely — the SAME gate `sftp_arm_gate` already
+        // enforces (shared via `autofill_client_trusted`, so the two paths can't
+        // diverge). Degrade is silent here; `connect_by_alias` emits a one-time
+        // session nudge so the user learns why (the breadcrumb `[PATH ssh]` persists).
+        return ConnectPlan::Normal(None);
     }
     if !is_known {
         // BLANKET gate, load-bearing for BOTH kinds — not just the server-facing
@@ -609,6 +623,10 @@ fn connect_by_alias(
     if candidacy.is_none() {
         return connect_plain(app, terminal, &host, &args, mode, protocol);
     }
+    // A candidate exists, but `connect_plan` withholds it when the resolved ssh
+    // client is the untrusted `[PATH ssh]` fallback. Nudge once so the user knows
+    // why a stored secret didn't auto-fill (no-op on a trusted client).
+    maybe_untrusted_client_nudge(app);
 
     // Reuse the first-pass resolution if the modal handed it back, so the
     // Confirmed/Withheld re-entry does not run `ssh -G` (and any `Match exec`
@@ -663,6 +681,7 @@ fn connect_by_alias(
         is_proxied,
         is_known,
         password_confirmed,
+        autofill_client_trusted(),
         alias,
     ) {
         ConnectPlan::Normal(msg) => {
@@ -863,6 +882,23 @@ fn maybe_password_discoverability(app: &mut App, host: &HostView) {
             false,
         );
     }
+}
+
+/// One-time-per-session nudge: an auto-fill candidate is being connected but the
+/// resolved ssh client is the untrusted `[PATH ssh]` fallback (not System32
+/// OpenSSH), so [`connect_plan`] withholds the secret and the user types it by hand.
+/// Fires at most once (mirrors [`maybe_password_discoverability`]) — the breadcrumb
+/// `[PATH ssh]` warning already shows the underlying cause persistently. Call only
+/// once a candidate secret is confirmed (no point nudging for a keyless host).
+fn maybe_untrusted_client_nudge(app: &mut App) {
+    if autofill_client_trusted() || app.untrusted_client_hint_shown {
+        return;
+    }
+    app.untrusted_client_hint_shown = true;
+    app.toast(
+        "auto-fill off: untrusted ssh client ([PATH ssh]) — use System32 OpenSSH to enable",
+        false,
+    );
 }
 
 /// Surface a plain (no auto-fill) inline exit as a toast, naming the launched
@@ -1767,11 +1803,19 @@ struct SftpArmGate {
     is_known: bool,
 }
 
+/// Whether the resolved ssh client is trusted to receive an armed secret: the
+/// System32 OpenSSH build (on unix `is_system32` is always true, so a Windows-only
+/// gate). The SINGLE source of truth for BOTH arming paths — `connect_plan` (fed via
+/// `connect_by_alias`) and `sftp_arm_gate` — so the connect and SFTP gates can never
+/// diverge again. Never arm against the Git/MSYS `[PATH ssh]` fallback: its
+/// force/console handling differs, and a planted bare `ssh`/`sftp` earlier in the
+/// resolution order would otherwise receive the live `SSH_ASKPASS` token.
+fn autofill_client_trusted() -> bool {
+    crate::os::binaries::tools().is_system32
+}
+
 fn sftp_arm_gate(app: &App, host: &HostView, alias: &str) -> Option<SftpArmGate> {
-    // Never arm against the Git/MSYS `[PATH ssh]` fallback build (its force/console
-    // handling differs, and a planted bare `ssh`/`sftp` would receive the live
-    // SSH_ASKPASS token); only the System32 OpenSSH client is trusted for auto-fill.
-    if !crate::os::binaries::tools().is_system32 {
+    if !autofill_client_trusted() {
         return None;
     }
     let candidacy = app.vault_secret_kinds(host)?;
@@ -3291,51 +3335,66 @@ mod tests {
             passphrase: true,
         };
 
+        // The 7th arg is `client_trusted` (System32 OpenSSH resolved); the happy
+        // paths below pass `true`. The untrusted cases follow.
+
         // No candidacy (no match, or vault locked) -> normal, silent.
         assert_eq!(
-            connect_plan(None, false, true, false, true, false, "h"),
+            connect_plan(None, false, true, false, true, false, true, "h"),
             ConnectPlan::Normal(None)
         );
         // Match-exec on the host -> degrade silently (no ssh -G side effects).
         assert_eq!(
-            connect_plan(Some(both), true, true, false, true, false, "h"),
+            connect_plan(Some(both), true, true, false, true, false, true, "h"),
             ConnectPlan::Normal(None)
         );
         // resolve failed/timed out -> degrade silently.
         assert_eq!(
-            connect_plan(Some(both), false, false, false, true, false, "h"),
+            connect_plan(Some(both), false, false, false, true, false, true, "h"),
             ConnectPlan::Normal(None)
         );
         // proxied -> degrade silently (permanent skip).
         assert_eq!(
-            connect_plan(Some(both), false, true, true, true, false, "h"),
+            connect_plan(Some(both), false, true, true, true, false, true, "h"),
+            ConnectPlan::Normal(None)
+        );
+        // UNTRUSTED ssh client ([PATH ssh] fallback) -> withhold BOTH kinds, SILENTLY
+        // (parity with sftp_arm_gate; connect_by_alias emits the one-time nudge).
+        assert_eq!(
+            connect_plan(Some(both), false, true, false, true, false, false, "h"),
+            ConnectPlan::Normal(None)
+        );
+        // ...even a passphrase-only host, and even when already confirmed — the
+        // untrusted-client gate is blanket, ahead of the TOFU and confirm gates.
+        assert_eq!(
+            connect_plan(Some(pp_only), false, true, false, true, true, false, "h"),
             ConnectPlan::Normal(None)
         );
         // not yet known (TOFU) -> normal WITH the nudge toast.
-        match connect_plan(Some(both), false, true, false, false, false, "h") {
+        match connect_plan(Some(both), false, true, false, false, false, true, "h") {
             ConnectPlan::Normal(Some(msg)) => assert!(msg.contains("not yet trusted")),
             other => panic!("expected Normal(Some), got {other:?}"),
         }
         // passphrase-only + not known -> STILL normal+nudge, never armed. The TOFU
         // gate is blanket because arming sets force, which hijacks the host-key
         // prompt; an unknown host must not be armed even for a local passphrase.
-        match connect_plan(Some(pp_only), false, true, false, false, false, "h") {
+        match connect_plan(Some(pp_only), false, true, false, false, false, true, "h") {
             ConnectPlan::Normal(Some(msg)) => assert!(msg.contains("not yet trusted")),
             other => panic!("expected Normal(Some) for passphrase-only/not-known, got {other:?}"),
         }
         // password armed + known + not yet confirmed -> defer to the confirm modal.
         assert_eq!(
-            connect_plan(Some(both), false, true, false, true, false, "h"),
+            connect_plan(Some(both), false, true, false, true, false, true, "h"),
             ConnectPlan::DeferPasswordConfirm(both)
         );
         // password armed + already confirmed -> arm.
         assert_eq!(
-            connect_plan(Some(both), false, true, false, true, true, "h"),
+            connect_plan(Some(both), false, true, false, true, true, true, "h"),
             ConnectPlan::Arm(both)
         );
         // passphrase only (no password kind) -> arm directly, no confirm.
         assert_eq!(
-            connect_plan(Some(pp_only), false, true, false, true, false, "h"),
+            connect_plan(Some(pp_only), false, true, false, true, false, true, "h"),
             ConnectPlan::Arm(pp_only)
         );
     }
