@@ -731,7 +731,7 @@ pub fn sftp_quote(p: &str) -> Option<String> {
 /// batch files). On the vanishingly rare RNG failure it falls back to the pid plus
 /// a process-global counter, so concurrent callers still get distinct names (the
 /// counter is what keeps `stage_batch`'s `create_new` from colliding).
-fn nonce() -> String {
+pub(crate) fn nonce() -> String {
     match crate::os::vault::random_bytes(8) {
         Ok(bytes) => bytes.iter().map(|b| format!("{b:02x}")).collect(),
         Err(_) => {

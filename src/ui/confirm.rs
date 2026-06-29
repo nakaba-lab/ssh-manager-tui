@@ -6,7 +6,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Clear, Paragraph};
 
-use crate::app::{App, ConfirmAction};
+use crate::app::{App, ConfirmAction, SftpDirection};
 
 use super::theme;
 use super::widgets::{centered, modal_block};
@@ -65,6 +65,20 @@ pub fn draw(f: &mut Frame, action: ConfirmAction, area: Rect) {
             "Remove this stored secret from the vault?".to_string(),
             true,
         ),
+        ConfirmAction::OverwriteTransfer { direction, name } => {
+            let side = match direction {
+                SftpDirection::Get => "local",
+                SftpDirection::Put => "remote",
+            };
+            // Truncate a long (possibly server-supplied) name to fit the modal width.
+            let shown: String = name.chars().take(36).collect();
+            let ellipsis = if name.chars().count() > 36 { "…" } else { "" };
+            (
+                "Overwrite file",
+                format!("A {side} file '{shown}{ellipsis}' already exists. Overwrite it?"),
+                true,
+            )
+        }
         ConfirmAction::Quit => ("Quit", "Quit SSH Manager?".to_string(), false),
     };
 
