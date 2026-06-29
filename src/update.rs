@@ -55,7 +55,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent, terminal: &mut DefaultTerminal) 
         Screen::KeyManager => handle_keys(app, key)?,
         Screen::KnownHosts => handle_known_hosts(app, key),
         Screen::Help => handle_help(app, key),
-        Screen::Confirm(action) => handle_confirm(app, key, action)?,
+        Screen::Confirm(action) => handle_confirm(app, key, action, terminal)?,
         Screen::ActionMenu(idx) => handle_action_menu(app, key, idx, terminal)?,
         Screen::GenerateKey { origin } => handle_gen_wizard(app, key, origin),
         Screen::PickKey { origin } => handle_pick_key(app, key, origin),
@@ -1720,7 +1720,7 @@ fn submit_sftp_transfer(app: &mut App, terminal: &mut DefaultTerminal) -> Result
     args.extend(Protocol::Sftp.build_args(&host, &ConnectOverrides::default()));
 
     close_overlay(app);
-    execute_sftp_transfer(app, terminal, &host, &alias, &args)
+    execute_sftp_transfer(app, terminal, &host, &alias, &args).map(|_| ())
 }
 
 /// Prepend the per-transfer `BatchMode` option to an inline `sftp -b` arg vector.
@@ -1745,13 +1745,15 @@ fn sftp_transfer_args(armed: bool, base: &[String]) -> Vec<String> {
 /// resolved target was already consented this session (same gate as connect). When
 /// nothing is armed the transfer runs `BatchMode=yes` and fails fast on a host that
 /// needs an interactive password (`sftp -b` never prompts) — same as before.
+/// Returns whether the transfer succeeded (child exit code 0) so an atomic caller
+/// can finalize (rename the temp into place) or clean up a partial.
 fn execute_sftp_transfer(
     app: &mut App,
     terminal: &mut DefaultTerminal,
     host: &HostView,
     alias: &str,
     args: &[String],
-) -> Result<()> {
+) -> Result<bool> {
     let label = Protocol::Sftp.label();
     let (listener, env) = arm_sftp_secrets(app, host, alias);
     // The askpass env is live iff a listener was armed; key BatchMode on that exactly
@@ -1776,7 +1778,7 @@ fn execute_sftp_transfer(
     if let Some((msg, is_err)) = transfer_toast(toast, exit_code) {
         app.toast(msg, is_err);
     }
-    Ok(())
+    Ok(matches!(exit_code, Some(0)))
 }
 
 /// Escalate an inline-transfer toast to a sticky error on a non-zero child exit. A
@@ -2030,6 +2032,52 @@ fn sftp_batch_line(direction: SftpDirection, local: &str, remote: &str) -> Optio
         SftpDirection::Get => format!("get {remote} {local}\n"),
         SftpDirection::Put => format!("put {local} {remote}\n"),
     })
+}
+
+/// Build the ATOMIC `sftp -b` script for a browser transfer, writing to a temp on the
+/// destination side so an interrupted transfer never truncates an existing file (M2).
+/// `dst_tmp` is a sibling of the destination: a LOCAL temp for a download (the caller
+/// renames it into place after success) or a REMOTE temp for an upload (an in-batch
+/// `rename` — posix-rename on OpenSSH, an atomic overwrite — finalizes it server-side).
+/// `None` if any path can't be expressed safely (see [`sftp_quote`]).
+fn transfer_script(
+    direction: SftpDirection,
+    local: &str,
+    remote: &str,
+    dst_tmp: &str,
+) -> Option<String> {
+    let (local, remote, tmp) = (
+        sftp_quote(local)?,
+        sftp_quote(remote)?,
+        sftp_quote(dst_tmp)?,
+    );
+    Some(match direction {
+        SftpDirection::Get => format!("get {remote} {tmp}\n"),
+        SftpDirection::Put => format!("put {local} {tmp}\nrename {tmp} {remote}\n"),
+    })
+}
+
+/// Whether a transfer of `name` would overwrite an existing destination file. For a
+/// download the destination is the local pane directory (checked against the real
+/// filesystem); for an upload it is the remote pane's current directory, whose listing
+/// the browser already holds — so neither direction needs an extra round-trip (H2).
+fn transfer_dest_exists(b: &SftpBrowser, direction: SftpDirection, name: &str) -> bool {
+    match direction {
+        SftpDirection::Get => b.local_cwd.join(name).try_exists().unwrap_or(false),
+        SftpDirection::Put => b
+            .remote_entries
+            .iter()
+            .any(|e| e.name != ".." && e.name == name),
+    }
+}
+
+/// Atomically replace `dst` with the freshly-downloaded `tmp`. On Windows a rename
+/// fails if the destination exists, so remove it first (mirrors the config writer's
+/// save path); on unix `rename` overwrites atomically.
+fn finalize_local_download(tmp: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    let _ = std::fs::remove_file(dst);
+    std::fs::rename(tmp, dst)
 }
 
 /// A temp-file guard: removes the staged batch file on drop so it never lingers,
@@ -2356,9 +2404,40 @@ fn browser_activate(app: &mut App, terminal: &mut DefaultTerminal) -> Result<()>
     }
 }
 
-/// Transfer the file `name` between the two panes' current directories, running
-/// the `sftp -b` inline (suspend/restore, reusing the Phase 2 executor so sftp's
-/// progress meter shows), then refresh the destination pane.
+/// The decision for an `Enter`-on-a-file transfer, computed purely from browser state
+/// so it is unit-testable without a terminal.
+enum TransferGate {
+    /// Don't transfer; show this status (remote not ready, or an unsafe name — H1).
+    Refuse(String),
+    /// The destination already exists — confirm before overwriting (H2).
+    Confirm,
+    /// Safe and new destination — run the transfer.
+    Proceed,
+}
+
+/// Decide what an `Enter`-on-a-file transfer should do: refuse (remote unready, or a
+/// server-controlled name that escapes the local pane — H1), confirm (the destination
+/// exists — H2), or proceed. Pure over `b`, so the gate is unit-tested.
+fn transfer_gate(b: &SftpBrowser, direction: SftpDirection, name: &str) -> TransferGate {
+    // Until the initial `pwd` resolves the absolute home, remote_cwd is empty and
+    // `remote_join("", name)` would yield `/name` — the filesystem ROOT, not the home
+    // the user sees. Refuse rather than write to the wrong place.
+    if b.remote_cwd.is_empty() {
+        return TransferGate::Refuse("remote not ready yet — wait for the listing".to_string());
+    }
+    if let Err(msg) = transfer_endpoints(direction, &b.local_cwd, &b.remote_cwd, name) {
+        return TransferGate::Refuse(msg);
+    }
+    if transfer_dest_exists(b, direction, name) {
+        return TransferGate::Confirm;
+    }
+    TransferGate::Proceed
+}
+
+/// The `Enter`-on-a-file transfer gate: validate the (possibly server-controlled)
+/// name (H1) and, if the destination already exists, route through an overwrite-
+/// confirm modal (H2) BEFORE clobbering it; otherwise run the transfer. `y` on the
+/// confirm re-invokes [`do_browser_transfer`].
 fn browser_transfer(
     app: &mut App,
     terminal: &mut DefaultTerminal,
@@ -2368,24 +2447,46 @@ fn browser_transfer(
     let Some(b) = app.sftp_browser.as_ref() else {
         return Ok(());
     };
-    // Until the initial `pwd` resolves the absolute home, remote_cwd is empty and
-    // `remote_join("", name)` would yield `/name` — i.e. the filesystem ROOT, not
-    // the home the user sees. Refuse a transfer rather than write to the wrong place
-    // (a fast Tab→Enter in the local pane before the first listing arrives).
+    match transfer_gate(b, direction, name) {
+        TransferGate::Refuse(msg) => {
+            set_browser_status(app, msg);
+            Ok(())
+        }
+        TransferGate::Confirm => {
+            open_confirm(
+                app,
+                ConfirmAction::OverwriteTransfer {
+                    direction,
+                    name: name.to_string(),
+                },
+            );
+            Ok(())
+        }
+        TransferGate::Proceed => do_browser_transfer(app, terminal, direction, name),
+    }
+}
+
+/// Run the actual `sftp -b` transfer of `name` between the panes, ATOMICALLY (M2):
+/// write to a temp on the destination side then put it in place, so an interrupted
+/// transfer never truncates an existing file. Runs inline (suspend/restore so sftp's
+/// progress meter shows), then refreshes the destination pane. Invoked directly when
+/// the destination is new, or from the overwrite-confirm on `y`.
+fn do_browser_transfer(
+    app: &mut App,
+    terminal: &mut DefaultTerminal,
+    direction: SftpDirection,
+    name: &str,
+) -> Result<()> {
+    let Some(b) = app.sftp_browser.as_ref() else {
+        return Ok(());
+    };
     if b.remote_cwd.is_empty() {
-        set_browser_status(
-            app,
-            "remote not ready yet — wait for the listing".to_string(),
-        );
         return Ok(());
     }
     let Some(host) = app.hosts.get(b.host).cloned() else {
         return Ok(());
     };
     let alias = host.alias().to_string();
-    // Build (and, for a download, safety-check the server-controlled name behind)
-    // the endpoint paths. A traversing/absolute remote name is refused here so it
-    // can never escape the local pane directory (H1).
     let (local, remote) = match transfer_endpoints(direction, &b.local_cwd, &b.remote_cwd, name) {
         Ok(pair) => pair,
         Err(msg) => {
@@ -2393,8 +2494,14 @@ fn browser_transfer(
             return Ok(());
         }
     };
-
-    let Some(batch) = sftp_batch_line(direction, &local, &remote) else {
+    // A destination-side temp (sibling of the real destination), with an unguessable
+    // nonce so a pre-planted file/symlink at the temp path can't redirect the write.
+    let dst = match direction {
+        SftpDirection::Get => &local,
+        SftpDirection::Put => &remote,
+    };
+    let dst_tmp = format!("{dst}.sshm-part-{}", crate::os::sftp::nonce());
+    let Some(batch) = transfer_script(direction, &local, &remote, &dst_tmp) else {
         set_browser_status(
             app,
             "path contains a \" or control character — cannot transfer".to_string(),
@@ -2419,7 +2526,27 @@ fn browser_transfer(
         .collect::<Vec<_>>();
     args.extend(Protocol::Sftp.build_args(&host, &ConnectOverrides::default()));
 
-    execute_sftp_transfer(app, terminal, &host, &alias, &args)?;
+    let ok = execute_sftp_transfer(app, terminal, &host, &alias, &args)?;
+
+    // M2 finalize. A download landed in a LOCAL temp: on success rename it over the
+    // destination, on failure drop the partial so the original is left untouched. An
+    // upload's rename ran in-batch (server-side, atomic on OpenSSH), so nothing to do
+    // here — a failed upload may leave a remote `.sshm-part`, preferable to a
+    // truncated original.
+    if direction == SftpDirection::Get {
+        let tmp_path = std::path::PathBuf::from(&dst_tmp);
+        let dst_path = std::path::PathBuf::from(&local);
+        if ok {
+            if let Err(e) = finalize_local_download(&tmp_path, &dst_path) {
+                set_browser_status(
+                    app,
+                    format!("downloaded but could not replace destination: {e}"),
+                );
+            }
+        } else {
+            let _ = std::fs::remove_file(&tmp_path);
+        }
+    }
 
     // Refresh the side that just received the file.
     match direction {
@@ -3061,10 +3188,22 @@ fn handle_help(app: &mut App, key: KeyEvent) {
     }
 }
 
-fn handle_confirm(app: &mut App, key: KeyEvent, action: ConfirmAction) -> Result<()> {
+fn handle_confirm(
+    app: &mut App,
+    key: KeyEvent,
+    action: ConfirmAction,
+    terminal: &mut DefaultTerminal,
+) -> Result<()> {
     match key.code {
         KeyCode::Char('y') | KeyCode::Enter => {
-            perform_confirm(app, action);
+            // The overwrite-confirm runs the inline transfer on accept, so it needs the
+            // terminal (suspend/restore); every other action is terminal-free.
+            if let ConfirmAction::OverwriteTransfer { direction, name } = action {
+                close_overlay(app);
+                do_browser_transfer(app, terminal, direction, &name)?;
+            } else {
+                perform_confirm(app, action);
+            }
         }
         KeyCode::Char('n') | KeyCode::Esc => close_overlay(app),
         _ => {}
@@ -3123,6 +3262,9 @@ fn perform_confirm(app: &mut App, action: ConfirmAction) {
             app.screen = Screen::Vault;
             app.prev_screen = None;
         }
+        // Intercepted in `handle_confirm` (it needs the terminal to run the transfer);
+        // never reaches here, but keeps the match exhaustive without a panic path.
+        ConfirmAction::OverwriteTransfer { .. } => {}
     }
 }
 
@@ -3914,6 +4056,138 @@ mod tests {
         let (_l, r) =
             transfer_endpoints(SftpDirection::Put, local_cwd, "/srv", "local.txt").unwrap();
         assert_eq!(r, "/srv/local.txt");
+    }
+
+    #[test]
+    fn transfer_script_builds_atomic_get_and_put() {
+        // Download: get the remote source to a LOCAL temp (Rust renames it into place
+        // after success), so an interrupted get never truncates an existing local file.
+        assert_eq!(
+            transfer_script(
+                SftpDirection::Get,
+                "/home/me/cfg",
+                "/srv/cfg",
+                "/home/me/cfg.part"
+            ),
+            Some("get /srv/cfg /home/me/cfg.part\n".to_string())
+        );
+        // Upload: put to a REMOTE temp, then atomically rename it over the destination
+        // (posix-rename on OpenSSH) — never truncating an existing remote file (M2).
+        assert_eq!(
+            transfer_script(
+                SftpDirection::Put,
+                "/home/me/cfg",
+                "/srv/cfg",
+                "/srv/cfg.part"
+            ),
+            Some("put /home/me/cfg /srv/cfg.part\nrename /srv/cfg.part /srv/cfg\n".to_string())
+        );
+        // An unsafe path (trailing backslash / quote) fails closed.
+        assert_eq!(transfer_script(SftpDirection::Get, "a", "b\\", "c"), None);
+    }
+
+    fn h2_browser(
+        local_cwd: std::path::PathBuf,
+        remote_entries: Vec<crate::os::sftp::RemoteEntry>,
+    ) -> SftpBrowser {
+        use crate::app::SftpPane;
+        SftpBrowser {
+            host: 0,
+            focus: SftpPane::Local,
+            local_cwd,
+            local_entries: Vec::new(),
+            local_sel: 0,
+            remote_cwd: "/srv".to_string(),
+            remote_entries,
+            remote_sel: 0,
+            remote_loading: false,
+            status: String::new(),
+            session: crate::os::sftp::SftpSession::open_no_master("h"),
+        }
+    }
+
+    #[test]
+    fn transfer_dest_exists_detects_remote_collision_for_upload() {
+        // Upload destination = the remote pane's current dir, whose listing we already
+        // hold — so an existing same-named remote file is detected with no extra probe.
+        let b = h2_browser(
+            std::env::temp_dir(),
+            vec![
+                crate::os::sftp::RemoteEntry {
+                    name: "..".into(),
+                    is_dir: true,
+                    is_link: false,
+                    size: 0,
+                },
+                crate::os::sftp::RemoteEntry {
+                    name: "report.txt".into(),
+                    is_dir: false,
+                    is_link: false,
+                    size: 1,
+                },
+            ],
+        );
+        assert!(transfer_dest_exists(&b, SftpDirection::Put, "report.txt"));
+        assert!(!transfer_dest_exists(&b, SftpDirection::Put, "new.txt"));
+        // The synthetic ".." row is never a collision.
+        assert!(!transfer_dest_exists(&b, SftpDirection::Put, ".."));
+    }
+
+    #[test]
+    fn transfer_gate_refuses_confirms_or_proceeds() {
+        // A new remote destination -> proceed (no confirm modal).
+        let fresh = h2_browser(
+            std::env::temp_dir(),
+            vec![crate::os::sftp::RemoteEntry {
+                name: "..".into(),
+                is_dir: true,
+                is_link: false,
+                size: 0,
+            }],
+        );
+        assert!(matches!(
+            transfer_gate(&fresh, SftpDirection::Put, "fresh.txt"),
+            TransferGate::Proceed
+        ));
+        // An existing remote destination -> confirm before overwriting (H2).
+        let dup = h2_browser(
+            std::env::temp_dir(),
+            vec![crate::os::sftp::RemoteEntry {
+                name: "dup.txt".into(),
+                is_dir: false,
+                is_link: false,
+                size: 1,
+            }],
+        );
+        assert!(matches!(
+            transfer_gate(&dup, SftpDirection::Put, "dup.txt"),
+            TransferGate::Confirm
+        ));
+        // A traversing server-controlled DOWNLOAD name -> refuse (H1).
+        assert!(matches!(
+            transfer_gate(&dup, SftpDirection::Get, "../escape"),
+            TransferGate::Refuse(_)
+        ));
+        // Remote not resolved yet -> refuse.
+        let mut not_ready = h2_browser(std::env::temp_dir(), Vec::new());
+        not_ready.remote_cwd = String::new();
+        assert!(matches!(
+            transfer_gate(&not_ready, SftpDirection::Put, "x"),
+            TransferGate::Refuse(_)
+        ));
+    }
+
+    #[test]
+    fn transfer_dest_exists_detects_local_collision_for_download() {
+        // Download destination = the local pane dir; check the real filesystem.
+        let dir = std::env::temp_dir().join(format!("sshm-h2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("there.txt"), b"x").unwrap();
+        let b = h2_browser(dir.clone(), Vec::new());
+        assert!(transfer_dest_exists(&b, SftpDirection::Get, "there.txt"));
+        assert!(!transfer_dest_exists(&b, SftpDirection::Get, "absent.txt"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

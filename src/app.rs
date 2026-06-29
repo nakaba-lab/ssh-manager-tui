@@ -228,6 +228,12 @@ pub enum ConfirmAction {
     DiscardEdit,
     /// Delete the vault entry at this index.
     DeleteVaultEntry(usize),
+    /// Overwrite an existing SFTP transfer destination. The browser has validated the
+    /// name and confirmed the destination exists; `y` re-runs the transfer.
+    OverwriteTransfer {
+        direction: SftpDirection,
+        name: String,
+    },
     Quit,
 }
 
