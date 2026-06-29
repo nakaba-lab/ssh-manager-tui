@@ -613,6 +613,21 @@ pub fn remote_parent(cwd: &str) -> String {
     }
 }
 
+/// True iff `name` is safe to use as a SINGLE local path component on THIS host —
+/// not empty, not `.`/`..`, and free of any path separator, drive prefix, or UNC
+/// root. Gates a server-controlled SFTP download filename before it is joined onto
+/// a local directory, so a hostile/compromised server cannot escape the chosen
+/// local folder (e.g. a remote entry named `..\..\Startup\evil.bat`, `C:\…`, or
+/// `\\host\share\…`) — the scp/sftp client-side filename-injection class
+/// (CVE-2019-6111). Host path semantics are deliberate: the value becomes a
+/// host-local destination, so `\` and `C:` matter on Windows but are ordinary
+/// filename bytes on unix. `Path::file_name` collapses any traversing/qualified
+/// path to its last component, so requiring it to equal `name` admits only a bare
+/// component.
+pub fn is_safe_local_name(name: &str) -> bool {
+    !name.is_empty() && std::path::Path::new(name).file_name() == Some(std::ffi::OsStr::new(name))
+}
+
 /// Quote a path for an `sftp` batch command, or `None` if it can't be expressed
 /// safely. sftp's batch parser has no escape for a literal `"`, and a control
 /// character (newline/CR/tab/…) would split or corrupt the single-line command —
@@ -760,6 +775,40 @@ drwxr-xr-x    2 deploy deploy 4096 Jan 15 10:30 projects
                 .any(|n| n.contains("working") || n.contains("directory")),
             "the pwd preamble line must not leak as an entry"
         );
+    }
+
+    #[test]
+    fn is_safe_local_name_accepts_plain_files_rejects_traversal() {
+        // A plain filename is a safe single component on every host.
+        assert!(is_safe_local_name("invoice.txt"));
+        assert!(is_safe_local_name("a file (final).txt"));
+
+        // Universal rejections (separator/`..`/`.`/empty/absolute) on every host —
+        // a hostile SFTP server must not escape the chosen local directory (H1).
+        assert!(!is_safe_local_name(""));
+        assert!(!is_safe_local_name("."));
+        assert!(!is_safe_local_name(".."));
+        assert!(!is_safe_local_name("../evil"));
+        assert!(!is_safe_local_name("a/b"));
+        assert!(!is_safe_local_name("/etc/passwd"));
+
+        // Windows-only separators / prefixes: backslash, drive, drive-relative, UNC.
+        // These ARE legal filename bytes on unix, so the rejection is host-specific —
+        // gate the assertions to avoid the cross-platform clippy/test trap.
+        #[cfg(windows)]
+        {
+            assert!(!is_safe_local_name(r"..\evil"));
+            assert!(!is_safe_local_name(r"a\b"));
+            assert!(!is_safe_local_name(r"C:\Windows\evil"));
+            assert!(!is_safe_local_name("C:evil"));
+            assert!(!is_safe_local_name(r"\\attacker\share\evil"));
+        }
+        // On unix a backslash/colon is an ordinary filename char that stays in-cwd.
+        #[cfg(unix)]
+        {
+            assert!(is_safe_local_name(r"a\b"));
+            assert!(is_safe_local_name("weird:name"));
+        }
     }
 
     #[test]
