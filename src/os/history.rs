@@ -16,6 +16,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+/// Cap on the number of aliases kept in history (the most-recently-connected). Far
+/// above any realistic host count, so it only fires against accumulated orphans from a
+/// long-churning config — bounding the file rather than letting it grow forever.
+const MAX_HISTORY: usize = 1000;
+
 /// The default history path, `~/.ssh/sshm-history.json`.
 pub fn default_path() -> Option<PathBuf> {
     super::ssh_dir().map(|d| d.join("sshm-history.json"))
@@ -87,7 +92,25 @@ impl History {
             return;
         }
         self.entries.insert(alias.to_string(), now_unix());
+        self.prune();
         let _ = self.save();
+    }
+
+    /// Cap the history at the [`MAX_HISTORY`] most-recently-connected aliases. Without
+    /// this an ever-changing config — renamed or deleted hosts whose old aliases are
+    /// never connected again — would grow the file monotonically forever.
+    fn prune(&mut self) {
+        if self.entries.len() <= MAX_HISTORY {
+            return;
+        }
+        let mut by_recency: Vec<(u64, String)> =
+            self.entries.iter().map(|(k, &v)| (v, k.clone())).collect();
+        // Most-recent first; tie-break on alias so the kept set is deterministic.
+        by_recency.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        by_recency.truncate(MAX_HISTORY);
+        let keep: std::collections::BTreeSet<String> =
+            by_recency.into_iter().map(|(_, k)| k).collect();
+        self.entries.retain(|k, _| keep.contains(k));
     }
 
     fn save(&self) -> io::Result<()> {
@@ -223,6 +246,23 @@ mod tests {
         h.entries.insert("web".into(), 42);
         assert_eq!(h.last("web"), Some(42));
         assert_eq!(h.last("db"), None);
+    }
+
+    #[test]
+    fn prune_caps_history_at_the_most_recent() {
+        // An ever-changing config (renamed/deleted hosts) must not grow the history
+        // file without bound; prune keeps only the MAX_HISTORY most-recent aliases.
+        let mut h = History::default();
+        for i in 0..(MAX_HISTORY + 50) {
+            h.entries.insert(format!("host{i}"), i as u64);
+        }
+        h.prune();
+        assert_eq!(h.entries.len(), MAX_HISTORY);
+        assert!(h.last("host0").is_none(), "oldest entry dropped");
+        assert!(
+            h.last(&format!("host{}", MAX_HISTORY + 49)).is_some(),
+            "newest entry kept"
+        );
     }
 
     #[test]
