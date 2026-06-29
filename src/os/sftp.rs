@@ -256,6 +256,9 @@ pub struct SftpSession {
     /// `-o BatchMode=yes` instead (keyed on `listener.is_some()` in `run_op`), so
     /// `BatchMode=no` is only ever emitted alongside a live askpass environment.
     arm: Option<SftpArm>,
+    /// Consecutive armed-op failures since the last success/arm — the breaker's
+    /// classification-independent lockout backstop (see `note_op_failed`).
+    armed_fail_streak: u32,
     tx: Sender<SftpEvent>,
     rx: Receiver<SftpEvent>,
     handles: Vec<JoinHandle<()>>,
@@ -310,6 +313,7 @@ impl SftpSession {
             alias: alias.to_string(),
             common_args,
             arm: None,
+            armed_fail_streak: 0,
             tx,
             rx,
             handles: Vec::new(),
@@ -345,14 +349,32 @@ impl SftpSession {
     /// and, when that listener is successfully started, run with `-o BatchMode=no`.
     /// If `arm_connect` fails for an individual op it degrades to `BatchMode=yes`
     /// (no password sent) — see the `arm` field doc for the full fail-safe story.
+    /// Resets the armed-failure streak so a fresh arming starts the lockout backstop
+    /// from zero.
     pub fn arm(&mut self, arm: SftpArm) {
         self.arm = Some(arm);
+        self.armed_fail_streak = 0;
     }
 
     /// Disarm (circuit-breaker / teardown): drops + zeroizes the held secrets
     /// and reverts subsequent ops to `BatchMode=yes`.
     pub fn disarm(&mut self) {
         self.arm = None;
+    }
+
+    /// Record that an armed op FAILED and return the new consecutive-failure streak.
+    /// The breaker uses this as a classification-INDEPENDENT lockout backstop: even if
+    /// `is_auth_failure` doesn't recognize a server's rejection phrasing, repeated armed
+    /// failures still disarm, so a stored password can't be re-sent without bound.
+    pub fn note_op_failed(&mut self) -> u32 {
+        self.armed_fail_streak = self.armed_fail_streak.saturating_add(1);
+        self.armed_fail_streak
+    }
+
+    /// Record that an op SUCCEEDED, resetting the armed-failure streak so occasional
+    /// benign errors interleaved with successes never trip the count backstop.
+    pub fn note_op_succeeded(&mut self) {
+        self.armed_fail_streak = 0;
     }
 
     pub fn is_armed(&self) -> bool {

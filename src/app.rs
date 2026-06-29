@@ -596,6 +596,12 @@ pub struct SftpBrowser {
     pub session: SftpSession,
 }
 
+/// Consecutive armed-op failures that trip the circuit-breaker's count-based backstop
+/// (disarm regardless of how the server phrased the rejection). A recognized
+/// `auth_failure` disarms on the first; this bounds the unrecognized case to 2 armed
+/// server-facing attempts.
+const MAX_ARMED_FAILURES: u32 = 2;
+
 /// Apply one drained [`SftpEvent`] to the browser state. Pure (no I/O), so the
 /// stale-listing / unresolved-home / stale-failure handling is unit-testable
 /// without a live session.
@@ -630,6 +636,8 @@ pub fn apply_sftp_event(b: &mut SftpBrowser, event: SftpEvent) {
             b.remote_sel = b.remote_sel.min(b.remote_entries.len().saturating_sub(1));
             b.remote_loading = false;
             b.status.clear();
+            // A successful op resets the breaker's armed-failure streak.
+            b.session.note_op_succeeded();
         }
         SftpEvent::Failed {
             path,
@@ -637,47 +645,44 @@ pub fn apply_sftp_event(b: &mut SftpBrowser, event: SftpEvent) {
             auth_failure,
             served,
         } => {
-            // Ignore a failure from a superseded navigation (its path is no longer
-            // the one we're showing); the current op's result is still pending.
-            if let Some(p) = &path
-                && !b.remote_cwd.is_empty()
-                && *p != b.remote_cwd
-            {
+            let stale = matches!(&path, Some(p) if !b.remote_cwd.is_empty() && *p != b.remote_cwd);
+
+            // Circuit-breaker accounting runs even for a superseded (stale) op — it
+            // still consumed a server-facing attempt, so it must count toward the
+            // lockout bound. Disarm on a RECOGNIZED auth failure (immediately) OR after
+            // MAX consecutive armed failures (a classification-INDEPENDENT backstop, so
+            // a rejection phrasing `is_auth_failure` misses — a server that drops the
+            // connection, a non-OpenSSH banner — can't keep re-sending the password
+            // without bound). The streak resets on any success, so a benign command
+            // error after a successful auth does not, on its own, kill auto-fill.
+            let mut disarmed_now = false;
+            if b.session.is_armed() {
+                let streak = b.session.note_op_failed();
+                if auth_failure || streak >= MAX_ARMED_FAILURES {
+                    b.session.disarm();
+                    disarmed_now = true;
+                }
+            }
+
+            // A stale failure is accounted above but never alters the DISPLAY (its dir
+            // is no longer shown); the current op's result is still pending.
+            if stale {
                 return;
             }
             b.remote_loading = false;
-            // Circuit-breaker (armed sessions): ANY auth failure on an armed session
-            // disarms. `auth_failure` is classified over the FULL stderr (a leading
-            // banner can't mask it) and recognizes the disconnect-wrapped
-            // `Received disconnect ...: Authentication failed.` form, so a real
-            // rejection is not missed.
-            //
-            // We disarm regardless of `served`, not only when a password actually
-            // reached the server, because the lockout the breaker bounds also accrues
-            // when NO stored secret was released: against a keyboard-interactive /
-            // publickey-only server (`served=false`), staying armed would re-run
-            // `BatchMode=no` on every retry and re-attempt interactive auth — a fresh
-            // server-facing failed-auth event each time, with no bound. Disarming makes
-            // subsequent ops fail fast under `BatchMode=yes` (no interactive auth), which
-            // is strictly fewer server-facing attempts. `served` only varies the message.
-            //
-            // The `&& auth_failure` guard is load-bearing: a released secret whose auth
-            // SUCCEEDED and then hit a benign command error (e.g. `cd` into a
-            // forbidden/missing dir) also reports `served` but is NOT an auth failure —
-            // it must NOT disarm (that would needlessly kill auto-fill on ordinary
-            // browsing). See `armed_session_stays_armed_on_benign_post_auth_error`.
-            if b.session.is_armed() && auth_failure {
-                b.session.disarm();
+            if disarmed_now {
                 b.status = if served {
                     // A stored secret was released and the server still rejected it.
                     "stored secret rejected — re-check the vault, or press F".to_string()
                 } else {
-                    // Armed but no secret was released this op (arming failed → ran
-                    // un-armed, OR the server used a method we don't auto-fill). Stay
-                    // cause-neutral rather than misattributing it to a failed arm.
+                    // Disarmed without a released secret (arm failed, an unrecognized
+                    // rejection, or the count backstop). Cause-neutral.
                     "auto-fill did not complete — press F to enter it, or retry".to_string()
                 };
             } else {
+                // Not disarmed: either un-armed, or armed with the first unrecognized
+                // failure (still under the backstop) / a benign post-auth error — show
+                // the actual error and stay as-is.
                 b.status = friendly_sftp_error(&msg, auth_failure);
             }
             // `navigate_remote` cleared the old entries before this (failed) listing,
@@ -1862,6 +1867,55 @@ mod tests {
         assert!(!b.session.is_armed());
         // The disarm status names the rejected secret (kind-agnostic wording).
         assert!(b.status.contains("rejected"));
+    }
+
+    #[test]
+    fn breaker_disarms_after_repeated_unrecognized_armed_failures() {
+        // An auth-failure phrasing the is_auth_failure denylist does NOT recognize
+        // (auth_failure=false — e.g. a server that drops the connection) must not keep
+        // the session armed forever re-sending the password. A count-based backstop
+        // disarms after MAX consecutive armed failures regardless of classification (B1).
+        use crate::os::askpass::ResolvedIdentity;
+        use crate::os::sftp::{SftpArm, SftpEvent};
+        let mut b = SftpBrowser {
+            host: 0,
+            focus: SftpPane::Remote,
+            local_cwd: std::path::PathBuf::from("/"),
+            local_entries: Vec::new(),
+            local_sel: 0,
+            remote_cwd: String::new(),
+            remote_entries: Vec::new(),
+            remote_sel: 0,
+            remote_loading: true,
+            status: String::new(),
+            session: crate::os::sftp::SftpSession::open_no_master("h"),
+        };
+        b.session.arm(SftpArm {
+            identity: ResolvedIdentity {
+                user: "u".into(),
+                host: "h".into(),
+                host_key_alias: None,
+                identity_paths: Vec::new(),
+            },
+            password: None,
+            passphrase: None,
+        });
+        let unrecognized = || SftpEvent::Failed {
+            path: Some(".".into()),
+            msg: "Connection reset by peer".into(),
+            auth_failure: false, // not in the denylist
+            served: false,
+        };
+        apply_sftp_event(&mut b, unrecognized());
+        assert!(
+            b.session.is_armed(),
+            "still armed after the 1st unrecognized failure"
+        );
+        apply_sftp_event(&mut b, unrecognized());
+        assert!(
+            !b.session.is_armed(),
+            "count backstop disarms after MAX consecutive armed failures"
+        );
     }
 
     #[test]
