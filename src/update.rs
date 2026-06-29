@@ -2465,6 +2465,13 @@ fn transfer_gate(b: &SftpBrowser, direction: SftpDirection, name: &str) -> Trans
     if b.remote_cwd.is_empty() {
         return TransferGate::Refuse("remote not ready yet — wait for the listing".to_string());
     }
+    // An UPLOAD's overwrite check reads the remote pane's listing; while it is still
+    // loading that listing is stale/empty, so an existing destination could be missed
+    // and the overwrite confirm bypassed. Refuse until the listing settles. (A download
+    // is unaffected — its existence check is the authoritative local filesystem.)
+    if direction == SftpDirection::Put && b.remote_loading {
+        return TransferGate::Refuse("remote still loading — wait for the listing".to_string());
+    }
     if let Err(msg) = transfer_endpoints(direction, &b.local_cwd, &b.remote_cwd, name) {
         return TransferGate::Refuse(msg);
     }
@@ -4306,6 +4313,24 @@ mod tests {
         not_ready.remote_cwd = String::new();
         assert!(matches!(
             transfer_gate(&not_ready, SftpDirection::Put, "x"),
+            TransferGate::Refuse(_)
+        ));
+
+        // Upload while the remote listing is still loading -> refuse: remote_entries is
+        // stale/empty, so transfer_dest_exists could miss an existing file and bypass
+        // the overwrite confirm. A download is unaffected (its existence check is the
+        // local filesystem).
+        let mut loading = h2_browser(std::env::temp_dir(), Vec::new());
+        loading.remote_loading = true;
+        assert!(matches!(
+            transfer_gate(&loading, SftpDirection::Put, "x"),
+            TransferGate::Refuse(_)
+        ));
+        // ...but a DOWNLOAD while loading is still allowed (local existence check).
+        let mut loading_get = h2_browser(std::env::temp_dir(), Vec::new());
+        loading_get.remote_loading = true;
+        assert!(!matches!(
+            transfer_gate(&loading_get, SftpDirection::Get, "newfile.xyz"),
             TransferGate::Refuse(_)
         ));
     }
