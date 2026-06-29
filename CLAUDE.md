@@ -48,16 +48,21 @@ Three layers with a strict, enforced dependency direction:
 - **`config/`** — the lossless `~/.ssh/config` parser + surgical writer. **Zero
   ratatui dependency**, fully headless-testable. This is the most important and
   most-tested module.
-- **`os/`** — all external-world integration: spawning `ssh`/`ssh-keygen`,
+- **`os/`** — all external-world integration: spawning `ssh`/`ssh-keygen`/`sftp`,
   TCP liveness probing, SSH key discovery + fingerprint-based pairing,
-  `known_hosts` parsing/rewriting, clipboard, binary resolution, and the
-  encrypted password vault (`os/vault.rs`: Argon2id + XChaCha20-Poly1305 over
-  `~/.ssh/sshm-vault.json`, holding per-host login passwords and key passphrases
-  — secrets never touch the SSH config, are zeroized on drop, and the file
-  header is AEAD-authenticated with range-checked KDF params), plus a small
-  **non-secret** preferences file (`os/prefs.rs`: plain JSON at
-  `~/.ssh/sshm-prefs.json`, owner-private atomic write — currently just the
-  persisted password-autofill opt-in; never holds a secret). **Zero ratatui
+  `known_hosts` parsing/rewriting, clipboard, binary resolution, the **SFTP**
+  layer (`os/sftp.rs`: a pure `ls -l` listing parser plus the live `SftpSession`
+  browse worker — short-lived `sftp -b` ops on worker threads, with the armed
+  auto-fill + circuit-breaker; transfer batch construction lives in `update.rs`),
+  and the encrypted password vault (`os/vault.rs`: Argon2id + XChaCha20-Poly1305
+  over `~/.ssh/sshm-vault.json`, holding per-host login passwords and key
+  passphrases — secrets never touch the SSH config, are zeroized on drop, and the
+  file header is AEAD-authenticated with range-checked KDF params), plus two small
+  **non-secret** files: the preferences (`os/prefs.rs`: plain JSON at
+  `~/.ssh/sshm-prefs.json`, owner-private atomic write — the persisted
+  password-autofill opt-in; never holds a secret) and the connection history
+  (`os/history.rs`: plain JSON at `~/.ssh/sshm-history.json`, alias→last-connected
+  timestamp, capped and fail-soft; backs the "recent" sort). **Zero ratatui
   dependency.**
 - **`ui/`** — pure rendering only. **Never mutates domain state** (only widget
   scroll/selection state).

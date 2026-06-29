@@ -69,6 +69,12 @@ layout that stacks the panes on narrow terminals.
   **status** (reachability). The detail pane shows when each host was last connected
   ("2h ago", "yesterday", …). Timestamps live in `~/.ssh/sshm-history.json`, kept
   separate from the config so it always round-trips losslessly.
+- **SFTP** — without leaving the TUI: open an **interactive SFTP session** (`F`), run a
+  **guided one-shot transfer**, or browse with a **dual-pane file browser** (`b`) that
+  walks the remote and local trees side by side and transfers a file with `Enter`.
+  Transfers are **atomic** (an interruption never truncates an existing file) and
+  **prompt before overwriting**. A stored vault password / key passphrase auto-fills the
+  connection — gated on a trusted System32 OpenSSH client and your per-session consent.
 - **Lossless config editing** — add, edit, and delete `Host` blocks through a form:
   `HostName`, `User`, `Port`, `IdentityFile`, `ProxyJump`, `LocalForward` /
   `RemoteForward` / `DynamicForward`, plus arbitrary extra options. Everything is
@@ -170,6 +176,9 @@ sshm --help          print help and exit
 | `/` | search (fuzzy: alias / hostname / user) |
 | `Enter` | **connect inline** (suspends the TUI, runs `ssh`, restores it) |
 | `t` | **connect in a new Windows Terminal tab** |
+| `F` | open an **interactive SFTP session** to the host |
+| `b` | open the **dual-pane SFTP browser** |
+| `O` | connect with **ad-hoc overrides** (user / port / identity / jump …) |
 | `o` | open the per-host action menu |
 | `c` | copy the `ssh` command to the clipboard |
 | `e` / `a` | edit / add a host |
@@ -195,6 +204,17 @@ While searching: type to filter, `Enter` keep the filter, `Esc` clear it, `↑`/
 
 While editing a field: `←`/`→` move the cursor, `Home`/`End` jump, `Backspace`/`Delete`
 remove, `Enter` commit, `Esc` revert the field.
+
+### SFTP browser
+
+| Key | Action |
+|-----|--------|
+| `Tab` | switch focus between the **local** and **remote** pane |
+| `j` / `k`, `↓` / `↑` | move the selection |
+| `Enter` | enter a directory, or **transfer** the selected file to the other pane (prompts before overwriting) |
+| `Backspace` | go up a directory |
+| `F` | open a full interactive SFTP session to the host |
+| `r` | retry / refresh the remote listing · `?` help · `Esc` close |
 
 ### Key manager
 
