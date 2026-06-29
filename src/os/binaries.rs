@@ -31,10 +31,41 @@ pub fn tools() -> &'static SshTools {
     TOOLS.get_or_init(resolve)
 }
 
+/// The real Windows system directory (`…\System32`) resolved via the Win32
+/// `GetSystemDirectoryW` API — independent of the attacker-tamperable `%SystemRoot%`
+/// env var (CWE-426 hardening of the auto-fill trust anchor; see [`resolve`]).
+/// `None` if the API call fails or reports an implausibly long path.
+#[cfg(windows)]
+fn system_directory() -> Option<PathBuf> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+
+    // MAX_PATH; the system directory (e.g. `C:\Windows\System32`) is always well
+    // under this, so a single sizing-safe call suffices.
+    let mut buf = [0u16; 260];
+    // SAFETY: GetSystemDirectoryW writes at most `buf.len()` UTF-16 code units into
+    // `buf` and returns the count written (excluding the NUL), the required size if
+    // the buffer were too small, or 0 on failure.
+    let len = unsafe { GetSystemDirectoryW(buf.as_mut_ptr(), buf.len() as u32) };
+    if len == 0 || len as usize > buf.len() {
+        return None;
+    }
+    Some(PathBuf::from(OsString::from_wide(&buf[..len as usize])))
+}
+
 #[cfg(windows)]
 fn resolve() -> SshTools {
-    let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
-    let base = PathBuf::from(sysroot).join("System32").join("OpenSSH");
+    // Resolve System32 via the Win32 API, NOT the %SystemRoot% env var. That var is
+    // attacker-tamperable (HKCU\Environment or a crafted process environment), and
+    // `is_system32` now gates releasing a decrypted vault password to the resolved
+    // ssh/sftp through SSH_ASKPASS — so a redirected anchor would disclose the vault
+    // password to a planted binary (CWE-426). Fall back to the conventional literal
+    // only if the API fails; if that path has no ssh.exe, `is_system32` stays false
+    // (fail-safe: PATH ssh, no auto-fill).
+    let base = system_directory()
+        .unwrap_or_else(|| PathBuf::from("C:\\Windows\\System32"))
+        .join("OpenSSH");
     let ssh = base.join("ssh.exe");
     if ssh.is_file() {
         return SshTools {
@@ -86,4 +117,43 @@ pub fn find_wt() -> Option<PathBuf> {
         }
     }
     Some(PathBuf::from("wt.exe"))
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn system_directory_ignores_a_tampered_systemroot_env() {
+        // The auto-fill trust anchor (is_system32) must resolve System32 via the
+        // Win32 API, NOT the %SystemRoot% env var — that var is attacker-tamperable
+        // (HKCU\Environment / a crafted process environment), and is_system32 now
+        // gates releasing a decrypted vault password to the resolved ssh/sftp, so a
+        // redirected anchor would disclose the vault password to a planted binary
+        // (CWE-426). Point SystemRoot at an attacker dir and confirm the resolved
+        // system directory is UNCHANGED and real.
+        let baseline = system_directory().expect("system dir");
+        let orig = std::env::var_os("SystemRoot");
+        // SAFETY: test-only, restored immediately below. Production resolves the
+        // directory via GetSystemDirectoryW (never this var), so the brief window
+        // cannot mislead a parallel test's trust decision.
+        unsafe { std::env::set_var("SystemRoot", "C:\\attacker\\evil") };
+        let tampered = system_directory().expect("system dir");
+        match orig {
+            Some(v) => unsafe { std::env::set_var("SystemRoot", v) },
+            None => unsafe { std::env::remove_var("SystemRoot") },
+        }
+        assert_eq!(
+            baseline, tampered,
+            "system directory must not depend on %SystemRoot%"
+        );
+        assert!(tampered.exists(), "resolved system directory must exist");
+        assert!(
+            tampered
+                .to_string_lossy()
+                .to_lowercase()
+                .ends_with("system32"),
+            "GetSystemDirectoryW should resolve the System32 directory, got {tampered:?}"
+        );
+    }
 }
