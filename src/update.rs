@@ -549,6 +549,19 @@ fn connect_selected(
     )
 }
 
+/// Whether a connect-time override changes the login user away from the host's
+/// configured one. The stored vault password is keyed to the host's account, so an
+/// override to a different user must NOT auto-fill it — that would send one account's
+/// password in another account's login attempt to the same server (a wrong-account
+/// disclosure). An empty/unset override user, or one equal to the host's, is no change.
+/// A passphrase is account-independent (it decrypts a local key), so it is unaffected.
+fn override_changes_user(ov_user: Option<&str>, host_user: Option<&str>) -> bool {
+    match ov_user {
+        Some(u) if !u.is_empty() => Some(u) != host_user,
+        _ => false,
+    }
+}
+
 /// The re-entrant connect executor (spec "Connect-time flow"): resolve the alias →
 /// gate (candidacy → Match-exec → `ssh -G` → proxy → TOFU) → decide via
 /// [`connect_plan`] → execute. Inline owns its askpass listener in a scope-guard;
@@ -603,6 +616,23 @@ fn connect_by_alias(
 
     // Candidacy (opt-in-masked). A decline additionally drops the Password kind.
     let mut candidacy = apply_password_choice(app.vault_secret_kinds(&host), choice);
+    // Wrong-account guard: a connect-time override that switches the login user must not
+    // auto-fill the host's stored PASSWORD (it belongs to the host's account, not the
+    // override's) — that would disclose it to the server in a different account's login.
+    // The passphrase (local key decryption) is account-independent and stays.
+    if let Some(k) = candidacy.as_mut()
+        && k.password
+        && override_changes_user(ov.user.as_deref(), host.user.as_deref())
+    {
+        k.password = false;
+        app.toast(
+            "password auto-fill off: override connects as a different user",
+            false,
+        );
+        if !k.any() {
+            candidacy = None;
+        }
+    }
     // (#6) OpenSSH < 8.5 lacks the `(user@host)` keyboard-interactive prefix that
     // classify() depends on, so never arm the server-facing *password* secret on
     // such a client. Passphrase auto-fill is local-only and stays enabled.
@@ -3550,6 +3580,17 @@ mod tests {
         assert_eq!(s, "value");
         // Capacity preserved so subsequent edits do not immediately realloc.
         assert!(s.capacity() >= "secret-value".len());
+    }
+
+    #[test]
+    fn override_changes_user_detects_account_switch() {
+        // The stored password is keyed to the host's account, so a connect-time override
+        // to a DIFFERENT user must not auto-fill it (wrong-account disclosure).
+        assert!(!override_changes_user(None, Some("alice"))); // no override
+        assert!(!override_changes_user(Some(""), Some("alice"))); // empty override
+        assert!(!override_changes_user(Some("alice"), Some("alice"))); // same user
+        assert!(override_changes_user(Some("bob"), Some("alice"))); // switched account
+        assert!(override_changes_user(Some("bob"), None)); // host default -> explicit user
     }
 
     #[test]
