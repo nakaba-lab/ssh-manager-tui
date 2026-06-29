@@ -74,8 +74,39 @@ impl RemoteEntry {
 /// line, so names containing spaces survive. `total N` headers, blank lines, and
 /// the `.`/`..` self entries are dropped, as is any line that doesn't have the
 /// minimum field count (malformed-server resilience).
+/// Upper bound on entries parsed from one directory listing. A hostile server can
+/// return arbitrarily many `ls -la` lines; this caps the resulting `Vec` (and so the
+/// per-frame render) far above any usable directory. Pairs with [`MAX_LISTING_BYTES`].
+pub(crate) const MAX_LISTING_ENTRIES: usize = 50_000;
+
+/// Upper bound on bytes captured from one browse op's stdout/stderr. A hostile server
+/// can stream an endless listing (keeping the connection alive so the timeouts never
+/// trip); capping the read prevents the worker from buffering it without bound and
+/// OOM-crashing the TUI (M4).
+const MAX_LISTING_BYTES: usize = 8 * 1024 * 1024;
+
 pub fn parse_ls_l(block: &str) -> Vec<RemoteEntry> {
-    block.lines().filter_map(parse_ls_l_line).collect()
+    block
+        .lines()
+        .filter_map(parse_ls_l_line)
+        .take(MAX_LISTING_ENTRIES)
+        .collect()
+}
+
+/// Read up to `cap` bytes from `r`, returning the bytes and whether more remained
+/// (i.e. the input was truncated). Reading one past `cap` is what lets a caller
+/// distinguish "exactly cap" from "more than cap". Used to bound a browse op's
+/// captured output against a server that streams without bound (M4).
+fn read_capped<R: std::io::Read>(mut r: R, cap: usize) -> (Vec<u8>, bool) {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    let _ = r
+        .by_ref()
+        .take((cap as u64).saturating_add(1))
+        .read_to_end(&mut buf);
+    let truncated = buf.len() > cap;
+    buf.truncate(cap);
+    (buf, truncated)
 }
 
 /// Parse a single listing line, or `None` for a header/blank/`.`/`..`/malformed
@@ -432,6 +463,44 @@ pub(crate) fn batchmode_args(armed: bool) -> [&'static str; 2] {
     }
 }
 
+/// Captured child output with each stream bounded to [`MAX_LISTING_BYTES`].
+struct CappedOutput {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+/// Like `Command::output`, but caps stdout and stderr at [`MAX_LISTING_BYTES`] each so
+/// a hostile server streaming an unbounded `ls -la` cannot make the worker buffer it
+/// without limit and OOM the TUI (M4). stdout is the server-controlled stream for a
+/// listing; if it overflows the cap the child is killed so it can't block writing.
+/// (sftp emits only its own bounded diagnostics on stderr — it never proxies unbounded
+/// server bytes there — so joining stdout first cannot deadlock for a listing op.)
+fn output_capped(mut cmd: std::process::Command) -> std::io::Result<CappedOutput> {
+    use std::process::Stdio;
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn()?;
+    let out = child.stdout.take().expect("stdout was set to piped");
+    let err = child.stderr.take().expect("stderr was set to piped");
+    let t_out = std::thread::spawn(move || read_capped(out, MAX_LISTING_BYTES));
+    let t_err = std::thread::spawn(move || read_capped(err, MAX_LISTING_BYTES));
+    let (stdout, out_truncated) = t_out.join().unwrap_or_else(|_| (Vec::new(), false));
+    // If stdout overflowed, its reader stopped at the cap and the child may now be
+    // blocked writing — kill it so the stderr join below reaches EOF instead of hanging.
+    if out_truncated {
+        let _ = child.kill();
+    }
+    let (stderr, _) = t_err.join().unwrap_or_else(|_| (Vec::new(), false));
+    let status = child.wait()?;
+    Ok(CappedOutput {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
 /// Run one op to completion in a child `sftp -b` process and map it to an event.
 fn run_op(alias: &str, common_args: &[String], arm: Option<SftpArm>, op: SftpOp) -> SftpEvent {
     let SftpOp::List(path) = op;
@@ -483,10 +552,9 @@ fn run_op(alias: &str, common_args: &[String], arm: Option<SftpArm>, op: SftpOp)
     args.push("--".to_string());
     args.push(alias.to_string());
 
-    let output = std::process::Command::new(tools().sftp.as_path())
-        .args(&args)
-        .envs(env.iter().map(|(k, v)| (k, v)))
-        .output();
+    let mut cmd = std::process::Command::new(tools().sftp.as_path());
+    cmd.args(&args).envs(env.iter().map(|(k, v)| (k, v)));
+    let output = output_capped(cmd);
 
     // Tear the per-op listener down (zeroize) regardless of outcome, capturing its
     // Outcome so we can tell a real password rejection (Served) from a transient
@@ -779,6 +847,36 @@ drwxr-xr-x    2 deploy deploy 4096 Jan 15 10:30 projects
                 .any(|n| n.contains("working") || n.contains("directory")),
             "the pwd preamble line must not leak as an entry"
         );
+    }
+
+    #[test]
+    fn read_capped_bounds_input_and_flags_truncation() {
+        use std::io::Cursor;
+        // More than the cap: truncated to `cap` bytes, flagged.
+        let (buf, trunc) = read_capped(Cursor::new(b"hello world".to_vec()), 5);
+        assert_eq!(buf, b"hello");
+        assert!(trunc);
+        // Under the cap: kept whole, not flagged.
+        let (buf, trunc) = read_capped(Cursor::new(b"hi".to_vec()), 5);
+        assert_eq!(buf, b"hi");
+        assert!(!trunc);
+        // Exactly the cap is NOT truncation.
+        let (buf, trunc) = read_capped(Cursor::new(b"12345".to_vec()), 5);
+        assert_eq!(buf, b"12345");
+        assert!(!trunc);
+    }
+
+    #[test]
+    fn parse_ls_l_caps_entry_count() {
+        // A hostile / compromised server can return a `ls -la` with arbitrarily many
+        // entries; the parser must bound the entry Vec so it cannot drive unbounded
+        // allocation (M4 — combined with the byte cap on the captured stdout).
+        let prefix = "-rw-r--r--    1 u g  1 Jan  1 00:00 ";
+        let block: String = (0..MAX_LISTING_ENTRIES + 25)
+            .map(|i| format!("{prefix}f{i}\n"))
+            .collect();
+        let entries = parse_ls_l(&block);
+        assert_eq!(entries.len(), MAX_LISTING_ENTRIES);
     }
 
     #[test]

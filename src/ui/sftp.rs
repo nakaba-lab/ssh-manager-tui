@@ -115,12 +115,9 @@ fn draw_local_pane(f: &mut Frame, b: &SftpBrowser, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let rows: Vec<Line> = b
-        .local_entries
-        .iter()
-        .map(|e| entry_line(&e.name, e.is_dir, false, None))
-        .collect();
-    render_list(f, rows, b.local_sel, focused, inner);
+    render_entry_list(f, &b.local_entries, b.local_sel, focused, inner, |e| {
+        entry_line(&e.name, e.is_dir, false, None)
+    });
 }
 
 fn draw_remote_pane(f: &mut Frame, b: &SftpBrowser, area: Rect) {
@@ -148,12 +145,9 @@ fn draw_remote_pane(f: &mut Frame, b: &SftpBrowser, area: Rect) {
         );
         return;
     }
-    let rows: Vec<Line> = b
-        .remote_entries
-        .iter()
-        .map(|e| entry_line(&e.name, e.is_dir, e.is_link, Some(e.size)))
-        .collect();
-    render_list(f, rows, b.remote_sel, focused, inner);
+    render_entry_list(f, &b.remote_entries, b.remote_sel, focused, inner, |e| {
+        entry_line(&e.name, e.is_dir, e.is_link, Some(e.size))
+    });
 }
 
 /// One directory-entry line: a type glyph, the name, and (remote) a size column.
@@ -178,21 +172,39 @@ fn entry_line(name: &str, is_dir: bool, is_link: bool, size: Option<u64>) -> Lin
     Line::from(spans)
 }
 
-/// Render `rows` as a selectable list, scrolling so `sel` stays visible and
-/// painting the selection bar when the pane is `focused`.
-fn render_list(f: &mut Frame, rows: Vec<Line<'static>>, sel: usize, focused: bool, area: Rect) {
+/// First visible row index so `sel` stays on screen in a `height`-row viewport.
+fn list_scroll(sel: usize, height: usize) -> usize {
+    if height > 0 && sel >= height {
+        sel - height + 1
+    } else {
+        0
+    }
+}
+
+/// Render `entries` as a selectable list, building a [`Line`] only for the rows
+/// actually on screen (O(viewport), not O(entries)) so a huge listing can't pin the
+/// UI thread re-materializing every row each frame (M5). Scrolls so `sel` stays
+/// visible and paints the selection bar when the pane is `focused`.
+fn render_entry_list<T>(
+    f: &mut Frame,
+    entries: &[T],
+    sel: usize,
+    focused: bool,
+    area: Rect,
+    to_line: impl Fn(&T) -> Line<'static>,
+) {
     let height = area.height as usize;
-    if height == 0 || rows.is_empty() {
+    if height == 0 || entries.is_empty() {
         return;
     }
-    // Keep the selected row within the viewport.
-    let scroll = if sel >= height { sel - height + 1 } else { 0 };
-    let visible: Vec<Line> = rows
-        .into_iter()
+    let scroll = list_scroll(sel, height);
+    let visible: Vec<Line> = entries
+        .iter()
         .enumerate()
         .skip(scroll)
         .take(height)
-        .map(|(i, mut line)| {
+        .map(|(i, e)| {
+            let mut line = to_line(e);
             if i == sel && focused {
                 line = line.style(theme::selection());
             }
@@ -238,6 +250,18 @@ fn human_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn list_scroll_keeps_selection_in_view() {
+        // Selection within the first page: no scroll.
+        assert_eq!(list_scroll(0, 10), 0);
+        assert_eq!(list_scroll(9, 10), 0);
+        // Selection past the page: scroll so `sel` is the last visible row.
+        assert_eq!(list_scroll(10, 10), 1);
+        assert_eq!(list_scroll(25, 10), 16);
+        // Degenerate height never panics / underflows.
+        assert_eq!(list_scroll(5, 0), 0);
+    }
 
     #[test]
     fn human_size_scales_at_1024_boundaries() {
