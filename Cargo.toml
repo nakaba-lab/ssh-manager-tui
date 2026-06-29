@@ -17,7 +17,7 @@ name = "sshm"
 path = "src/main.rs"
 
 [dependencies]
-anyhow = "1.0.102"
+anyhow = "1.0.103"
 arboard = "3.6.1"
 argon2 = "0.5"
 base64 = "0.22"
