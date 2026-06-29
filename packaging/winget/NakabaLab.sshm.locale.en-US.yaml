@@ -1,7 +1,7 @@
 # yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.12.0.schema.json
 
 PackageIdentifier: NakabaLab.sshm
-PackageVersion: 1.1.1
+PackageVersion: 1.2.0
 PackageLocale: en-US
 Publisher: nakaba-lab
 PublisherUrl: https://github.com/nakaba-lab/ssh-manager-tui
