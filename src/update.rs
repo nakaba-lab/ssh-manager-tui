@@ -2037,8 +2037,9 @@ fn sftp_batch_line(direction: SftpDirection, local: &str, remote: &str) -> Optio
 /// Build the ATOMIC `sftp -b` script for a browser transfer, writing to a temp on the
 /// destination side so an interrupted transfer never truncates an existing file (M2).
 /// `dst_tmp` is a sibling of the destination: a LOCAL temp for a download (the caller
-/// renames it into place after success) or a REMOTE temp for an upload (an in-batch
-/// `rename` — posix-rename on OpenSSH, an atomic overwrite — finalizes it server-side).
+/// renames it into place after success) or a REMOTE temp for an upload (finalized
+/// server-side by an in-batch `-rm` of any existing destination then a `rename`, so the
+/// overwrite works on any server, not only ones advertising posix-rename).
 /// `None` if any path can't be expressed safely (see [`sftp_quote`]).
 fn transfer_script(
     direction: SftpDirection,
@@ -2053,7 +2054,12 @@ fn transfer_script(
     );
     Some(match direction {
         SftpDirection::Get => format!("get {remote} {tmp}\n"),
-        SftpDirection::Put => format!("put {local} {tmp}\nrename {tmp} {remote}\n"),
+        // `-rm` (dash-prefixed: `sftp -b` ignores the error when the destination does
+        // not exist) drops any existing destination BEFORE the rename, so the overwrite
+        // works even on servers without the posix-rename extension (where a plain
+        // `rename` over an existing path fails). The new bytes are in the temp the whole
+        // time, so a crash between the rm and the rename cannot truncate them.
+        SftpDirection::Put => format!("put {local} {tmp}\n-rm {remote}\nrename {tmp} {remote}\n"),
     })
 }
 
@@ -2071,12 +2077,12 @@ fn transfer_dest_exists(b: &SftpBrowser, direction: SftpDirection, name: &str) -
     }
 }
 
-/// Atomically replace `dst` with the freshly-downloaded `tmp`. On Windows a rename
-/// fails if the destination exists, so remove it first (mirrors the config writer's
-/// save path); on unix `rename` overwrites atomically.
+/// Replace `dst` with the freshly-downloaded `tmp`. `std::fs::rename` replaces an
+/// existing destination atomically on BOTH unix (POSIX rename) and Windows (MoveFileExW
+/// with MOVEFILE_REPLACE_EXISTING), so the original is replaced only on success and left
+/// intact on any failure — NO pre-remove window that could lose the original if the
+/// rename then fails. `tmp` and `dst` are always siblings (same dir/volume).
 fn finalize_local_download(tmp: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
-    #[cfg(windows)]
-    let _ = std::fs::remove_file(dst);
     std::fs::rename(tmp, dst)
 }
 
@@ -2538,10 +2544,11 @@ fn do_browser_transfer(
         let dst_path = std::path::PathBuf::from(&local);
         if ok {
             if let Err(e) = finalize_local_download(&tmp_path, &dst_path) {
-                set_browser_status(
-                    app,
-                    format!("downloaded but could not replace destination: {e}"),
-                );
+                // rename failed atomically (e.g. dst is a directory, or locked): the
+                // original is untouched. Drop the staged temp so it never litters the
+                // pane, and tell the user the download did not land.
+                let _ = std::fs::remove_file(&tmp_path);
+                set_browser_status(app, format!("download could not be placed: {e}"));
             }
         } else {
             let _ = std::fs::remove_file(&tmp_path);
@@ -4071,8 +4078,10 @@ mod tests {
             ),
             Some("get /srv/cfg /home/me/cfg.part\n".to_string())
         );
-        // Upload: put to a REMOTE temp, then atomically rename it over the destination
-        // (posix-rename on OpenSSH) — never truncating an existing remote file (M2).
+        // Upload: put to a REMOTE temp, drop any existing destination (`-rm` ignores
+        // the error when it doesn't exist), then rename the temp into place — never
+        // truncating an existing remote file, and working on servers WITHOUT the
+        // posix-rename extension (where a plain `rename` over an existing file fails).
         assert_eq!(
             transfer_script(
                 SftpDirection::Put,
@@ -4080,10 +4089,32 @@ mod tests {
                 "/srv/cfg",
                 "/srv/cfg.part"
             ),
-            Some("put /home/me/cfg /srv/cfg.part\nrename /srv/cfg.part /srv/cfg\n".to_string())
+            Some(
+                "put /home/me/cfg /srv/cfg.part\n-rm /srv/cfg\nrename /srv/cfg.part /srv/cfg\n"
+                    .to_string()
+            )
         );
         // An unsafe path (trailing backslash / quote) fails closed.
         assert_eq!(transfer_script(SftpDirection::Get, "a", "b\\", "c"), None);
+    }
+
+    #[test]
+    fn finalize_local_download_replaces_an_existing_file() {
+        // The atomic download finalize must replace an existing destination (the
+        // overwrite-confirm case) AND leave the original intact if it fails — so it
+        // relies on rename's atomic-replace, never a pre-remove that could lose the
+        // original. Pins that `std::fs::rename` replaces an existing file here.
+        let dir = std::env::temp_dir().join(format!("sshm-fin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dst = dir.join("file.txt");
+        let tmp = dir.join("file.txt.sshm-part-x");
+        std::fs::write(&dst, b"OLD").unwrap();
+        std::fs::write(&tmp, b"NEW").unwrap();
+        finalize_local_download(&tmp, &dst).unwrap();
+        assert_eq!(std::fs::read(&dst).unwrap(), b"NEW", "destination replaced");
+        assert!(!tmp.exists(), "the temp is consumed by the rename");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn h2_browser(
