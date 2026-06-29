@@ -629,14 +629,18 @@ pub fn is_safe_local_name(name: &str) -> bool {
 }
 
 /// Quote a path for an `sftp` batch command, or `None` if it can't be expressed
-/// safely. sftp's batch parser has no escape for a literal `"`, and a control
-/// character (newline/CR/tab/…) would split or corrupt the single-line command —
-/// reject both, fail-closed (mirrors the config writer's refusal stance). A value
-/// containing whitespace is wrapped in double quotes; backslashes are left intact
-/// so Windows local paths round-trip. This is the single quoting gate for every
-/// path that reaches an `sftp` batch line (browse ops and inline transfers).
+/// safely. sftp's batch tokenizer (`makeargv`) has no escape for a literal `"`, a
+/// control character (newline/CR/tab/…) would split or corrupt the single-line
+/// command, and a **trailing backslash** escapes the byte that follows it — the
+/// argument separator for a bare token, or the closing `"` for a wrapped one —
+/// merging this argument with the next (a quoting bypass that is fail-OPEN on a
+/// server-supplied `get` source). Reject all three, fail-closed (mirrors the config
+/// writer's refusal stance). A value containing whitespace is wrapped in double
+/// quotes; interior backslashes are left intact so Windows local paths to a real
+/// file round-trip. This is the single quoting gate for every path that reaches an
+/// `sftp` batch line (browse ops and inline transfers).
 pub fn sftp_quote(p: &str) -> Option<String> {
-    if p.contains('"') || p.chars().any(|c| c.is_control()) {
+    if p.contains('"') || p.ends_with('\\') || p.chars().any(|c| c.is_control()) {
         return None;
     }
     // A leading '-' would be parsed as a flag by the in-batch `ls`/`get`/`put`
@@ -809,6 +813,23 @@ drwxr-xr-x    2 deploy deploy 4096 Jan 15 10:30 projects
             assert!(is_safe_local_name(r"a\b"));
             assert!(is_safe_local_name("weird:name"));
         }
+    }
+
+    #[test]
+    fn sftp_quote_rejects_trailing_backslash() {
+        // sftp's batch tokenizer (makeargv) treats a backslash as escaping the next
+        // byte, so a value ending in `\` escapes either the following argument
+        // separator (bare token) or the closing `"` (wrapped token) and merges with
+        // the next argument — a quoting bypass that is fail-OPEN on a server-supplied
+        // `get` source/cwd. Reject it fail-closed, like a literal `"`/control char (M6).
+        assert_eq!(sftp_quote("foo\\"), None); // bare + trailing '\'
+        assert_eq!(sftp_quote("/srv/foo\\"), None);
+        assert_eq!(sftp_quote("C:\\My Docs\\"), None); // whitespace + trailing '\'
+        // Interior backslashes (a Windows path to a real FILE) still round-trip.
+        assert_eq!(
+            sftp_quote("C:\\id\\a.txt"),
+            Some("C:\\id\\a.txt".to_string())
+        );
     }
 
     #[test]
