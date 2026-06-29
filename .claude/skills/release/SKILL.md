@@ -61,11 +61,22 @@ Distribution facts (see the `distribution-setup` memory):
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 cargo test --all
+cargo deny check advisories bans sources   # release.yml's "quality gate" runs this
 ```
+
+**Run `cargo deny` locally — `release.yml`'s quality gate runs it, and a NEW RUSTSEC
+advisory against a dependency (which `cargo audit` in normal CI may not yet flag) will
+fail the release build *after* you've already pushed the tag.** (This bit v1.2.0:
+RUSTSEC-2026-0190 against `anyhow` 1.0.102 failed the gate; the fix was a `cargo update
+-p anyhow` to >=1.0.103, a follow-up PR, and re-pointing the tag.) `cargo deny`'s
+solution line names the fix version. If `cargo-deny` isn't installed: `cargo install
+cargo-deny`. If a flagged advisory has no fix yet, the user decides whether to
+`ignore` it in `deny.toml`.
 
 The Linux-only `dead_code` trap on `#[cfg(windows)]`-only symbols can pass on a
 local Windows build yet fail CI — if a release touched `os/` or cfg-gated code,
-dispatch the `windows-first-reviewer` subagent.
+either cross-compile (`cargo clippy --target x86_64-unknown-linux-gnu --all-targets --
+-D warnings`) or dispatch the `windows-first-reviewer` subagent.
 
 ## 3. Release build sanity
 
