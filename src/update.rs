@@ -1996,6 +1996,31 @@ fn should_arm_sftp_password(
     is_candidate && autofill_enabled && target_consented && kbdint_supported
 }
 
+/// Build the `(local, remote)` endpoint path strings for a browser transfer, or an
+/// `Err(message)` if it must be refused. For a **download** (`Get`) the `name` is a
+/// server-controlled directory-entry name that becomes the LOCAL destination, so it
+/// must be a safe single local component — a hostile/compromised server must not be
+/// able to name a file `..\..\Startup\evil.bat` / `C:\…` / `\\host\share\…` and have
+/// the download escape `local_cwd` (H1, CVE-2019-6111 class). For an **upload**
+/// (`Put`) the `name` comes from the trusted local listing (a single component that
+/// cannot traverse), so only the remote side is built — no server-controlled value
+/// reaches a local path.
+fn transfer_endpoints(
+    direction: SftpDirection,
+    local_cwd: &std::path::Path,
+    remote_cwd: &str,
+    name: &str,
+) -> std::result::Result<(String, String), String> {
+    if direction == SftpDirection::Get && !crate::os::sftp::is_safe_local_name(name) {
+        return Err(format!(
+            "refusing download: server-supplied name '{name}' is not a safe local filename"
+        ));
+    }
+    let local = local_cwd.join(name).display().to_string();
+    let remote = remote_join(remote_cwd, name);
+    Ok((local, remote))
+}
+
 /// Build the single `sftp -b` batch command for a transfer, or `None` if either
 /// path can't be expressed safely (see [`sftp_quote`]). `get` pulls remote→local;
 /// `put` pushes local→remote. Each path is quoted independently.
@@ -2358,8 +2383,16 @@ fn browser_transfer(
         return Ok(());
     };
     let alias = host.alias().to_string();
-    let local = b.local_cwd.join(name).display().to_string();
-    let remote = remote_join(&b.remote_cwd, name);
+    // Build (and, for a download, safety-check the server-controlled name behind)
+    // the endpoint paths. A traversing/absolute remote name is refused here so it
+    // can never escape the local pane directory (H1).
+    let (local, remote) = match transfer_endpoints(direction, &b.local_cwd, &b.remote_cwd, name) {
+        Ok(pair) => pair,
+        Err(msg) => {
+            set_browser_status(app, msg);
+            return Ok(());
+        }
+    };
 
     let Some(batch) = sftp_batch_line(direction, &local, &remote) else {
         set_browser_status(
@@ -3854,6 +3887,33 @@ mod tests {
             b.remote_loading,
             "remote_loading must remain true after dropped dispatch"
         );
+    }
+
+    #[test]
+    fn transfer_endpoints_rejects_unsafe_download_name() {
+        use std::path::Path;
+        let local_cwd = Path::new("/home/me/dl");
+
+        // Download (Get): `name` is server-controlled, so a traversing / absolute
+        // name that would escape local_cwd is refused (H1, CVE-2019-6111 class).
+        assert!(
+            transfer_endpoints(SftpDirection::Get, local_cwd, "/srv", "../../etc/passwd").is_err()
+        );
+        assert!(transfer_endpoints(SftpDirection::Get, local_cwd, "/srv", "/etc/passwd").is_err());
+        assert!(transfer_endpoints(SftpDirection::Get, local_cwd, "/srv", "a/b").is_err());
+
+        // Download with a plain name builds the joined local destination + remote
+        // source and proceeds.
+        let (local, remote) =
+            transfer_endpoints(SftpDirection::Get, local_cwd, "/srv/data", "report.txt").unwrap();
+        assert!(local.ends_with("report.txt"));
+        assert_eq!(remote, "/srv/data/report.txt");
+
+        // Upload (Put): `name` comes from the trusted local listing (a single
+        // component that cannot traverse), so the download guard does not apply.
+        let (_l, r) =
+            transfer_endpoints(SftpDirection::Put, local_cwd, "/srv", "local.txt").unwrap();
+        assert_eq!(r, "/srv/local.txt");
     }
 
     #[test]
