@@ -36,7 +36,7 @@ pub fn tools() -> &'static SshTools {
 /// env var (CWE-426 hardening of the auto-fill trust anchor; see [`resolve`]).
 /// `None` if the API call fails or reports an implausibly long path.
 #[cfg(windows)]
-fn system_directory() -> Option<PathBuf> {
+pub(crate) fn system_directory() -> Option<PathBuf> {
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
     use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;

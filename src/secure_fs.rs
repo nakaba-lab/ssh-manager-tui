@@ -71,7 +71,14 @@ pub fn restrict_acl(path: &Path) {
     if user.is_empty() {
         return;
     }
-    let _ = std::process::Command::new(icacls_path())
+    // Resolve icacls.exe to an absolute, untamperable System32 path; if that fails,
+    // SKIP the tighten rather than run a bare `icacls` off PATH — a missing ACL
+    // restriction is a smaller risk than executing a planted binary in the user's
+    // context during a vault/prefs/history write.
+    let Some(icacls) = icacls_path() else {
+        return;
+    };
+    let _ = std::process::Command::new(icacls)
         .arg(path)
         .arg("/inheritance:r")
         .arg("/grant:r")
@@ -81,14 +88,13 @@ pub fn restrict_acl(path: &Path) {
         .status();
 }
 
-/// Absolute `%SystemRoot%\System32\icacls.exe`, falling back to the bare name
-/// only if `SystemRoot` is unset (so the OS executable search applies).
+/// Absolute `…\System32\icacls.exe` resolved via the Win32 `GetSystemDirectoryW`
+/// API (NOT the tamperable `%SystemRoot%` env var — the same CWE-426 hardening as
+/// the ssh-client trust anchor). `None` if the system directory can't be resolved,
+/// in which case the caller skips the ACL tighten rather than trusting `PATH`.
 #[cfg(windows)]
-fn icacls_path() -> std::path::PathBuf {
-    match std::env::var("SystemRoot") {
-        Ok(root) if !root.is_empty() => Path::new(&root).join("System32").join("icacls.exe"),
-        _ => std::path::PathBuf::from("icacls"),
-    }
+fn icacls_path() -> Option<std::path::PathBuf> {
+    crate::os::binaries::system_directory().map(|d| d.join("icacls.exe"))
 }
 
 /// Best-effort directory fsync so a rename into it is persisted, not just
@@ -126,6 +132,21 @@ mod tests {
         let err = create_new_private(&p).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn icacls_path_resolves_under_the_real_system_dir() {
+        // The icacls trust anchor must resolve via the hardened GetSystemDirectoryW
+        // path (like M3 for ssh), NOT the tamperable %SystemRoot% env — so a planted
+        // icacls.exe via a poisoned SystemRoot can't run during a vault/prefs write.
+        let p = icacls_path().expect("icacls path resolves");
+        assert!(p.ends_with("icacls.exe"), "got {p:?}");
+        assert!(p.exists(), "resolved icacls.exe should exist");
+        assert!(
+            p.to_string_lossy().to_lowercase().contains("system32"),
+            "got {p:?}"
+        );
     }
 
     #[cfg(unix)]
