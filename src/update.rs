@@ -1701,7 +1701,7 @@ fn submit_sftp_transfer(app: &mut App, terminal: &mut DefaultTerminal) -> Result
     // build a malformed/ambiguous command (mirrors the config writer's stance).
     let Some(batch) = sftp_batch_line(direction, &local, &remote) else {
         app.toast(
-            "paths must not contain a double-quote or control character",
+            "paths must not contain a double-quote, control, or glob (* ? [) character",
             true,
         );
         return Ok(());
@@ -2027,6 +2027,15 @@ fn transfer_endpoints(
 /// path can't be expressed safely (see [`sftp_quote`]). `get` pulls remote→local;
 /// `put` pushes local→remote. Each path is quoted independently.
 fn sftp_batch_line(direction: SftpDirection, local: &str, remote: &str) -> Option<String> {
+    // Refuse a glob metachar in the SOURCE (remote for get, local for put) — sftp would
+    // glob-expand it to the wrong file (B2).
+    let source = match direction {
+        SftpDirection::Get => remote,
+        SftpDirection::Put => local,
+    };
+    if has_glob_metachar(source) {
+        return None;
+    }
     let (local, remote) = (sftp_quote(local)?, sftp_quote(remote)?);
     Some(match direction {
         SftpDirection::Get => format!("get {remote} {local}\n"),
@@ -2041,25 +2050,50 @@ fn sftp_batch_line(direction: SftpDirection, local: &str, remote: &str) -> Optio
 /// server-side by an in-batch `-rm` of any existing destination then a `rename`, so the
 /// overwrite works on any server, not only ones advertising posix-rename).
 /// `None` if any path can't be expressed safely (see [`sftp_quote`]).
+/// Whether `s` contains an sftp glob metacharacter (`*`, `?`, `[`). OpenSSH sftp
+/// glob-expands the get/put SOURCE path after dequoting (and double-quote wrapping
+/// does NOT disable it), so a source containing one must be refused: a server-named
+/// `*` would fetch a sibling file and a `[..]` name would fail to match (B2). cd/ls
+/// listing paths are NOT globbed, so this gate is applied only to transfer sources,
+/// never to the shared `sftp_quote`.
+fn has_glob_metachar(s: &str) -> bool {
+    s.contains(['*', '?', '['])
+}
+
 fn transfer_script(
     direction: SftpDirection,
     local: &str,
     remote: &str,
     dst_tmp: &str,
+    dst_bak: &str,
 ) -> Option<String> {
-    let (local, remote, tmp) = (
+    // The SOURCE (remote for get, local for put) is glob-expanded by sftp — refuse a
+    // glob metachar there. The destination temp/backup are write targets, never globbed.
+    let source = match direction {
+        SftpDirection::Get => remote,
+        SftpDirection::Put => local,
+    };
+    if has_glob_metachar(source) {
+        return None;
+    }
+    let (local, remote, tmp, bak) = (
         sftp_quote(local)?,
         sftp_quote(remote)?,
         sftp_quote(dst_tmp)?,
+        sftp_quote(dst_bak)?,
     );
     Some(match direction {
         SftpDirection::Get => format!("get {remote} {tmp}\n"),
-        // `-rm` (dash-prefixed: `sftp -b` ignores the error when the destination does
-        // not exist) drops any existing destination BEFORE the rename, so the overwrite
-        // works even on servers without the posix-rename extension (where a plain
-        // `rename` over an existing path fails). The new bytes are in the temp the whole
-        // time, so a crash between the rm and the rename cannot truncate them.
-        SftpDirection::Put => format!("put {local} {tmp}\n-rm {remote}\nrename {tmp} {remote}\n"),
+        // Truly atomic on ANY server: put to a temp, move any existing original ASIDE to
+        // a backup (`-rename`, dash-prefixed so a fresh upload's "no such file" is
+        // ignored), rename the temp into the now-absent destination (works without the
+        // posix-rename extension), then drop the backup (`-rm`, ignored if absent). The
+        // new bytes live in the temp throughout and the original lives in the backup
+        // through the swap window, so an interruption can never destroy the original —
+        // it is recoverable at the backup path.
+        SftpDirection::Put => {
+            format!("put {local} {tmp}\n-rename {remote} {bak}\nrename {tmp} {remote}\n-rm {bak}\n")
+        }
     })
 }
 
@@ -2500,17 +2534,21 @@ fn do_browser_transfer(
             return Ok(());
         }
     };
-    // A destination-side temp (sibling of the real destination), with an unguessable
-    // nonce so a pre-planted file/symlink at the temp path can't redirect the write.
+    // Destination-side temp + backup siblings (same dir/volume), each with an
+    // unguessable nonce so a pre-planted file/symlink can't redirect the write. The
+    // backup (upload only) holds the original through the in-batch swap window.
     let dst = match direction {
         SftpDirection::Get => &local,
         SftpDirection::Put => &remote,
     };
-    let dst_tmp = format!("{dst}.sshm-part-{}", crate::os::sftp::nonce());
-    let Some(batch) = transfer_script(direction, &local, &remote, &dst_tmp) else {
+    let nonce = crate::os::sftp::nonce();
+    let dst_tmp = format!("{dst}.sshm-part-{nonce}");
+    let dst_bak = format!("{dst}.sshm-bak-{nonce}");
+    let Some(batch) = transfer_script(direction, &local, &remote, &dst_tmp, &dst_bak) else {
         set_browser_status(
             app,
-            "path contains a \" or control character — cannot transfer".to_string(),
+            "name contains a quote, control, or glob (* ? [) character — cannot transfer"
+                .to_string(),
         );
         return Ok(());
     };
@@ -2536,9 +2574,10 @@ fn do_browser_transfer(
 
     // M2 finalize. A download landed in a LOCAL temp: on success rename it over the
     // destination, on failure drop the partial so the original is left untouched. An
-    // upload's rename ran in-batch (server-side, atomic on OpenSSH), so nothing to do
-    // here — a failed upload may leave a remote `.sshm-part`, preferable to a
-    // truncated original.
+    // upload's swap (put -> rename-original-aside -> rename-temp-in -> rm-backup) runs
+    // entirely in-batch server-side, so nothing to do here — a failed upload may leave a
+    // remote `.sshm-part`/`.sshm-bak`, but the ORIGINAL is never destroyed (it survives
+    // at the backup through the swap window).
     if direction == SftpDirection::Get {
         let tmp_path = std::path::PathBuf::from(&dst_tmp);
         let dst_path = std::path::PathBuf::from(&local);
@@ -4066,6 +4105,63 @@ mod tests {
     }
 
     #[test]
+    fn has_glob_metachar_detects_sftp_globs() {
+        assert!(has_glob_metachar("file*.txt"));
+        assert!(has_glob_metachar("image[1].jpg"));
+        assert!(has_glob_metachar("a?b"));
+        assert!(!has_glob_metachar("plain.txt"));
+        assert!(!has_glob_metachar("/srv/data/report.txt"));
+    }
+
+    #[test]
+    fn transfer_script_rejects_glob_in_the_source() {
+        // sftp glob-expands the get/put SOURCE, so a server-named `*` or `[..]` would
+        // fetch the wrong file (or fail confusingly). The source is refused fail-closed
+        // (B2). The DESTINATION temp is never globbed, so a glob there is irrelevant.
+        assert_eq!(
+            transfer_script(
+                SftpDirection::Get,
+                "/l/x",
+                "/srv/*",
+                "/l/x.part",
+                "/l/x.bak"
+            ),
+            None
+        );
+        assert_eq!(
+            transfer_script(
+                SftpDirection::Get,
+                "/l/x",
+                "/srv/img[1].jpg",
+                "/l/x.part",
+                "/l/x.bak"
+            ),
+            None
+        );
+        assert_eq!(
+            transfer_script(
+                SftpDirection::Put,
+                "/l/a?b",
+                "/srv/x",
+                "/srv/x.part",
+                "/srv/x.bak"
+            ),
+            None
+        );
+        // A glob only in the (non-globbed) destination temp/backup is fine.
+        assert!(
+            transfer_script(
+                SftpDirection::Get,
+                "/l/x",
+                "/srv/x",
+                "/l/x*.part",
+                "/l/x.bak"
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
     fn transfer_script_builds_atomic_get_and_put() {
         // Download: get the remote source to a LOCAL temp (Rust renames it into place
         // after success), so an interrupted get never truncates an existing local file.
@@ -4074,28 +4170,34 @@ mod tests {
                 SftpDirection::Get,
                 "/home/me/cfg",
                 "/srv/cfg",
-                "/home/me/cfg.part"
+                "/home/me/cfg.part",
+                "/home/me/cfg.bak"
             ),
             Some("get /srv/cfg /home/me/cfg.part\n".to_string())
         );
-        // Upload: put to a REMOTE temp, drop any existing destination (`-rm` ignores
-        // the error when it doesn't exist), then rename the temp into place — never
-        // truncating an existing remote file, and working on servers WITHOUT the
-        // posix-rename extension (where a plain `rename` over an existing file fails).
+        // Upload (truly atomic on ANY server): put to a temp, move any existing original
+        // ASIDE to a backup (`-rename`, ignored when there is none), rename the temp in,
+        // then drop the backup. An interruption mid-dance leaves the original recoverable
+        // at the backup — never destroyed — and the rename targets an absent path so it
+        // works without the posix-rename extension.
         assert_eq!(
             transfer_script(
                 SftpDirection::Put,
                 "/home/me/cfg",
                 "/srv/cfg",
-                "/srv/cfg.part"
+                "/srv/cfg.part",
+                "/srv/cfg.bak"
             ),
             Some(
-                "put /home/me/cfg /srv/cfg.part\n-rm /srv/cfg\nrename /srv/cfg.part /srv/cfg\n"
+                "put /home/me/cfg /srv/cfg.part\n-rename /srv/cfg /srv/cfg.bak\nrename /srv/cfg.part /srv/cfg\n-rm /srv/cfg.bak\n"
                     .to_string()
             )
         );
         // An unsafe path (trailing backslash / quote) fails closed.
-        assert_eq!(transfer_script(SftpDirection::Get, "a", "b\\", "c"), None);
+        assert_eq!(
+            transfer_script(SftpDirection::Get, "a", "b\\", "c", "d"),
+            None
+        );
     }
 
     #[test]
