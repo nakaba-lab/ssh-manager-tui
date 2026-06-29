@@ -34,7 +34,7 @@ zeroize = "1"
 [target.'cfg(windows)'.dependencies]
 # 0.60 matches a windows-sys generation already in the tree (via arboard), so the
 # windows-targets import-library crate-set de-duplicates to one generation.
-windows-sys = { version = "0.60", features = [
+windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
