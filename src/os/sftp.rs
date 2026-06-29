@@ -693,7 +693,34 @@ pub fn remote_parent(cwd: &str) -> String {
 /// path to its last component, so requiring it to equal `name` admits only a bare
 /// component.
 pub fn is_safe_local_name(name: &str) -> bool {
-    !name.is_empty() && std::path::Path::new(name).file_name() == Some(std::ffi::OsStr::new(name))
+    if name.is_empty() || std::path::Path::new(name).file_name() != Some(std::ffi::OsStr::new(name))
+    {
+        return false;
+    }
+    // On Windows a reserved DOS device name (CON/NUL/COM1…) resolves to the device, not
+    // a file in the directory, swallowing the download — refuse it too. (Unix has no
+    // such names, so this never changes the legal filename set there.)
+    #[cfg(windows)]
+    if is_windows_reserved_device(name) {
+        return false;
+    }
+    true
+}
+
+/// Whether `name`'s stem (before the first `.`, trailing dots/spaces stripped) is a
+/// reserved Windows DOS device: CON, PRN, AUX, NUL, COM1–9, LPT1–9 (case-insensitive).
+#[cfg(windows)]
+fn is_windows_reserved_device(name: &str) -> bool {
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or(name)
+        .trim_end_matches([' ', '.']);
+    let upper = stem.to_ascii_uppercase();
+    matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ((upper.starts_with("COM") || upper.starts_with("LPT"))
+            && upper.len() == 4
+            && matches!(upper.as_bytes()[3], b'1'..=b'9'))
 }
 
 /// Quote a path for an `sftp` batch command, or `None` if it can't be expressed
@@ -911,6 +938,31 @@ drwxr-xr-x    2 deploy deploy 4096 Jan 15 10:30 projects
             assert!(is_safe_local_name(r"a\b"));
             assert!(is_safe_local_name("weird:name"));
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn is_safe_local_name_rejects_windows_reserved_devices() {
+        // A server-supplied download name that is a reserved DOS device resolves to the
+        // device (not a file under local_cwd) regardless of directory — even the staged
+        // `NUL.sshm-part-<nonce>` temp does — so it must be refused on Windows.
+        for n in [
+            "NUL",
+            "con",
+            "CON.txt",
+            "nul.sshm-part-x",
+            "COM1",
+            "lpt9",
+            "AUX",
+            "PRN",
+            "aux.",
+        ] {
+            assert!(!is_safe_local_name(n), "{n} is a reserved device");
+        }
+        // Not reserved: COM0, a longer name that merely starts with COM, a normal file.
+        assert!(is_safe_local_name("COM0"));
+        assert!(is_safe_local_name("communicate.txt"));
+        assert!(is_safe_local_name("report.txt"));
     }
 
     #[test]
