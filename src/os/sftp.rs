@@ -494,10 +494,10 @@ struct CappedOutput {
 
 /// Like `Command::output`, but caps stdout and stderr at [`MAX_LISTING_BYTES`] each so
 /// a hostile server streaming an unbounded `ls -la` cannot make the worker buffer it
-/// without limit and OOM the TUI (M4). stdout is the server-controlled stream for a
-/// listing; if it overflows the cap the child is killed so it can't block writing.
-/// (sftp emits only its own bounded diagnostics on stderr — it never proxies unbounded
-/// server bytes there — so joining stdout first cannot deadlock for a listing op.)
+/// without limit and OOM the TUI (M4). If EITHER stream overflows the cap the child is
+/// killed so it can't block writing into a no-longer-drained pipe — symmetric handling
+/// so a flooded stderr is bounded and killed just like stdout, not merely relied upon
+/// to EPIPE.
 fn output_capped(mut cmd: std::process::Command) -> std::io::Result<CappedOutput> {
     use std::process::Stdio;
     cmd.stdin(Stdio::null())
@@ -514,7 +514,12 @@ fn output_capped(mut cmd: std::process::Command) -> std::io::Result<CappedOutput
     if out_truncated {
         let _ = child.kill();
     }
-    let (stderr, _) = t_err.join().unwrap_or_else(|_| (Vec::new(), false));
+    let (stderr, err_truncated) = t_err.join().unwrap_or_else(|_| (Vec::new(), false));
+    // Symmetric: a flooded stderr (its reader stopped at the cap) likewise gets the
+    // child killed so a subsequent write can't wedge it.
+    if err_truncated {
+        let _ = child.kill();
+    }
     let status = child.wait()?;
     Ok(CappedOutput {
         status,
