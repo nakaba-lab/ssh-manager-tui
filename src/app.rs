@@ -640,38 +640,37 @@ pub fn apply_sftp_event(b: &mut SftpBrowser, event: SftpEvent) {
                 return;
             }
             b.remote_loading = false;
-            // Circuit-breaker (armed sessions). Disarm only on `served && auth_failure`:
-            //   * `auth_failure` is classified over the FULL stderr (a leading banner
-            //     can't mask it) and recognizes the disconnect-wrapped
-            //     `Received disconnect ...: Authentication failed.` form, so a real
-            //     rejection is not missed.
-            //   * `served` (reliable even when teardown's join times out — the listener
-            //     latches each release) means a stored secret was actually released to
-            //     ssh this op. It is KIND-AGNOSTIC: a *password* release reached the
-            //     SERVER (the lockout this bounds), whereas a *passphrase* release only
-            //     decrypted a LOCAL key — disarming on the latter is a harmless fail-safe
-            //     over-disarm (no server-facing secret was sent).
-            // We require BOTH, not `served` alone: a released secret whose auth SUCCEEDED
-            // and then hit a benign command error (e.g. `cd` into a forbidden/missing
-            // dir) also reports `served` but is NOT an auth failure — disarming there
-            // would needlessly kill auto-fill on ordinary browsing.
+            // Circuit-breaker (armed sessions): ANY auth failure on an armed session
+            // disarms. `auth_failure` is classified over the FULL stderr (a leading
+            // banner can't mask it) and recognizes the disconnect-wrapped
+            // `Received disconnect ...: Authentication failed.` form, so a real
+            // rejection is not missed.
+            //
+            // We disarm regardless of `served`, not only when a password actually
+            // reached the server, because the lockout the breaker bounds also accrues
+            // when NO stored secret was released: against a keyboard-interactive /
+            // publickey-only server (`served=false`), staying armed would re-run
+            // `BatchMode=no` on every retry and re-attempt interactive auth — a fresh
+            // server-facing failed-auth event each time, with no bound. Disarming makes
+            // subsequent ops fail fast under `BatchMode=yes` (no interactive auth), which
+            // is strictly fewer server-facing attempts. `served` only varies the message.
+            //
+            // The `&& auth_failure` guard is load-bearing: a released secret whose auth
+            // SUCCEEDED and then hit a benign command error (e.g. `cd` into a
+            // forbidden/missing dir) also reports `served` but is NOT an auth failure —
+            // it must NOT disarm (that would needlessly kill auto-fill on ordinary
+            // browsing). See `armed_session_stays_armed_on_benign_post_auth_error`.
             if b.session.is_armed() && auth_failure {
-                if served {
-                    // A stored secret was released and the server still rejected auth ->
-                    // disarm so a server-facing password is not re-sent on the next
-                    // navigation (bounds lockout exposure).
-                    b.session.disarm();
-                    b.status =
-                        "stored secret rejected — re-check the vault, or press F".to_string();
+                b.session.disarm();
+                b.status = if served {
+                    // A stored secret was released and the server still rejected it.
+                    "stored secret rejected — re-check the vault, or press F".to_string()
                 } else {
-                    // Armed but no secret was released this op: either arming failed (ran
-                    // un-armed) OR the server withheld it (publickey-only /
-                    // keyboard-interactive / a method we don't auto-fill). No password
-                    // was sent, so keep the session armed; the message stays
+                    // Armed but no secret was released this op (arming failed → ran
+                    // un-armed, OR the server used a method we don't auto-fill). Stay
                     // cause-neutral rather than misattributing it to a failed arm.
-                    b.status =
-                        "auto-fill did not complete — press F to enter it, or retry".to_string();
-                }
+                    "auto-fill did not complete — press F to enter it, or retry".to_string()
+                };
             } else {
                 b.status = friendly_sftp_error(&msg, auth_failure);
             }
@@ -1860,7 +1859,7 @@ mod tests {
     }
 
     #[test]
-    fn breaker_served_vs_not_picks_message_and_disarm() {
+    fn breaker_disarms_on_any_armed_auth_failure_message_varies_by_served() {
         use crate::os::askpass::ResolvedIdentity;
         use crate::os::sftp::{SftpArm, SftpEvent};
 
@@ -1903,8 +1902,13 @@ mod tests {
         assert!(!b.session.is_armed());
         assert!(b.status.contains("rejected"));
 
-        // served=false: armed but no secret was released (arm_connect failed → ran
-        // un-armed, or the server withheld it) -> stay armed, cause-neutral message.
+        // served=false + auth_failure: armed but no secret was released this op
+        // (arm_connect failed → ran un-armed, OR the server used a method we don't
+        // auto-fill — keyboard-interactive / publickey-only). Still DISARM: keeping it
+        // armed would re-run BatchMode=no on every retry and re-attempt interactive
+        // auth, burning server-facing auth attempts with no lockout bound. Disarming
+        // makes subsequent ops fail fast under BatchMode=yes (M1). Message stays
+        // cause-neutral (no server-facing secret was sent).
         b.session.arm(make_arm());
         assert!(b.session.is_armed());
         apply_sftp_event(
@@ -1916,8 +1920,59 @@ mod tests {
                 served: false,
             },
         );
-        assert!(b.session.is_armed());
+        assert!(!b.session.is_armed());
         assert!(b.status.contains("did not complete"));
+    }
+
+    #[test]
+    fn armed_session_stays_armed_on_benign_post_auth_error() {
+        // The `&& auth_failure` guard exists so a benign command error AFTER a
+        // successful auth (e.g. `cd` into a forbidden/missing dir reports served=true
+        // but auth_failure=false) does NOT disarm — otherwise ordinary browsing would
+        // kill auto-fill. Pins that guard: a regression dropping `&& auth_failure`
+        // (disarming on served alone) would fail here while every auth-failure test
+        // still passed (M7). (review: M7 over-disarm coverage)
+        use crate::os::askpass::ResolvedIdentity;
+        use crate::os::sftp::{SftpArm, SftpEvent};
+        let mut b = SftpBrowser {
+            host: 0,
+            focus: SftpPane::Remote,
+            local_cwd: std::path::PathBuf::from("/"),
+            local_entries: Vec::new(),
+            local_sel: 0,
+            remote_cwd: "/home/me".to_string(),
+            remote_entries: Vec::new(),
+            remote_sel: 0,
+            remote_loading: true,
+            status: String::new(),
+            session: crate::os::sftp::SftpSession::open_no_master("h"),
+        };
+        b.session.arm(SftpArm {
+            identity: ResolvedIdentity {
+                user: "u".into(),
+                host: "h".into(),
+                host_key_alias: None,
+                identity_paths: Vec::new(),
+            },
+            password: None,
+            passphrase: None,
+        });
+        assert!(b.session.is_armed());
+        apply_sftp_event(
+            &mut b,
+            SftpEvent::Failed {
+                path: Some("/home/me".into()),
+                msg: "remote open(\"/home/me/secret\"): Permission denied".into(),
+                auth_failure: false, // a benign post-auth ACL error, NOT an auth failure
+                served: true,
+            },
+        );
+        assert!(
+            b.session.is_armed(),
+            "a benign post-auth error (auth_failure=false) must NOT disarm auto-fill"
+        );
+        // It surfaces the friendly/raw error, not the 'rejected' disarm wording.
+        assert!(!b.status.contains("rejected"));
     }
 
     #[test]
