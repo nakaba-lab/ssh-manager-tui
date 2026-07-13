@@ -14,6 +14,7 @@ use zeroize::Zeroize;
 pub const VAULT_IDLE_LOCK: Duration = Duration::from_secs(15 * 60);
 
 use crate::config::SshConfig;
+use crate::config::diff::DiffLine;
 use crate::config::model::HostView;
 use crate::os::connect::{ConnectOverrides, Protocol};
 use crate::os::history::History;
@@ -115,6 +116,12 @@ pub enum Screen {
     Edit {
         editing: Option<usize>,
     },
+    /// Before-save diff preview (issue #42): a modal overlaid on the Edit form
+    /// showing exactly what the save will write to `~/.ssh/config` versus the
+    /// current on-disk file. Esc returns to the form; Enter commits the pending
+    /// edit ([`App::pending_save`]) and saves. The rendered diff and scroll
+    /// position live on [`App::diff_preview`] / [`App::diff_scroll`].
+    DiffPreview,
     KeyManager,
     KnownHosts,
     Help,
@@ -235,6 +242,21 @@ pub enum ConfirmAction {
         name: String,
     },
     Quit,
+}
+
+/// A validated config mutation held between the diff-preview and its commit
+/// (issue #42). `save_form` builds one, previews it by applying it to a *clone*
+/// of the config, and — on confirm — applies the very same value to the real
+/// config before saving. Preview and commit therefore run the identical
+/// operation via [`apply_pending`](crate::update::apply_pending), so what the
+/// user reviewed is byte-for-byte what gets written. The `HostView` is boxed to
+/// keep the enum (and `Screen`, which it never enters, plus `App`) compact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingSave {
+    /// Apply an edited view back onto the existing host block at this item index.
+    Apply { item: usize, view: Box<HostView> },
+    /// Append a brand-new host block built from this view.
+    Add { view: Box<HostView> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -772,6 +794,16 @@ pub struct App {
     // --- S2 form ---
     pub form: EditForm,
 
+    // --- before-save diff preview (issue #42) ---
+    /// The mutation awaiting confirmation in the diff preview, or `None` when no
+    /// preview is open. Set by `save_form`, consumed on commit.
+    pub pending_save: Option<PendingSave>,
+    /// The rendered diff shown by the preview modal (old on-disk file → what the
+    /// save will write). Computed once when the preview opens; the UI only paints.
+    pub diff_preview: Vec<DiffLine>,
+    /// Vertical scroll offset (in lines) of the diff preview.
+    pub diff_scroll: u16,
+
     // --- connect-time override form ---
     pub override_form: OverrideForm,
 
@@ -878,6 +910,9 @@ impl App {
             probes: Vec::new(),
             last_sweep: Instant::now(),
             form: EditForm::default(),
+            pending_save: None,
+            diff_preview: Vec::new(),
+            diff_scroll: 0,
             override_form: OverrideForm::default(),
             sftp_form: SftpForm::default(),
             sftp_browser: None,

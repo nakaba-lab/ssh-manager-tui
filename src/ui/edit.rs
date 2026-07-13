@@ -7,15 +7,22 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::Paragraph;
 
-use crate::app::{App, FormMode, form_idx};
+use crate::app::{App, FormMode, Screen, form_idx};
 
 use super::theme;
 use super::widgets::{input_line, panel, section_header};
 
 pub fn draw(f: &mut Frame, app: &App, area: Rect) {
-    let title = match app.screen {
-        crate::app::Screen::Edit { editing: Some(_) } => "Edit host",
-        _ => "Add host",
+    // The diff-preview modal overlays this form (its base screen is the Edit
+    // form), so while it is up `app.screen` is `DiffPreview` — resolve the title
+    // from the base screen instead, or an in-progress edit would read "Add host".
+    let editing_existing = matches!(app.screen, Screen::Edit { editing: Some(_) })
+        || (app.screen == Screen::DiffPreview
+            && matches!(app.prev_screen, Some(Screen::Edit { editing: Some(_) })));
+    let title = if editing_existing {
+        "Edit host"
+    } else {
+        "Add host"
     };
     let block = panel(title, true);
 
