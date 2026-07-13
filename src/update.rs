@@ -1408,10 +1408,13 @@ fn handle_diff_preview(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Commit the previewed mutation: apply the same operation to the real config,
-/// save to disk, and return to the list. Called from the diff preview on
-/// Enter / Ctrl-S. On failure it surfaces a toast and drops back to the edit
-/// form to retry, leaving the on-disk file untouched.
+/// Commit the previewed mutation and return to the list. Called from the diff
+/// preview on Enter / Ctrl-S. The op is applied to a *clone* which is then saved;
+/// the real `app.config` is only replaced once the write succeeds. So a failed
+/// save leaves both the on-disk file **and** the in-memory model untouched —
+/// otherwise a failed `Add` would strand a phantom host in memory and every
+/// retry would fail with a duplicate-alias error. On failure it surfaces a toast
+/// and drops back to the edit form to retry.
 fn commit_pending_save(app: &mut App) {
     let Some(pending) = app.pending_save.take() else {
         // No pending op (shouldn't happen): just close the preview.
@@ -1423,16 +1426,21 @@ fn commit_pending_save(app: &mut App) {
         PendingSave::Add { .. } => "host added",
     };
 
-    if let Err(e) = apply_pending(&mut app.config, &pending) {
+    let mut next = app.config.clone();
+    // apply_pending already succeeded on the preview clone, so this is a
+    // defensive branch; keep it so a future non-idempotent op can't panic here.
+    if let Err(e) = apply_pending(&mut next, &pending) {
         app.toast(format!("{e}"), true);
         close_overlay(app);
         return;
     }
-    if let Err(e) = app.config.save() {
+    if let Err(e) = next.save() {
         app.toast(format!("save failed: {e}"), true);
         close_overlay(app);
         return;
     }
+    // Adopt the saved config only now that the write is durable.
+    app.config = next;
 
     app.diff_preview.clear();
     app.diff_scroll = 0;
@@ -4852,6 +4860,49 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             before,
             "cancelling writes nothing"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn failed_save_does_not_mutate_in_memory_config() {
+        // Regression: commit applies to a clone and only adopts it once the write
+        // succeeds, so a failed save leaves the in-memory config untouched. Without
+        // that, a failed Add would strand a phantom host and every retry would fail
+        // with a duplicate-alias error, permanently blocking the add.
+        let (mut app, path) = app_fixture_on_disk("Host a\n    HostName 1.1.1.1\n");
+        // Force `save()` to fail: point the config at a path whose parent is a
+        // FILE, so the temp-file create under it errors with "not a directory".
+        let blocker = path.parent().unwrap().join("blocker");
+        std::fs::write(&blocker, b"x").unwrap();
+        app.config.path = blocker.join("config");
+
+        let hosts_before = app.config.host_views().len();
+        let view = HostView {
+            patterns: vec!["web1".into()],
+            host_name: Some("10.0.0.1".into()),
+            ..Default::default()
+        };
+        app.pending_save = Some(PendingSave::Add {
+            view: Box::new(view),
+        });
+        app.prev_screen = Some(Screen::Edit { editing: None });
+        app.screen = Screen::DiffPreview;
+
+        commit_pending_save(&mut app);
+
+        assert!(app.toast.is_error, "a failed save must surface an error");
+        assert_eq!(
+            app.config.host_views().len(),
+            hosts_before,
+            "a failed save must not add a phantom host in memory"
+        );
+        assert!(
+            !app.config
+                .host_views()
+                .iter()
+                .any(|(_, v)| v.alias() == "web1"),
+            "the un-written host must not linger in the in-memory config"
         );
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
