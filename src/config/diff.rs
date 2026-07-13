@@ -102,15 +102,18 @@ fn lcs_diff(a: &[&str], b: &[&str]) -> Vec<DiffLine> {
         return a.iter().map(|s| DiffLine::Del(s.to_string())).collect();
     }
 
-    // dp[i][j] = LCS length of a[i..] and b[j..]. Filled bottom-up so the forward
-    // backtrack below can greedily reproduce a minimal edit script.
-    let mut dp = vec![vec![0usize; m + 1]; n + 1];
+    // dp[i*w + j] = LCS length of a[i..] and b[j..], row stride w = m + 1. A
+    // single flat allocation (not `Vec<Vec<_>>`) keeps the table contiguous and
+    // cache-friendly and avoids n+1 separate heap allocations. Filled bottom-up
+    // so the forward backtrack below can greedily reproduce a minimal edit script.
+    let w = m + 1;
+    let mut dp = vec![0usize; (n + 1) * w];
     for i in (0..n).rev() {
         for j in (0..m).rev() {
-            dp[i][j] = if a[i] == b[j] {
-                dp[i + 1][j + 1] + 1
+            dp[i * w + j] = if a[i] == b[j] {
+                dp[(i + 1) * w + (j + 1)] + 1
             } else {
-                dp[i + 1][j].max(dp[i][j + 1])
+                dp[(i + 1) * w + j].max(dp[i * w + (j + 1)])
             };
         }
     }
@@ -122,7 +125,7 @@ fn lcs_diff(a: &[&str], b: &[&str]) -> Vec<DiffLine> {
             out.push(DiffLine::Context(a[i].to_string()));
             i += 1;
             j += 1;
-        } else if dp[i + 1][j] >= dp[i][j + 1] {
+        } else if dp[(i + 1) * w + j] >= dp[i * w + (j + 1)] {
             // Deleting a[i] is at least as good as inserting b[j]: prefer it so
             // deletions render before the additions that replace them.
             out.push(DiffLine::Del(a[i].to_string()));
