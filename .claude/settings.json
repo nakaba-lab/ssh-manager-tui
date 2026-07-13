@@ -1,43 +1,138 @@
 {
-  "enabledPlugins": {
-    "frontend-design@claude-plugins-official": true,
-    "superpowers@claude-plugins-official": true,
-    "code-review@claude-plugins-official": true,
-    "context7@claude-plugins-official": true,
-    "skill-creator@claude-plugins-official": true,
-    "code-simplifier@claude-plugins-official": true,
-    "github@claude-plugins-official": true,
-    "playwright@claude-plugins-official": true,
-    "claude-md-management@claude-plugins-official": true,
-    "feature-dev@claude-plugins-official": true,
-    "security-guidance@claude-plugins-official": true,
-    "ralph-loop@claude-plugins-official": true,
-    "claude-code-setup@claude-plugins-official": true,
-    "commit-commands@claude-plugins-official": true,
-    "pr-review-toolkit@claude-plugins-official": true,
-    "serena@claude-plugins-official": true,
-    "chrome-devtools-mcp@claude-plugins-official": true,
-    "hookify@claude-plugins-official": true,
-    "remember@claude-plugins-official": true,
-    "rust-analyzer-lsp@claude-plugins-official": true,
-    "microsoft-docs@claude-plugins-official": true,
-    "code-modernization@claude-plugins-official": true
+  "skillListingBudgetFraction": 0.05,
+  "enabledMcpjsonServers": ["chrome-devtools"],
+  "permissions": {
+    "allow": [
+      "Bash(git log *)",
+      "Bash(git diff *)",
+      "Bash(git status)",
+      "Bash(git status *)",
+      "Bash(git branch *)",
+      "Bash(git show *)",
+      "Bash(git fetch *)",
+      "Bash(git worktree *)",
+      "Read(**/*)",
+      "Bash(gh *)",
+      "Bash(glab *)",
+      "Bash(grep *)",
+      "Bash(curl -* http://localhost*)",
+      "mcp__chrome-devtools__take_screenshot",
+      "mcp__chrome-devtools__navigate_page",
+      "mcp__chrome-devtools__list_pages",
+      "mcp__chrome-devtools__new_page",
+      "mcp__chrome-devtools__take_snapshot",
+      "mcp__chrome-devtools__resize_page",
+      "mcp__playwright__browser_navigate",
+      "mcp__playwright__browser_take_screenshot",
+      "mcp__playwright__browser_snapshot",
+      "mcp__playwright__browser_resize"
+    ],
+    "ask": [
+      "Bash(gh pr merge)",
+      "Bash(gh pr merge *)",
+      "Bash(glab mr merge)",
+      "Bash(glab mr merge *)",
+      "Bash(gh release delete *)",
+      "Bash(glab release delete *)",
+      "Bash(gh secret *)",
+      "Bash(glab variable *)",
+      "Bash(gh repo delete *)",
+      "Bash(glab repo delete *)",
+      "Bash(git reset --hard*)",
+      "Bash(git clean -f*)"
+    ],
+    "deny": [
+      "Bash(git push --force*)",
+      "Bash(git push -f*)",
+      "Bash(git push * -f)",
+      "Bash(git push * -f *)",
+      "Bash(git push * --force*)",
+      "Bash(git push *+*)",
+      "Bash(rm -rf*)",
+      "Bash(rm -fr*)",
+      "Bash(rm -r -f*)",
+      "Bash(rm -f -r*)",
+      "Read(.env)",
+      "Read(.env.*)",
+      "Read(**/.env)",
+      "Read(**/.env.*)",
+      "Read(**/secrets/**)",
+      "Read(**/*.pem)",
+      "Read(**/*.key)",
+      "Read(**/id_rsa*)",
+      "Read(**/id_ed25519*)"
+    ]
   },
   "hooks": {
-    "PostToolUse": [
+    "SessionStart": [
       {
-        "matcher": "Edit|Write|MultiEdit",
         "hooks": [
-          { "type": "command", "command": "cargo fmt" }
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/check_hooks_setup.py\""
+          }
         ]
       }
     ],
-    "Stop": [
+    "PreToolUse": [
       {
+        "matcher": "Edit|MultiEdit|Write",
         "hooks": [
-          { "type": "command", "command": "cargo clippy --all-targets -- -D warnings" }
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/pre_edit.py\""
+          }
+        ]
+      },
+      {
+        "matcher": "TaskUpdate",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/pre_task_update.py\""
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|MultiEdit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/post_edit.py\""
+          },
+          {
+            "type": "command",
+            "command": "cargo fmt --manifest-path \"$CLAUDE_PROJECT_DIR/Cargo.toml\""
+          }
         ]
       }
     ]
+  },
+  "enabledPlugins": {
+    "frontend-design@claude-plugins-official": true,
+    "typescript-lsp@claude-plugins-official": true,
+    "jdtls-lsp@claude-plugins-official": true,
+    "skill-creator@claude-plugins-official": true,
+    "claude-code-setup@claude-plugins-official": true,
+    "claude-md-management@claude-plugins-official": true,
+    "commit-commands@claude-plugins-official": true,
+    "pyright-lsp@claude-plugins-official": true,
+    "feature-dev@claude-plugins-official": true,
+    "code-review@claude-plugins-official": true,
+    "security-guidance@claude-plugins-official": true,
+    "context7@claude-plugins-official": true,
+    "pr-review-toolkit@claude-plugins-official": true,
+    "code-simplifier@claude-plugins-official": true,
+    "playwright@claude-plugins-official": true,
+    "hookify@claude-plugins-official": true,
+    "serena@claude-plugins-official": true,
+    "ralph-loop@claude-plugins-official": true,
+    "superpowers@claude-plugins-official": true,
+    "chrome-devtools-mcp@claude-plugins-official": true,
+    "plugin-dev@claude-plugins-official": false,
+    "mcp-server-dev@claude-plugins-official": false,
+    "remember@claude-plugins-official": true
   }
 }

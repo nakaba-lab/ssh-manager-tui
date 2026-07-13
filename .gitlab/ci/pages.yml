@@ -1,0 +1,49 @@
+# docs/ を Astro+Starlight（docs-site/）でビルドし GitLab Pages へ公開する（include 用スニペット）。
+#
+# 可視性の注意: private リポジトリ ≠ private サイト。Pages の公開範囲はリポジトリの可視性と独立で、
+# メンバー限定にするには Settings → General → Visibility の Pages access control を設定する
+# （docs/ には要件定義書・運用ガイド等の内部文書が載る。公開可否は `/project-setup` の
+# 「docs サイト有効化」タスクが確認する）。
+#
+# 有効化: 出荷のルート .gitlab-ci.yml が既にこのスニペットを include 済み（追加設定は不要）。
+# ジョブを分離スニペットにしているのは、無効化時に include 1 行を外すだけで切り離せるようにし、
+# 既存 CI と衝突させないため（design-doc-check.yml と同じ提供形態）:
+#
+#   include:
+#     - local: .gitlab/ci/pages.yml
+#
+# 公開元ブランチは git ホストの default ブランチ（$CI_DEFAULT_BRANCH）。profile の defaultBranch（develop）
+# とは別物で、出荷のセットアップ（version-control-remote-sync タスク）は `git init -b main` でホスト default を
+# main にするため、既定では Pages は main からのみ公開される＝develop のみにマージした生きた設計書は main
+# 到達まで公開されない。develop の最新設計を継続公開したいなら `glab repo edit --default-branch develop` で
+# ホスト default を develop にする（project-setup の「docs サイト有効化」タスクで選べる）。
+# GitLab Pages の規約上、ジョブ名は必ず "pages"、成果物は public/ に置く。
+# ドキュメントサイトを使わないプロジェクトは、ルート .gitlab-ci.yml の include 行を外して
+# このファイルを削除する（snippet 削除だけだと include が「local file does not exist」で落ちる）。
+#
+# image は GitHub Actions（ubuntu＝glibc）と揃えて Debian 系 node を使う。alpine（musl）は
+# sharp（Starlight の画像最適化依存）の prebuilt 取得に失敗しやすいため避ける。
+pages:
+  stage: deploy
+  image: node:24
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+  script:
+    - |
+      set -eu
+      # astro.config.mjs が読む site/base を Pages の公開 URL から導出。
+      #   SITE = オリジン（例: https://group.gitlab.io）
+      #   BASE = サブパス（例: /project/。project pages はサブパス配下に出る）
+      SITE="$(printf '%s' "$CI_PAGES_URL" | sed -E 's#(https?://[^/]+).*#\1#')"
+      BASE="$(printf '%s' "$CI_PAGES_URL" | sed -E 's#https?://[^/]+##')"
+      export SITE
+      export BASE="${BASE%/}/"
+      cd docs-site
+      npm ci
+      npm run build
+      cd ..
+      rm -rf public
+      mv docs-site/dist public
+  artifacts:
+    paths:
+      - public

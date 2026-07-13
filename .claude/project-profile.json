@@ -1,0 +1,51 @@
+{
+  "$schema": "./project-profile.schema.json",
+  "templateVersion": "v1.9.0",
+  "templateOrigin": "",
+  "name": "sshm-tui",
+  "kind": "cli",
+  "languages": ["rust"],
+  "packageManager": "cargo",
+  "commands": {
+    "build": "cargo build --release",
+    "test": "cargo test --all",
+    "dev": "",
+    "lint": "cargo clippy --all-targets -- -D warnings",
+    "format": "cargo fmt --all",
+    "migration": "",
+    "integrationTest": "",
+    "coverage": "",
+    "deploy": ""
+  },
+  "vcsHost": "github",
+  "defaultBranch": "develop",
+  "protectedBranches": ["develop", "main"],
+  "protectedGlobs": [],
+  "frontendDir": "none",
+  "frontendDirs": [],
+  "checks": [
+    { "match": "**/*.rs", "command": "cargo check", "cwdFromRoot": true, "timeout": 180 }
+  ],
+  "services": [],
+  "commitMessage": {
+    "enabled": true,
+    "types": ["feat", "fix", "docs", "style", "refactor", "perf", "test", "chore", "build", "ci", "revert"],
+    "requireScope": true,
+    "requireBody": true,
+    "bodyExemptTypes": [],
+    "footer": "Refs",
+    "ticketBranchPattern": "^[a-z]+/(\\d+)-"
+  },
+  "designDoc": {
+    "enabled": true,
+    "dir": "docs/design",
+    "enforceTypes": ["feat", "fix"],
+    "escapeKeyword": "Design: none"
+  },
+  "docsSite": {
+    "enabled": true,
+    "dir": "docs-site",
+    "designGlob": "docs/design",
+    "checkCommand": ["npm", "run", "check"]
+  }
+}

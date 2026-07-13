@@ -1,7 +1,46 @@
+# ── OS ──
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── エディタ / IDE ──
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+.project
+.classpath
+.settings/
+
+# ── ログ / 一時ファイル ──
+*.log
+logs/
+tmp/
+*.tmp
+
+# ── 環境変数・秘密情報 ──
+.env
+.env.*
+!.env.example
+
+# ── 依存 / ビルド成果物（言語別。/project-setup が言語に応じて追記する）──
+# ※ロックファイル（package-lock.json / uv.lock / Cargo.lock 等）は無視しない＝コミットする（.claude/rules/git-workflow.md「依存ロックファイル」）
+node_modules/
+dist/
+build/
+out/
+coverage/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+# Rust（バイナリクレート sshm-tui。Cargo.lock はコミットする＝上記の通り無視しない）
 /target
 **/*.rs.bk
 *.pdb
 
-# Claude Code: track shared config (agents/, skills/, settings.json) so it
-# follows the repo across machines; keep only machine-local overrides out.
-/.claude/settings.local.json
+# ── Claude Code（ローカル設定はコミットしない）──
+.claude/settings.local.json
+# /remember・継続メモリのハンドオフ記録（チームで共有する場合はこの行を外す）
+.remember/

@@ -293,8 +293,11 @@ On top of that:
 
 - **A backup on first save** — the previous file is copied to `config.bak` the first
   time you save in a session.
-- **Atomic writes** — saves go to a temp file and then rename over the target (on Unix
-  with `0o600` perms).
+- **Atomic writes** — a save is written to an unpredictable, owner-private temp file
+  (`O_EXCL`) and then renamed over the target in **one** operation, so there is no
+  delete-before-rename window and no orphan is left behind. The temp file and its parent
+  directory are fsynced; permissions are `0o600` on Unix and an owner-only ACL on
+  Windows.
 - **Private keys are never read or displayed** — only key *paths* are passed to `ssh`
   via `-i`.
 - **Validation before write** — a missing alias, a non-numeric port, or a value
@@ -327,7 +330,8 @@ care includes:
 - preferring `System32\OpenSSH` over a `PATH` `ssh` that would interpret the config
   differently,
 - acting only on key **press** events (the Windows console also emits key-up),
-- a Windows-safe atomic rename (remove-then-rename), and
+- a Windows-safe atomic save that replaces the destination in a single rename
+  (`MoveFileExW` + `REPLACE_EXISTING`, no delete-before-rename window), and
 - correct `wt.exe` argument escaping for the new-tab connect.
 
 ## Architecture
@@ -352,15 +356,26 @@ cargo build                     # debug build
 cargo run                       # launch against ~/.ssh/config
 cargo run -- --config ./test    # run against a throwaway config (recommended)
 
-cargo test                      # config/ and os/ unit + round-trip tests
+cargo test --all                # config/ and os/ unit + round-trip tests
 cargo test roundtrip_crlf       # a single test by name
-cargo clippy -- -D warnings
-cargo fmt
+cargo clippy --all-targets -- -D warnings
+cargo fmt --all
+cargo deny check                # advisory + license + supply-chain gate (deny.toml)
 ```
 
 The test suite is headless and pure — no test spawns `ssh`, `ssh-keygen`, or `wt`. When
 manually testing save behavior, always point `--config` at a throwaway file: the app
 writes to whatever path it is given.
+
+### Development workflow
+
+This repository uses an agent-oriented workflow — **Issue-driven + Git Flow + git
+worktrees + TDD (Red-Green-Refactor) + spec-driven planning + multi-stage review**.
+The integration branch is `develop`; releases go out on `main` with a `v*` tag. The
+conventions live in [`CLAUDE.md`](CLAUDE.md) and [`.claude/rules/`](.claude/rules/)
+(git-workflow, tdd, testing-strategy, spec-driven, code-review, …). Commits follow
+Conventional Commits (`<type>(<scope>): …`), enforced by the `commit-msg` git hook
+(enable it once with `git config core.hooksPath .githooks`).
 
 ## Support
 
@@ -371,10 +386,10 @@ optional and genuinely appreciated. Starring the repo helps just as much. ⭐
 
 ## Contributing
 
-Issues and pull requests are welcome. Before opening a PR, please run `cargo fmt`,
-`cargo clippy -- -D warnings`, and `cargo test`. When touching the `config/` layer,
-keep the lossless round-trip invariant intact and preserve the regression tests
-(labelled by bug id in comments).
+Issues and pull requests are welcome. Before opening a PR, please run `cargo fmt --all`,
+`cargo clippy --all-targets -- -D warnings`, and `cargo test --all`. When touching the
+`config/` layer, keep the lossless round-trip invariant intact and preserve the
+regression tests (labelled by bug id in comments).
 
 ## License
 
@@ -396,3 +411,5 @@ Built with [ratatui](https://ratatui.rs) (terminal UI),
 [nucleo-matcher](https://github.com/helix-editor/nucleo) (fuzzy search),
 [arboard](https://github.com/1Password/arboard) (clipboard), and
 [dirs](https://github.com/dirs-dev/dirs-rs) (home resolution).
+
+<!-- このプロジェクトは Claude Code エージェント開発ワークフロー・テンプレート v1.9.0 から生成 -->

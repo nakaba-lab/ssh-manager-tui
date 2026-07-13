@@ -1,0 +1,4 @@
+# Astro / Node のビルド成果物・依存（zip には含めない＝利用者が npm ci で取得）
+node_modules/
+dist/
+.astro/

@@ -1,0 +1,239 @@
+#!/usr/bin/env python3
+"""commit-msg フック（git ネイティブ）— .claude/project-profile.json の commitMessage 駆動。
+
+git config core.hooksPath .githooks を設定したときのみ git が起動する。
+- subject を Conventional Commits 形式（<type>(<scope>): <説明>）で検証
+- body（WHY と影響範囲）を必須化
+- ブランチ名のチケット番号から footer（Refs/Closes #N）を冪等に自動追記
+検証不適合は exit 1 でコミットを拒否する。
+
+作法は template/.claude/hooks/{pre_edit,post_edit}.py に揃える:
+stdout/stderr を UTF-8 に固定／project-profile.json を上方向探索／読込失敗は安全側（通す）。
+ただし Claude Code フックと違い stdin JSON ではなく「引数1 = コミットメッセージファイルのパス」を受け取る
+（git が -F / -m / editor / --amend すべてで起動する）。cwd は常に当該作業ツリー/worktree のルート。
+"""
+import sys
+import os
+import re
+import json
+import subprocess
+from pathlib import Path
+
+# 出力を UTF-8 に固定（Windows の既定エンコーディングでの文字化け回避）
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+# プロファイルに commitMessage が無い／部分指定のときに使う組込み既定（profile の既定と同値）
+BUILTIN_DEFAULTS = {
+    "enabled": True,
+    "types": ["feat", "fix", "docs", "style", "refactor", "perf",
+              "test", "chore", "build", "ci", "revert"],
+    "requireScope": True,
+    "requireBody": True,
+    "bodyExemptTypes": [],
+    "footer": "Refs",
+    "ticketBranchPattern": r"^[a-z]+/(\d+)-",
+}
+
+# designDoc チェックの組込み既定（profile の designDoc 既定と同値）。
+DESIGN_DEFAULTS = {
+    "enabled": True,
+    "dir": "docs/design",
+    "enforceTypes": ["feat", "fix"],
+    "escapeKeyword": "Design: none",
+}
+
+# 検証をスキップする subject 接頭辞（自動生成・履歴操作系）。
+# 'Revert "' はクォート込み（git 自動 revert の "Revert \"...\"" のみを拾い、
+# 手書きの正規 type "revert(scope): ..." は検証対象に残す）。
+SKIP_PREFIXES = ("Merge ", 'Revert "', "fixup!", "squash!")
+
+
+def load_profile(start):
+    """start から上方向に .claude/project-profile.json を探す（pre_edit/post_edit と同一）。"""
+    base = Path(start).resolve() if start else Path.cwd()
+    for directory in [base, *base.parents]:
+        candidate = directory / ".claude" / "project-profile.json"
+        if candidate.exists():
+            try:
+                return json.loads(candidate.read_text(encoding="utf-8")), directory
+            except Exception:
+                return {}, directory
+    return {}, None
+
+
+def current_branch():
+    """現在のブランチ名。detached HEAD / rebase 中などは "" を返す（footer をスキップさせる）。"""
+    try:
+        result = subprocess.run(
+            ["git", "symbolic-ref", "--short", "HEAD"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+        return result.stdout.strip() if result.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def staged_files():
+    """ステージ済みファイルのパス一覧。取得不能（git エラー・例外）は None を返し、
+    呼び出し側で安全側（チェックをスキップ）に倒す。current_branch と同じ subprocess 作法。"""
+    try:
+        result = subprocess.run(
+            ["git", "diff", "--cached", "--name-only"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+        return result.stdout.splitlines() if result.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def effective_lines(raw):
+    """コメント行（# 始まり）を除去し、先頭・末尾の空行をトリムした実効メッセージ行。
+    git の既定 cleanup=strip 相当。scissors 以降の verbose diff も # 始まりなので落ちる。"""
+    lines = [ln for ln in raw.splitlines() if not ln.lstrip().startswith("#")]
+    while lines and lines[0].strip() == "":
+        lines.pop(0)
+    while lines and lines[-1].strip() == "":
+        lines.pop()
+    return lines
+
+
+def build_subject_regex(cfg):
+    types = "|".join(re.escape(t) for t in cfg["types"])
+    scope = r"\([^)]+\)" if cfg.get("requireScope", True) else r"(?:\([^)]+\))?"
+    # <type><scope>!?: <説明>  — ! は任意（Breaking Change: feat(api)!: ...）
+    return re.compile(rf"^(?:{types}){scope}!?: .+$")
+
+
+def append_footer(raw, footer_line):
+    """実効本文の末尾に「空行1つ + footer」を入れる。末尾のコメント/空行領域（editor の
+    テンプレ説明・scissors・verbose diff）は分離して後ろに保持する。"""
+    lines = raw.split("\n")
+    i = len(lines)
+    while i > 0 and (lines[i - 1].lstrip().startswith("#") or lines[i - 1].strip() == ""):
+        i -= 1
+    content, trailer = lines[:i], lines[i:]
+    rebuilt = content + ["", footer_line]
+    if trailer:
+        rebuilt += [""] + trailer
+    return "\n".join(rebuilt) + "\n"
+
+
+def emit_subject_error(subject, cfg):
+    types = "/".join(cfg["types"])
+    print("コミットメッセージの形式が不正です。", file=sys.stderr)
+    print(f"  受け取った 1 行目: {subject!r}", file=sys.stderr)
+    print("  期待する形式: <type>(<scope>): <説明>", file=sys.stderr)
+    print(f"  type: {types}（Breaking Change は type の後に ! を付ける: feat(api)!: ...）", file=sys.stderr)
+    if cfg.get("requireScope", True):
+        print("  scope（括弧）は必須です。", file=sys.stderr)
+    print("  例:", file=sys.stderr)
+    print("    feat(auth): ログイン API を追加", file=sys.stderr)
+    print("", file=sys.stderr)
+    print("    なぜ必要か・影響範囲を本文（body）に書く", file=sys.stderr)
+
+
+def emit_body_error():
+    print("コミット本文（body）が必要です。", file=sys.stderr)
+    print("  1 行目（subject）の後に空行を 1 つ置き、WHY と影響範囲を書いてください。", file=sys.stderr)
+    print("  例:", file=sys.stderr)
+    print("    fix(api): null 参照を修正", file=sys.stderr)
+    print("", file=sys.stderr)
+    print("    入力が空のとき NPE が出ていたためガードを追加。/users 経路に影響。", file=sys.stderr)
+
+
+def emit_design_error(dcfg):
+    dir_disp = dcfg.get("dir", "docs/design")
+    print("設計書（生きた設計書）の更新がありません。", file=sys.stderr)
+    print(f"  {dir_disp}/ 配下のいずれかを更新してこのコミットに含めてください。", file=sys.stderr)
+    print("  設計変更が無いコミットなら、本文（body）に「Design: none」の行を書けば通ります。", file=sys.stderr)
+    print("  （git commit --amend で設計書を再ステージしない場合も「Design: none」が要ります）", file=sys.stderr)
+    print("  例:", file=sys.stderr)
+    print("    feat(auth): ログイン API を追加", file=sys.stderr)
+    print("", file=sys.stderr)
+    print("    なぜ必要か・影響範囲を本文に書く", file=sys.stderr)
+    print(f"    {dir_disp}/auth.md に構成・データフローを記述", file=sys.stderr)
+    print("  （プロジェクト全体で無効にするなら .claude/project-profile.json の designDoc.enabled を false に）", file=sys.stderr)
+
+
+def main():
+    if len(sys.argv) < 2:
+        return 0  # 想定外の起動は安全側で通す
+    msg_path = Path(sys.argv[1])
+    try:
+        raw = msg_path.read_text(encoding="utf-8")
+    except Exception:
+        return 0  # メッセージファイルが読めない＝整合性は git に委ねて通す
+
+    profile, _ = load_profile(os.getcwd())
+    cfg = {**BUILTIN_DEFAULTS, **(profile.get("commitMessage") or {})}
+    if not cfg.get("enabled", True):
+        return 0
+
+    lines = effective_lines(raw)
+    if not lines:
+        return 0  # 空メッセージ（空コミットの拒否は git 本体に委ねる）
+    subject = lines[0]
+    if subject.startswith(SKIP_PREFIXES):
+        return 0  # Merge / Revert "…" / fixup! / squash!
+
+    # subject 検証
+    if not build_subject_regex(cfg).match(subject):
+        emit_subject_error(subject, cfg)
+        return 1
+
+    # body 検証
+    stype_match = re.match(r"^([a-z]+)", subject)
+    stype = stype_match.group(1) if stype_match else ""
+    if cfg.get("requireBody", True) and stype not in cfg.get("bodyExemptTypes", []):
+        has_blank_sep = len(lines) >= 2 and lines[1].strip() == ""
+        has_body = any(ln.strip() for ln in lines[2:])
+        if not (has_blank_sep and has_body):
+            emit_body_error()
+            return 1
+
+    # 設計書チェック（designDoc 駆動）: enforceTypes のコミットで dir 配下が未ステージかつ
+    # body に逃がし（^design: none）が無ければ拒否する。取得不能・無効は安全側で通す。
+    # 注: 判定は staged（git diff --cached＝HEAD 比較）。--amend で設計書を再ステージしない場合は
+    # 「未更新」と見なすため、その時は body に Design: none を書く（.claude/rules/design-doc.md 参照）。
+    # 逃がし判定・案内・CI はいずれも「Design: none」固定（escapeKeyword は将来用で現状未使用）。
+    dcfg = {**DESIGN_DEFAULTS, **(profile.get("designDoc") or {})}
+    if dcfg.get("enabled", True) and stype in dcfg.get("enforceTypes", []):
+        staged = staged_files()
+        if staged is not None:
+            dir_prefix = dcfg.get("dir", "docs/design").rstrip("/") + "/"
+            touched_design = any(p.startswith(dir_prefix) for p in staged)
+            has_escape = any(re.match(r"(?i)^design:\s*none\b", ln.strip()) for ln in lines)
+            if not touched_design and not has_escape:
+                emit_design_error(dcfg)
+                return 1
+
+    # footer 自動追記（冪等）
+    footer = cfg.get("footer", "Refs")
+    if footer in ("Refs", "Closes"):
+        branch = current_branch()
+        pattern = cfg.get("ticketBranchPattern", "")
+        ticket = None
+        if branch and pattern:
+            try:
+                m = re.search(pattern, branch)
+                if m:
+                    ticket = m.group(1)
+            except re.error:
+                ticket = None
+        if ticket:
+            body_text = "\n".join(lines)
+            if not re.search(rf"#{re.escape(ticket)}\b", body_text):
+                try:
+                    msg_path.write_text(append_footer(raw, f"{footer} #{ticket}"), encoding="utf-8")
+                except Exception:
+                    pass  # 書けなくても検証は通っているのでコミットは成立させる
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

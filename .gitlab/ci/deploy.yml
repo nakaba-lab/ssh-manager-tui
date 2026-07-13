@@ -1,0 +1,52 @@
+# タグ push（v*）を起点にビルド→デプロイ→疎通確認（smoke）を行う、コメント主体のデプロイ雛形
+# （include 用スニペット）。
+#
+# 有効化: 出荷のルート .gitlab-ci.yml が既にこのスニペットを include 済み（追加設定は不要）。
+# 設定されるまで安全に no-op: .claude/project-profile.json の commands.deploy が空のうちは
+# skip メッセージを出して成功する。/project-setup のデプロイヒアリング（デプロイ先・提供形態）で
+# commands.deploy を確定したときに有効化し、デプロイ先依存の中身（クラウド CLI・認証・smoke URL）を
+# 下のコメント雛形から埋める。デプロイしないプロジェクトはルート .gitlab-ci.yml の include 行を
+# 外してこのファイルを削除する。
+# image は既定の alpine（profile 読み取り用の python3 のみ導入）。有効化時は /project-setup が
+# デプロイ先の CLI を持つ image に差し替える。タグ運用（SemVer）は .claude/rules/git-workflow.md を参照。
+# profile の読み取りは共有スクリプト .claude/scripts/read_profile_command.py に依存する
+# （このスニペット単体を別リポジトリへコピーする場合は同伴する）。
+release-deploy:
+  stage: deploy
+  image: alpine:latest
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v/'
+  before_script:
+    - apk add --no-cache python3 >/dev/null
+  script:
+    - |
+      set -eu
+      # .claude/project-profile.json の commands を読む（プロファイルが正。読み取りは
+      # 共有スクリプト .claude/scripts/read_profile_command.py ＝ 4 CI 雛形で共通）
+      DEPLOY="$(python3 .claude/scripts/read_profile_command.py deploy)"
+      if [ -z "$DEPLOY" ]; then
+        echo "commands.deploy 未設定: skip（/project-setup のデプロイヒアリングで有効化する）"
+        exit 0
+      fi
+      # --- build（デプロイ前ビルドが要るなら commands.build を設定する）---
+      BUILD="$(python3 .claude/scripts/read_profile_command.py build)"
+      if [ -n "$BUILD" ]; then
+        echo "+ build: $BUILD"
+        sh -c "$BUILD"
+      else
+        echo "commands.build 未設定: build skip"
+      fi
+      # --- deploy ---
+      # ここに環境別のデプロイ手順を足す（/project-setup のデプロイヒアリングで埋める）。例:
+      #   - クラウド CLI: aws / gcloud / az の CLI を持つ image に差し替えて認証（CI/CD Variables）
+      #   - コンテナ: docker build → レジストリへ push（タグは $CI_COMMIT_TAG）→ 実行環境を更新
+      #   - パッケージ: レジストリへ publish（npm publish / twine upload 等）
+      # 認証情報は Settings → CI/CD → Variables に「Masked かつ Protected」で置き、環境変数経由で渡す。
+      # あわせて Settings → Repository → Protected tags で v* を保護すること（必ずペアで設定する:
+      # Protected 変数は保護ブランチ/タグのパイプラインにしか渡らないため、v* を保護せずに変数だけ
+      # Protected 化すると、この deploy ジョブで変数が空になる。Masked は表示マスクのみで保護ではない）。
+      echo "+ deploy: $DEPLOY (tag: $CI_COMMIT_TAG)"
+      sh -c "$DEPLOY"
+      # --- smoke（デプロイ直後に主要導線が生きているかの最小確認）---
+      # 例: curl -fsS --retry 3 --retry-delay 5 "$SMOKE_URL" >/dev/null && echo "smoke: ok"
+      echo "smoke: 疎通確認は未設定（/project-setup のデプロイヒアリングで整える）"

@@ -1,0 +1,92 @@
+# アプリ本体のテスト・Lint・ビルドを MR / push で実行する CI 雛形（include 用スニペット）。
+#
+# 有効化: 出荷のルート .gitlab-ci.yml が既にこのスニペットを include 済み（追加設定は不要）。
+# 設定されるまで安全に no-op: .claude/project-profile.json の commands（test/build/lint）が
+# 空のうちは skip メッセージを出して成功する（/project-setup が commands 確定時に有効化する。
+# 不要ならルート .gitlab-ci.yml の include 行を外してこのファイルを削除する）。
+# profile の読み取りは共有スクリプト .claude/scripts/read_profile_command.py に依存する
+# （このスニペット単体を別リポジトリへコピーする場合は同伴する）。
+# image は既定の alpine（profile 読み取り用の python3 のみ導入）。commands 有効化時は
+# /project-setup がプロジェクトのスタックの image（node / python / gradle 等）に差し替える。
+#
+# あわせて feat/fix のテスト必須チェック（test-required ジョブ）も同居する:
+# feature/* ・ fix/* からの MR にテストらしき差分が無ければ fail する。
+# 逃がし: MR 説明に「Test: none」行、または「test:none」ラベル（design-doc-check の
+# 「Design: none」と同型）。
+#
+# 依存監査・更新の自動化: GitHub の Dependabot（.github/dependabot.yml）に相当する仕組みは、
+# GitLab では Renovate か GitLab の Dependency Scanning を使う（/project-setup の recommender が提案する）。
+
+# commands.test / build / lint を実行する（すべて空なら skip）。
+app-test:
+  stage: test
+  image: alpine:latest
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && ($CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "develop" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main")'
+    - if: '$CI_PIPELINE_SOURCE == "push" && ($CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "main")'
+  before_script:
+    - apk add --no-cache python3 >/dev/null
+  script:
+    - |
+      set -eu
+      # .claude/project-profile.json の commands を読む（プロファイルが正。読み取りは
+      # 共有スクリプト .claude/scripts/read_profile_command.py ＝ 4 CI 雛形で共通）
+      # マルチサービス（モノレポ）は profile の services[]（任意）で宣言する。サービス別に回すなら
+      # services[].dir を手がかりに matrix/サービス別ジョブへ展開する（指針は .claude/rules/scale.md）。
+      LINT="$(python3 .claude/scripts/read_profile_command.py lint)"
+      BUILD="$(python3 .claude/scripts/read_profile_command.py build)"
+      TEST="$(python3 .claude/scripts/read_profile_command.py test)"
+      INTEGRATION="$(python3 .claude/scripts/read_profile_command.py integrationTest)"
+      if [ -z "${LINT}${BUILD}${TEST}${INTEGRATION}" ]; then
+        echo "commands.test/build/lint/integrationTest が未設定: skip（/project-setup が確定時に有効化する）"
+        exit 0
+      fi
+      if [ -n "$LINT" ];  then echo "+ lint:  $LINT";  sh -c "$LINT";  fi
+      if [ -n "$BUILD" ]; then echo "+ build: $BUILD"; sh -c "$BUILD"; fi
+      # 注意: テスト収集 0 件で非ゼロ終了するランナーがある（pytest=exit 5／vitest=--passWithNoTests 未指定）。
+      # set -e で CI が落ちるため、初期は最低 1 テストを置くか commands.test 側で吸収する
+      # （例: pytest なら "pytest; rc=$?; [ $rc -eq 5 ] && exit 0 || exit $rc"、vitest なら --passWithNoTests を付ける）。
+      if [ -n "$TEST" ];  then echo "+ test:  $TEST";  sh -c "$TEST";  fi
+      # 結合テスト（commands.integrationTest 設定時のみ実行。体系は .claude/rules/testing-strategy.md）。
+      # 実 DB/外部サービスを要する結合テストは job レベルの services: が要る
+      # — service 雛形は db 論点（将来）or 利用者が追加する。未設定なら no-op。
+      if [ -n "$INTEGRATION" ]; then echo "+ integration: $INTEGRATION"; sh -c "$INTEGRATION"; fi
+      # --- カバレッジ計測（commands.coverage 設定時に有効化する。コメントを外す）---
+      # COVERAGE="$(python3 .claude/scripts/read_profile_command.py coverage)"
+      # if [ -n "$COVERAGE" ]; then echo "+ coverage: $COVERAGE"; sh -c "$COVERAGE"; fi
+  # --- カバレッジのアーティファクト化（commands.coverage 有効化時にコメントを外す）---
+  # artifacts:
+  #   paths:
+  #     - coverage/   # ← プロジェクトのカバレッジ出力先に合わせる
+
+# feature/* ・ fix/* の MR にテストの追加・更新を要求する（テストなしコミット禁止の CI 側ガード）。
+test-required:
+  stage: test
+  image: alpine:latest
+  variables:
+    GIT_DEPTH: 0   # merge-base（CI_MERGE_REQUEST_DIFF_BASE_SHA）を確実に含める（浅いクローンだと bad revision で落ちる）
+    # 「テストらしきパス」の判定正規表現（プロジェクトのテスト配置の流儀に合わせて調整可）
+    TEST_PATH_REGEX: 'test|spec'
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME =~ /^(feature|fix)\// && ($CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "develop" || $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "main")'
+  before_script:
+    - apk add --no-cache git >/dev/null
+  script:
+    - |
+      set -eu
+      # 逃がし: test:none ラベル（CI_MERGE_REQUEST_LABELS はラベル無し MR では未定義のため :- で空に落とす）
+      case ",${CI_MERGE_REQUEST_LABELS:-}," in
+        *,test:none,*) echo "ラベル test:none: skip"; exit 0 ;;
+      esac
+      # 逃がし: MR 説明の Test: none（行頭・大文字小文字無視）
+      if printf '%s' "${CI_MERGE_REQUEST_DESCRIPTION:-}" | grep -qiE '^[[:space:]]*test:[[:space:]]*none\b'; then
+        echo "MR 説明に Test: none: skip"; exit 0
+      fi
+      # テストらしきパスの差分があるか（三点＝merge-base 起点）
+      git fetch -q origin "$CI_MERGE_REQUEST_TARGET_BRANCH_NAME"
+      if git diff --name-only "${CI_MERGE_REQUEST_DIFF_BASE_SHA}...HEAD" | grep -qiE "$TEST_PATH_REGEX"; then
+        echo "テストの追加・更新あり: ok"
+      else
+        echo "feat/fix の MR にテストの追加・更新が見当たりません（パスに test|spec を含むファイルが diff にありません）。テストを追加するか、テスト不要な変更なら MR 説明に 'Test: none' を書くか 'test:none' ラベルを付けてください。" >&2
+        exit 1
+      fi

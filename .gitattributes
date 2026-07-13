@@ -1,0 +1,31 @@
+# 既定: テキストは Git に自動判定させ、改行はチェックアウト時に OS 依存
+* text=auto
+
+# 改行を固定したいファイル
+*.sh   text eol=lf
+*.bash text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+
+# git フック（拡張子なし・LF 必須・git/bash が実行する）
+.githooks/* text eol=lf
+
+# 共有追記ファイルのマージ戦略
+# CHANGELOG: [Unreleased] への行単位追記を自動統合する。同一行の編集は手動解消
+CHANGELOG.md merge=union
+
+# Windows 専用スクリプトは CRLF
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+
+# バイナリ（差分を取らない）
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.pdf  binary
+*.zip  binary
+*.gz   binary
+*.jar  binary

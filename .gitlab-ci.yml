@@ -1,0 +1,28 @@
+# GitLab CI のエントリポイント。GitLab はリポジトリ直下のこの 1 ファイルだけを
+# パイプライン定義として自動検出する。GitHub の .github/workflows/* は drop-in で効くが、
+# .gitlab/ci/ 配下のスニペットは「ここで include しない限り起動しない」（この土台が無いと
+# GitLab は「No .gitlab-ci.yml found」でパイプライン自体を作らない）。
+# 実ジョブは .gitlab/ci/ に分割し、このファイルは stages 宣言と include の土台に徹する。
+#
+#   - design-doc-check : feature/* ・ fix/* からの MR で docs/design/ 更新を要求
+#   - secret-scan      : MR の差分コミットの秘密情報スキャン（gitleaks。検出のみ fail・環境問題は警告のみ）
+#   - pages            : docs-site（Astro+Starlight）を GitLab Pages へ公開
+#   - app-test         : アプリのテスト/Lint/ビルド＋feat/fix のテスト必須（commands 未設定なら no-op）
+#   - deploy           : タグ push（v*）起点のデプロイ雛形（commands.deploy 未設定なら no-op）
+#
+# 既存 CI を持つプロジェクトに後から載せる場合は、このファイルを丸ごと上書きせず
+# stages / include を自分の .gitlab-ci.yml にマージする。
+# docs サイトを使わないプロジェクトは pages の include 行を外す（snippet を消すだけだと
+# include が「local file does not exist」で落ちるため、行ごと外す。/project-setup の docs
+# 無効化が自動で外す）。設計書チェックも不要なら design-doc-check の行も外す。
+
+stages:
+  - test
+  - deploy
+
+include:
+  - local: .gitlab/ci/design-doc-check.yml
+  - local: .gitlab/ci/secret-scan.yml    # 秘密情報スキャンが不要なら行ごと外す
+  - local: .gitlab/ci/pages.yml
+  - local: .gitlab/ci/app-test.yml   # アプリ CI が不要なら行ごと外す（commands 未設定なら no-op）
+  - local: .gitlab/ci/deploy.yml     # デプロイしないプロジェクトは行ごと外す（commands.deploy 未設定なら no-op）

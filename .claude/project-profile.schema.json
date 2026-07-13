@@ -1,0 +1,250 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Project Profile",
+  "description": "このテンプレートの言語非依存コアを各プロジェクトに適合させる機械可読プロファイル。hooks がこのファイルを読む。CLAUDE.md の「プロジェクト設定」節と対になる（/project-setup が両方を同時に更新する）。",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "$schema": { "type": "string" },
+    "templateVersion": {
+      "type": "string",
+      "description": "このプロジェクトの元になったテンプレートのバージョン。リリースビルドが zip 生成時に刻印する（手動編集は不要）。空＝開発ビルド/不明",
+      "default": ""
+    },
+    "templateOrigin": {
+      "type": "string",
+      "description": "テンプレートの取得元・不具合/改善要望の報告先（URL 等）。/project-setup の README 再生成が末尾の由来表記に使う。空＝記載しない",
+      "default": ""
+    },
+    "name": {
+      "type": "string",
+      "description": "プロジェクト名"
+    },
+    "kind": {
+      "type": "string",
+      "description": "提供形態",
+      "enum": ["", "web", "cli", "desktop", "library"]
+    },
+    "languages": {
+      "type": "array",
+      "description": "使用言語。例: [\"java\", \"typescript\"]",
+      "items": { "type": "string" }
+    },
+    "packageManager": {
+      "type": "string",
+      "description": "パッケージマネージャ。例: npm / pnpm / uv / gradle / cargo / go"
+    },
+    "commands": {
+      "type": "object",
+      "description": "各種コマンド。空文字なら未設定（該当処理はスキップ）。",
+      "additionalProperties": false,
+      "properties": {
+        "build": { "type": "string" },
+        "test": { "type": "string" },
+        "lint": { "type": "string" },
+        "format": { "type": "string" },
+        "migration": { "type": "string" },
+        "dev": {
+          "type": "string",
+          "description": "ローカル開発サーバの起動コマンド（フォアグラウンド）。例: npm run dev。frontend-reviewer／「ビジュアル/UX 確認」タスクが実レンダリング確認（スクリーンショット取得）の前に Bash バックグラウンドで起動するのに使う。Web 以外や開発サーバを持たないプロジェクトは空のままでよい。"
+        },
+        "integrationTest": {
+          "type": "string",
+          "description": "結合テスト（複数コンポーネント・実 DB/外部 I/O を跨ぐテスト）の実行コマンド。例: npm run test:integration。空なら「結合テストは単体テストに統合されている」扱いでスキップする。テストレベルの体系・実施タイミングは .claude/rules/testing-strategy.md を参照。"
+        },
+        "coverage": {
+          "type": "string",
+          "description": "カバレッジ計測コマンド。例: npm run test -- --coverage。設定時のみコードレビュー時に計測し、著しい低下を報告する（.claude/rules/testing-strategy.md）。空なら計測しない。"
+        },
+        "deploy": {
+          "type": "string",
+          "description": "デプロイコマンド（手動実行の手順コマンドでも可）。例: npm run deploy。タグ起動のデプロイ CI 雛形（.github/workflows/release-deploy.yml／.gitlab/ci/deploy.yml）と /release-tasks のリリース後スモークの前提になる。空ならデプロイ工程はスキップする。"
+        }
+      }
+    },
+    "vcsHost": {
+      "type": "string",
+      "description": "リモートのホスト",
+      "enum": ["", "github", "gitlab"]
+    },
+    "defaultBranch": {
+      "type": "string",
+      "description": "worktree の派生元・diff のベースに使うブランチ",
+      "default": "develop"
+    },
+    "protectedBranches": {
+      "type": "array",
+      "description": "直接編集を警告するブランチ。空配列なら警告しない。",
+      "items": { "type": "string" }
+    },
+    "protectedGlobs": {
+      "type": "array",
+      "description": "Edit/Write をブロックするファイルのグロブ（自動生成物・適用済みマイグレーション等）。空配列ならブロックしない。例: [\"**/MsgCode.java\", \"**/mybatis_generated/**\"]",
+      "items": { "type": "string" }
+    },
+    "frontendDir": {
+      "type": "string",
+      "description": "UI コード（画面・コンポーネント）を含むディレクトリ。例: frontend。リポジトリルート直下にフロントがある場合は \".\"、UI を持たないプロジェクトは \"none\" を明示する。空（\"\"）は「未確認」であり kind=web では設定不備（SessionStart フックが警告し、ビジュアル/UX 検証〔frontend-reviewer・DoD の UI 項目・視覚 AC〕が全段沈黙する）。設定すると UI 変更時のビジュアル/UX レビューと DoD の（UI 変更時）項目が有効になり、a11y/視覚チェックの checks スコープにも使う。"
+    },
+    "frontendDirs": {
+      "type": "array",
+      "description": "（大規模・複数フロント向け・任意）UI を複数ディレクトリに持つモノレポで各フロントのルートを列挙する。単一フロントは frontendDir で足りる（こちらは空のままでよい）。ビジュアル/UX 検証は frontendDir を主としつつ、複数フロントを個別に frontend-reviewer で回す運用は .claude/rules/scale.md を参照。空配列なら未使用。",
+      "items": { "type": "string" }
+    },
+    "checks": {
+      "type": "array",
+      "description": "Edit/Write 後に走らせる言語別チェック。空配列なら何も走らせない（=完全 no-op）。フロントの a11y チェック（eslint-plugin-jsx-a11y 等）もここに追加できる（ビジュアル回帰は重いため PR 前チェックに回す）。",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["match", "command"],
+        "properties": {
+          "match": {
+            "type": "string",
+            "description": "対象ファイルのグロブ。例: \"**/*.ts\""
+          },
+          "command": {
+            "type": "string",
+            "description": "実行コマンド。先頭は PATH 上で解決できる実行ファイル名にすること（相対パス ./gradlew や Windows のバックスラッシュ絶対パスは不可。パスを書く場合は / 区切り）。PATH に無ければスキップ。例: \"npx tsc --noEmit\""
+          },
+          "cwdFromRoot": {
+            "type": "boolean",
+            "description": "プロファイル所在ディレクトリ（プロジェクトルート）で実行するか",
+            "default": false
+          },
+          "timeout": {
+            "type": "number",
+            "description": "秒。既定 120",
+            "default": 120
+          }
+        }
+      }
+    },
+    "services": {
+      "type": "array",
+      "description": "（大規模・モノレポ/マルチサービス向け・任意）リポジトリ内の各サービス（独立にビルド/デプロイされる単位）を宣言する。出荷の単一キー動線（commands.* / frontendDir）は既定のまま — services[] は構造の機械可読な宣言で、サービス別 CI・スコープ運用の指針は .claude/rules/scale.md を参照する。空配列なら単一アプリ扱い（既定）。",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "dir"],
+        "properties": {
+          "name": { "type": "string", "description": "サービス名。例: api / web / worker" },
+          "dir": { "type": "string", "description": "サービスのルートディレクトリ（/ 区切り）。例: services/api" },
+          "kind": { "type": "string", "description": "サービスの提供形態（任意・自由文字列）。例: web / api / worker / cli" },
+          "frontendDir": { "type": "string", "description": "このサービスが UI を持つ場合の UI ディレクトリ（任意。運用は .claude/rules/scale.md）" }
+        }
+      }
+    },
+    "commitMessage": {
+      "type": "object",
+      "description": "commit-msg フック（.githooks/commit-msg）の挙動。git config core.hooksPath を設定したときのみ有効。未設定キーは組込み既定にフォールバックする。",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "false なら検証・footer 追記を一切しない",
+          "default": true
+        },
+        "types": {
+          "type": "array",
+          "description": "許可する Conventional Commits の type",
+          "items": { "type": "string" }
+        },
+        "requireScope": {
+          "type": "boolean",
+          "description": "subject に scope を必須にするか（<type>(<scope>): ...）",
+          "default": true
+        },
+        "requireBody": {
+          "type": "boolean",
+          "description": "body（WHY と影響範囲）を必須にするか",
+          "default": true
+        },
+        "bodyExemptTypes": {
+          "type": "array",
+          "description": "body 必須の例外とする type。例: [\"docs\", \"chore\"]",
+          "items": { "type": "string" }
+        },
+        "footer": {
+          "type": "string",
+          "description": "ブランチのチケット番号から自動追記する footer 種別。none なら追記しない",
+          "enum": ["Refs", "Closes", "none"],
+          "default": "Refs"
+        },
+        "ticketBranchPattern": {
+          "type": "string",
+          "description": "ブランチ名からチケット番号を取り出す正規表現。キャプチャグループ1が番号。例: ^[a-z]+/(\\d+)-"
+        }
+      }
+    },
+    "designDoc": {
+      "type": "object",
+      "description": "設計書チェック（.githooks/commit-msg に統合）の挙動。git config core.hooksPath を設定したときのみ有効。enforceTypes のコミットで dir 配下が未ステージかつ body に escapeKeyword が無ければコミットを拒否する。未設定キーは組込み既定にフォールバックする。",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "false なら設計書チェックを一切しない",
+          "default": true
+        },
+        "dir": {
+          "type": "string",
+          "description": "生きた設計書のディレクトリ。このディレクトリ配下のいずれかが更新されていれば「設計書更新あり」とみなす。",
+          "default": "docs/design"
+        },
+        "enforceTypes": {
+          "type": "array",
+          "description": "設計書更新を要求する Conventional Commits の type。例: [\"feat\", \"fix\"]",
+          "items": { "type": "string" }
+        },
+        "escapeKeyword": {
+          "type": "string",
+          "description": "逃がし文言の表示用ラベル（将来の拡張余地）。現状の判定・エラー案内・CI はいずれも「Design: none」固定で、この値を変えても挙動は変わらない。",
+          "default": "Design: none"
+        }
+      }
+    },
+    "docsSite": {
+      "type": "object",
+      "description": "設計書スキーマ検証（.githooks/pre-commit に統合）の挙動。git config core.hooksPath を設定したときのみ有効。designGlob 配下がステージされたコミットで、docs-site 内の checkCommand（astro check）を実行し、frontmatter スキーマ不適合ならコミットを拒否する。未設定キーは組込み既定にフォールバックする。Pages の公開 URL/base/ブランチは CI の環境変数で扱い、ここには持たない。",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "false なら pre-commit のスキーマ検証を一切しない（ドキュメントサイトを使わないプロジェクト向け）",
+          "default": true
+        },
+        "dir": {
+          "type": "string",
+          "description": "Astro+Starlight プロジェクト（docs-site）の場所。存在しなければ pre-commit は素通りする。",
+          "default": "docs-site"
+        },
+        "designGlob": {
+          "type": "string",
+          "description": "スキーマ強制の対象ディレクトリ。この配下がステージされたコミットでのみ検証が走る（速度配慮）。",
+          "default": "docs/design"
+        },
+        "checkCommand": {
+          "type": "array",
+          "description": "docs-site 内で実行する検証コマンド（astro のスキーマ＋型チェック）。非ゼロ終了でコミットを拒否する。",
+          "items": { "type": "string" },
+          "default": ["npm", "run", "check"]
+        }
+      }
+    }
+  },
+  "if": {
+    "properties": { "kind": { "const": "web" } },
+    "required": ["kind"]
+  },
+  "then": {
+    "required": ["frontendDir"],
+    "properties": {
+      "frontendDir": {
+        "minLength": 1,
+        "pattern": "\\S",
+        "$comment": "kind=web では frontendDir の空・空白のみ・キー欠落（いずれも未確認）を許さない。UI のあるディレクトリ／ルート直下なら \".\"／UI を持たないなら \"none\" のいずれかを明示する（エディタのスキーマ検証用。実行時の警告は check_hooks_setup.py が担う＝判定を揃える）。"
+      }
+    }
+  }
+}

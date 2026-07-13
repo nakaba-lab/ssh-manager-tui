@@ -1,14 +1,64 @@
+# 依存の脆弱性・更新を自動で PR 化する（Dependabot）。不要なら削除してよい。
+#
+# 実効エントリは同梱資産の 2 つ（docs-site/ の npm と、同梱 CI の github-actions）。
+# 利用者プロジェクトのスタック向けエントリは、/project-setup がスタック確定時に下の
+# コメント例から有効化して追記する。
+# GitLab には Dependabot が無いため、Renovate か GitLab の Dependency Scanning を使う
+# （.gitlab/ci/app-test.yml のコメント参照）。
 version: 2
 updates:
-  - package-ecosystem: github-actions
-    directory: "/"
+  # docs-site（Astro+Starlight）の依存更新。docs サイトを使わない（docs-site/ を削除した）
+  # プロジェクトはこのエントリも削除する。
+  - package-ecosystem: npm
+    directory: /docs-site
     schedule:
       interval: weekly
-    commit-message:
-      prefix: "chore(ci)"
+    # 更新 PR をまとめたい場合は groups を使う（任意）:
+    # groups:
+    #   docs-site-deps:
+    #     patterns: ["*"]
+
+  # 同梱 CI（.github/workflows/）と利用者が後から足すワークフローの Action 更新。
+  # 同梱 CI はテンプレートが出荷するスタック非依存の資産のため、既定で有効にしている。
+  # サプライチェーン強化が要るプロジェクトは `actions/checkout@<sha> # v5` の SHA ピンに
+  # 切り替えてよい（Dependabot が SHA も追従更新する）。
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+
+  # Rust 本体（sshm-tui）の依存更新。vault の crypto スタック（argon2 / chacha20poly1305 /
+  # zeroize / getrandom）が弱点になりうるため、RUSTSEC の追従を自動化する。
   - package-ecosystem: cargo
-    directory: "/"
+    directory: /
     schedule:
       interval: weekly
     commit-message:
       prefix: "chore(deps)"
+
+  # 注: .mcp.json の MCP サーバー（npx 直指定・バージョン固定済みの chrome-devtools-mcp）は
+  # Dependabot の走査対象外。更新は /project-resync の依存点検の節目などに
+  # `npm view chrome-devtools-mcp version` で最新を確認し、意図的な作業として書き換える
+  # （@latest へ戻すと未審査の最新版がセッション起動のたびに無確認で実行されるため戻さない）。
+
+  # --- 利用者スタック向けの追記例（/project-setup がスタック確定時に有効化する）---
+  # - package-ecosystem: npm              # JS/TS（ルートの package.json）
+  #   directory: /
+  #   schedule:
+  #     interval: weekly
+  # - package-ecosystem: pip              # Python（pip/poetry: requirements*.txt / pyproject.toml）
+  #   directory: /
+  #   schedule:
+  #     interval: weekly
+  # - package-ecosystem: uv               # Python（uv: pyproject.toml + uv.lock を更新。uv.lock のコミットが前提＝.claude/rules/git-workflow.md「依存ロックファイル」。Dependabot は 2025-03 から uv 対応）
+  #   directory: /
+  #   schedule:
+  #     interval: weekly
+  # - package-ecosystem: gradle           # Java/Kotlin（Maven は maven）
+  #   directory: /
+  #   schedule:
+  #     interval: weekly
+  # - package-ecosystem: cargo            # Rust
+  #   directory: /
+  #   schedule:
+  #     interval: weekly

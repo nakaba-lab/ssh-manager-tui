@@ -1,0 +1,125 @@
+#!/usr/bin/env python3
+"""pre-commit フック（git ネイティブ）— .claude/project-profile.json の docsSite 駆動。
+
+git config core.hooksPath .githooks を設定したときのみ git が起動する。
+生きた設計書（docs/design/）の frontmatter を Zod スキーマで「構造が正しいか」検証する
+（commit-msg の「更新したか」規律とは役割が異なる相補ガード。.claude/rules/design-doc.md 参照）。
+
+- ステージに designGlob（既定 docs/design/）配下が無ければ素通り（速度配慮）。
+- docs-site（既定 docs-site/）が無いプロジェクトは安全側で素通り。
+- docs-site/node_modules が無ければ「cd docs-site && npm ci」を促して exit 1
+  （worktree ごとのオンデマンド導入。Node 前提を選択済みのため握りつぶさない）。
+- 揃っていれば docs-site 内で checkCommand（既定 npm run check ＝ astro check）を実行し、
+  スキーマ不適合（非ゼロ終了）なら exit 1 でコミットを拒否する。
+
+作法は commit-msg / pre_edit / post_edit に揃える:
+stdout/stderr を UTF-8 に固定／project-profile.json を上方向探索／読込失敗は安全側（通す）。
+Windows の npm.cmd 等を起動できるよう実行ファイルは shutil.which で解決する。
+引数は受け取らず、ステージ差分（git diff --cached）を自分で見る（cwd = 作業ツリー/worktree ルート）。
+"""
+import sys
+import os
+import json
+import shutil
+import subprocess
+from pathlib import Path
+
+# 出力を UTF-8 に固定（Windows の既定エンコーディングでの文字化け回避）
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+# プロファイルに docsSite が無い／部分指定のときに使う組込み既定。
+DOCSSITE_DEFAULTS = {
+    "enabled": True,
+    "dir": "docs-site",            # Astro プロジェクト（docs-site）の場所
+    "designGlob": "docs/design",   # スキーマ強制対象（この配下がステージされた時のみ起動）
+    "checkCommand": ["npm", "run", "check"],  # docs-site 内で走らせる検証（astro check）
+}
+
+
+def load_profile(start):
+    """start から上方向に .claude/project-profile.json を探す（commit-msg と同一）。"""
+    base = Path(start).resolve() if start else Path.cwd()
+    for directory in [base, *base.parents]:
+        candidate = directory / ".claude" / "project-profile.json"
+        if candidate.exists():
+            try:
+                return json.loads(candidate.read_text(encoding="utf-8")), directory
+            except Exception:
+                return {}, directory
+    return {}, None
+
+
+def staged_files():
+    """ステージ済みファイルのパス一覧。取得不能（git エラー・例外）は None を返し、
+    呼び出し側で安全側（チェックをスキップ）に倒す。commit-msg と同じ subprocess 作法。"""
+    try:
+        result = subprocess.run(
+            ["git", "diff", "--cached", "--name-only"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+        return result.stdout.splitlines() if result.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def emit_install_error(dir_disp):
+    print("設計書スキーマ検証をスキップできません: docs-site の依存が未導入です。", file=sys.stderr)
+    print(f"  この worktree で一度だけ次を実行してください: cd {dir_disp} && npm ci", file=sys.stderr)
+    print("  （worktree ごとに node_modules は共有されないため、初回のみ導入が要ります）", file=sys.stderr)
+    print("  ドキュメントサイトを使わないプロジェクトは .claude/project-profile.json の", file=sys.stderr)
+    print("  docsSite.enabled を false にしてください。", file=sys.stderr)
+
+
+def emit_check_error(dir_disp):
+    print("", file=sys.stderr)
+    print("設計書（docs/design/）の frontmatter がスキーマに適合しません（上の astro check 参照）。", file=sys.stderr)
+    print("  必須フィールド（title / area / status / relatedIssues / updated）と型を確認してください。", file=sys.stderr)
+    print(f"  ローカルで再現: cd {dir_disp} && npm run check", file=sys.stderr)
+    print("  詳細は .claude/rules/design-doc.md。", file=sys.stderr)
+
+
+def main():
+    profile, directory = load_profile(os.getcwd())
+    cfg = {**DOCSSITE_DEFAULTS, **(profile.get("docsSite") or {})}
+    if not cfg.get("enabled", True):
+        return 0
+
+    root = directory if directory is not None else Path.cwd()
+    docs_site = root / cfg.get("dir", "docs-site")
+    if not docs_site.is_dir():
+        return 0  # docs-site を使わないプロジェクトは素通り
+
+    staged = staged_files()
+    if staged is None:
+        return 0  # 取得不能は安全側で通す
+    design_prefix = str(cfg.get("designGlob", "docs/design")).rstrip("/") + "/"
+    if not any(p.startswith(design_prefix) for p in staged):
+        return 0  # 設計書を触っていない → スキップ（速度配慮）
+
+    dir_disp = cfg.get("dir", "docs-site")
+    if not (docs_site / "node_modules").is_dir():
+        emit_install_error(dir_disp)
+        return 1
+
+    command = cfg.get("checkCommand") or DOCSSITE_DEFAULTS["checkCommand"]
+    exe = shutil.which(command[0])
+    if exe is None:
+        emit_install_error(dir_disp)
+        return 1
+    try:
+        # 出力（astro check の診断）はそのまま端末に流す（capture しない）。
+        result = subprocess.run([exe, *command[1:]], cwd=str(docs_site))
+    except Exception:
+        return 0  # 実行自体が失敗（環境問題）は安全側で通す＝CI が最終ガード
+    if result.returncode != 0:
+        emit_check_error(dir_disp)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

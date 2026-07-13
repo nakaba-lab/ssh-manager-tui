@@ -1,0 +1,183 @@
+name: Design Doc Check
+
+# feature/* ・ fix/* から develop/main への PR で、生きた設計書（docs/design/）の更新を要求する。
+# 逃がし: PR 本文に「Design: none」行、または「design:none」ラベル。
+# ローカルの .githooks/commit-msg と二重ガード（--no-verify や core.hooksPath 未設定の
+# すり抜けをここで捕捉）。設計書チェックが不要なプロジェクトはこのファイルを削除してよい。
+# 補助ジョブ（不要ならジョブ単位で削除してよい）:
+#   - requirements-doc-check : docs/要件定義書.md の必須節の欠落を警告（存在する場合のみ・fail しない）
+#   - ui-section-check       : frontmatter が kind: ui の設計書に「## UI/画面設計」見出しを要求（fail する）
+#   - data-model-section-check : frontmatter が kind: data の設計書に「## データモデル」見出しを要求（fail する）
+on:
+  pull_request:
+    branches: [develop, main]
+
+# GITHUB_TOKEN は読み取りのみ（least privilege）。判定は git diff・grep のみで write は不要
+# （新規リポジトリの既定は read-only だが、permissive な既定が残る組織もあるため明示して固定する）。
+permissions:
+  contents: read
+
+jobs:
+  design-doc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Require docs/design update
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+          BASE_REF: ${{ github.base_ref }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: |
+          set -euo pipefail
+          # feature/* ・ fix/* 以外（docs/chore 等）は対象外
+          case "$HEAD_REF" in
+            feature/*|fix/*) ;;
+            *) echo "対象ブランチ外（$HEAD_REF）: skip"; exit 0 ;;
+          esac
+          # 逃がし: design:none ラベル
+          case ",$PR_LABELS," in
+            *,design:none,*) echo "ラベル design:none: skip"; exit 0 ;;
+          esac
+          # 逃がし: PR 本文の Design: none（行頭・大文字小文字無視）
+          if printf '%s' "$PR_BODY" | grep -qiE '^[[:space:]]*design:[[:space:]]*none\b'; then
+            echo "PR 本文に Design: none: skip"; exit 0
+          fi
+          # docs/design/ 配下の差分があるか（三点＝merge-base 起点）
+          if git diff --name-only "origin/${BASE_REF}...HEAD" | grep -q '^docs/design/'; then
+            echo "設計書（docs/design/）の更新あり: ok"
+          else
+            echo "::error::feat/fix の PR に docs/design/ の更新がありません。設計書を更新するか、PR 本文に 'Design: none' を書くか 'design:none' ラベルを付けてください。（Web の UI 変更時は設計書の「UI/画面設計」節も更新すること）"
+            exit 1
+          fi
+
+  # docs/要件定義書.md の必須節（節構成の正は /project-setup が生成する要件定義書）の欠落を警告する。
+  # 要件定義書が無いプロジェクト（既存導入で opt-out した等）では skip。まずは warning 運用
+  # （fail させない）— 節名はプロジェクトの実情で増減し得るため、強制はレビューに委ねる。
+  requirements-doc-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Check required sections
+        run: |
+          set -euo pipefail
+          DOC="docs/要件定義書.md"
+          if [ ! -f "$DOC" ]; then
+            echo "$DOC なし: skip"; exit 0
+          fi
+          MISSING=0
+          for h in 背景・目的 スコープ 主要機能 業務フロー 非機能要件 テスト方針 技術選定 リリース・運用 未決事項 変更履歴; do
+            if ! grep -qE "^#+[[:space:]].*${h}" "$DOC"; then
+              echo "::warning file=${DOC}::必須節「${h}」の見出しが見つかりません（該当しない節も「該当なし」を明示して残す）"
+              MISSING=1
+            fi
+          done
+          if [ "$MISSING" = 0 ]; then echo "必須節 ok"; fi
+
+  # frontmatter に kind: ui を持つ設計書（docs/design/）に「## UI/画面設計」見出しを要求する。
+  # kind は任意キー（docs-site/src/content.config.ts）— 付けた領域だけ節構造を検査する。
+  ui-section-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Require UI section in kind:ui design docs
+        run: |
+          python3 - <<'EOF'
+          import pathlib, re, sys
+
+          root = pathlib.Path("docs/design")
+          if not root.is_dir():
+              print("docs/design なし: skip"); sys.exit(0)
+          errors = []
+          for path in sorted(root.rglob("*.md")):
+              text = path.read_text(encoding="utf-8")
+              m = re.match(r"\A---\r?\n(.*?)\r?\n---\r?\n", text, re.S)
+              if not m:
+                  continue  # frontmatter なし（索引 README.md 等）は対象外
+              if not re.search(r"^kind:\s*['\"]?ui['\"]?\s*$", m.group(1), re.M):
+                  continue
+              if not re.search(r"^##\s*UI/画面設計", text[m.end():], re.M):
+                  errors.append(str(path))
+          for p in errors:
+              print(f"::error file={p}::kind: ui の設計書に「## UI/画面設計」見出しがありません（節テンプレートは .claude/rules/design-doc.md）")
+          if not errors:
+              print("kind: ui の節構造 ok")
+          sys.exit(1 if errors else 0)
+          EOF
+
+  # frontmatter に kind: data を持つ設計書（docs/design/）に「## データモデル」見出しを要求する。
+  # ui-section-check の双子（kind:ui→UI/画面設計 と対称）。GH↔GL の双子一致は
+  # scripts/check_template_consistency.py が機械検証する。
+  data-model-section-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Require data model section in kind:data design docs
+        run: |
+          python3 - <<'EOF'
+          import pathlib, re, sys
+
+          root = pathlib.Path("docs/design")
+          if not root.is_dir():
+              print("docs/design なし: skip"); sys.exit(0)
+          errors = []
+          for path in sorted(root.rglob("*.md")):
+              text = path.read_text(encoding="utf-8")
+              m = re.match(r"\A---\r?\n(.*?)\r?\n---\r?\n", text, re.S)
+              if not m:
+                  continue  # frontmatter なし（索引 README.md 等）は対象外
+              if not re.search(r"^kind:\s*['\"]?data['\"]?\s*$", m.group(1), re.M):
+                  continue
+              if not re.search(r"^##\s*データモデル", text[m.end():], re.M):
+                  errors.append(str(path))
+          for p in errors:
+              print(f"::error file={p}::kind: data の設計書に「## データモデル」見出しがありません（節テンプレートは .claude/rules/design-doc.md）")
+          if not errors:
+              print("kind: data の節構造 ok")
+          sys.exit(1 if errors else 0)
+          EOF
+
+  # docs-site（Astro+Starlight）の設計書スキーマ検証を PR で先行ゲートする。
+  # docs/design/ か docs-site/ に変更を含む PR でのみ astro check（npm run check）を実行し、
+  # ① Dependabot 等の docs-site 依存 bump の破壊（例: Starlight のサイドバー記法廃止）と
+  # ② 設計書 frontmatter のスキーマ不適合を、post-merge の Pages ビルドを待たず PR で捕捉する
+  # （docs-deploy.yml は push:[develop,main] のみで PR を実ビルドしないため、その相補ゲート）。
+  # docs サイトを使わない（docs-site/ を削除した）プロジェクトはこのジョブを削除してよい。
+  # このゲートは project-profile.json の docsSite.enabled を読まない（CI 段での無効化は
+  # docs-site/ 削除かこのジョブ削除）。ローカル pre-commit の docsSite.enabled 駆動とは独立。
+  # GitLab の .gitlab/ci/design-doc-check.yml の同名ジョブと双子（GH↔GL 一致は
+  # scripts/check_template_consistency.py が検証する）。
+  docs-site-schema-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Detect docs-site / docs/design changes
+        id: detect
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          if [ ! -d docs-site ]; then
+            echo "docs-site なし: skip"; echo "run=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if git diff --name-only "origin/${BASE_REF}...HEAD" | grep -qE '^(docs-site/|docs/design/)'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "docs-site/・docs/design/ の変更なし: skip"; echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/setup-node@v5
+        if: steps.detect.outputs.run == 'true'
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: docs-site/package-lock.json
+      - name: astro check（設計書スキーマ + 型）
+        if: steps.detect.outputs.run == 'true'
+        working-directory: docs-site
+        run: |
+          npm ci
+          npm run check

@@ -1,0 +1,73 @@
+name: Deploy Docs (Pages)
+
+# docs/ を Astro+Starlight（docs-site/）でビルドし GitHub Pages へデプロイする。
+# 前提: リポジトリ設定 → Pages → Source を「GitHub Actions」にする。
+# 公開元ブランチは「git ホストの default ブランチ」に自動追従する（build ジョブの if で判定するため
+# project-setup の手編集は不要。GitLab の pages.yml が CI_DEFAULT_BRANCH に追従するのと対称）。
+# 注意: ここでの「default」は git ホストの default ブランチで、profile の defaultBranch（develop）とは
+# 別物。出荷のセットアップ（version-control-remote-sync タスク）は `git init -b main` でホスト default を
+# main にするため、既定では Pages は main からのみ公開される＝develop のみにマージした生きた設計書は
+# main 到達まで公開されない。develop の最新設計を継続公開したいなら、ホスト default を develop にする
+# （`gh repo edit --default-branch develop`。project-setup の「docs サイト有効化」タスクで選べる）。
+# 上記いずれでもない名前を default にする運用では、その名前を下の branches: にも足す。
+# workflow_dispatch で手動実行も可。
+# ドキュメントサイトを使わないプロジェクトはこのファイルを削除してよい。
+# 注意: private リポジトリ ≠ private サイト — GitHub Pages のアクセス制御は Enterprise Cloud 限定で、
+# それ以外は URL を知る誰でも閲覧できる（公開可否は /project-setup の docs サイト有効化ゲートで確認する）。
+on:
+  push:
+    branches: [develop, main]
+  workflow_dispatch:
+
+# Pages デプロイに必要な権限（GITHUB_TOKEN）。
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# 同時デプロイを抑止（実行中のデプロイはキャンセルしない）。
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    # push は default ブランチのときだけ公開する（非 default への push はジョブごとスキップ
+    # ＝ runner を使わない）。手動実行（workflow_dispatch）は任意ブランチで許可。
+    # deploy は needs: build なので、build がスキップされれば deploy も連動してスキップされる。
+    if: github.event_name == 'workflow_dispatch' || github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Configure Pages
+        id: pages
+        uses: actions/configure-pages@v6
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: docs-site/package-lock.json
+      - name: Install deps
+        working-directory: docs-site
+        run: npm ci
+      - name: Build site
+        working-directory: docs-site
+        env:
+          # astro.config.mjs が読む。project pages の base/origin を自動注入。
+          SITE: ${{ steps.pages.outputs.origin }}
+          BASE: ${{ steps.pages.outputs.base_path }}
+        run: npm run build
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: docs-site/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5
