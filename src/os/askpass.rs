@@ -234,10 +234,7 @@ pub fn expand_identity_path(raw: &str, t: &IdentityTokens) -> Option<String> {
                 .unwrap_or_else(|| t.host_arg.clone()),
             'n' => t.host_arg.clone(),
             'p' => t.port.clone(),
-            'j' => match &t.proxy_jump_host {
-                Some(h) => h.clone(),
-                None => return None,
-            },
+            'j' => t.proxy_jump_host.clone()?,
             _ => return None, // %C and any other token -> fail-safe
         };
         out.push_str(&val);

@@ -4,6 +4,7 @@
 //! unit-testable headless. See [`parser`] for the parse side and [`writer`] for
 //! rendering + editing.
 
+pub mod diff;
 pub mod model;
 pub mod parser;
 pub mod tokens;

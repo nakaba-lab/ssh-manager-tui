@@ -4,6 +4,7 @@
 
 pub mod confirm;
 pub mod connect_override;
+pub mod diff;
 pub mod edit;
 pub mod help;
 pub mod keys;
@@ -57,6 +58,7 @@ fn base_screen(app: &App) -> Screen {
         | Screen::VaultUnlock
         | Screen::ConnectOverride { .. }
         | Screen::SftpTransfer
+        | Screen::DiffPreview
         | Screen::PasswordConfirm { .. } => app.prev_screen.clone().unwrap_or(Screen::List),
         Screen::PickKey { origin } | Screen::PickJump { origin } => match origin {
             PickOrigin::Edit { editing } => Screen::Edit { editing: *editing },
@@ -111,6 +113,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             list::draw_jump_picker(f, app, &origin, body_a)
         }
         Screen::ConnectOverride { host } => connect_override::draw(f, app, *host, body_a),
+        Screen::DiffPreview => diff::draw(f, app, body_a),
         Screen::SftpTransfer => sftp::draw_transfer(f, app, body_a),
         Screen::VaultUnlock => vault::draw_unlock(f, app, body_a),
         Screen::VaultEntry { .. } => vault::draw_entry(f, app, body_a),
@@ -227,6 +230,17 @@ fn draw_footer(f: &mut Frame, app: &App, base: &Screen, area: Rect) {
             ("Space/←→", "direction"),
             ("^S", "transfer"),
             ("Esc", "cancel"),
+        ]);
+        f.render_widget(Paragraph::new(hints), area);
+        return;
+    }
+    // The diff preview resolves its base to the Edit form, so without this its
+    // footer would show the form's hints; surface the preview's real chords.
+    if matches!(app.screen, Screen::DiffPreview) {
+        let hints = widgets::footer_hints(&[
+            ("Enter", "save"),
+            ("j/k", "scroll"),
+            ("Esc", "back to form"),
         ]);
         f.render_widget(Paragraph::new(hints), area);
         return;

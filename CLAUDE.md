@@ -45,9 +45,11 @@ it unprompted.
 
 Three layers with a strict, enforced dependency direction:
 
-- **`config/`** — the lossless `~/.ssh/config` parser + surgical writer. **Zero
-  ratatui dependency**, fully headless-testable. This is the most important and
-  most-tested module.
+- **`config/`** — the lossless `~/.ssh/config` parser + surgical writer, plus
+  `config/diff.rs`: a pure line-level differ (common prefix/suffix trim + line
+  LCS) that backs the **before-save diff preview** — it only reads two rendered
+  strings, never the model. **Zero ratatui dependency**, fully headless-testable.
+  This is the most important and most-tested module.
 - **`os/`** — all external-world integration: spawning `ssh`/`ssh-keygen`/`sftp`,
   TCP liveness probing, SSH key discovery + fingerprint-based pairing,
   `known_hosts` parsing/rewriting, clipboard, binary resolution, the **SFTP**

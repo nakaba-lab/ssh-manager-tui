@@ -17,11 +17,14 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::app::{
     App, ConfirmAction, ConnectMode, EditForm, FormMode, GenOrigin, ListFocus,
-    PasswordConfirmOrigin, PickOrigin, SFTP_FIELDS, Screen, SftpBrowser, SftpDirection, SftpForm,
-    SftpPane, VaultEntryForm, VaultUnlock, form_from_view, form_idx, override_form_from_host,
-    override_idx, overrides_from_form, read_local_dir, view_from_form,
+    PasswordConfirmOrigin, PendingSave, PickOrigin, SFTP_FIELDS, Screen, SftpBrowser,
+    SftpDirection, SftpForm, SftpPane, VaultEntryForm, VaultUnlock, form_from_view, form_idx,
+    override_form_from_host, override_idx, overrides_from_form, read_local_dir, view_from_form,
 };
+use crate::config::SshConfig;
+use crate::config::diff;
 use crate::config::model::HostView;
+use crate::error::ConfigError;
 use crate::os::askpass::{
     AskpassListener, DeclineReason, Outcome, arm_connect, os_tokens, resolved_identity,
 };
@@ -52,6 +55,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent, terminal: &mut DefaultTerminal) 
     match app.screen.clone() {
         Screen::List => handle_list(app, key, terminal)?,
         Screen::Edit { editing } => handle_edit(app, key, editing)?,
+        Screen::DiffPreview => handle_diff_preview(app, key),
         Screen::KeyManager => handle_keys(app, key)?,
         Screen::KnownHosts => handle_known_hosts(app, key),
         Screen::Help => handle_help(app, key),
@@ -1281,6 +1285,9 @@ fn form_is_dirty(app: &App) -> bool {
     view_from_form(&app.form) != app.form.original
 }
 
+/// Validate the edit form, then open the before-save diff preview instead of
+/// writing immediately (issue #42). The apply + save is deferred to
+/// [`commit_pending_save`], which runs only after the user confirms the diff.
 fn save_form(app: &mut App, editing: Option<usize>) {
     let view = view_from_form(&app.form);
 
@@ -1307,24 +1314,140 @@ fn save_form(app: &mut App, editing: Option<usize>) {
         return;
     }
 
-    let result = match editing {
-        Some(item) => app.config.apply_view(item, &view).map(|_| "host saved"),
-        None => app.config.add_host(&view).map(|_| "host added"),
+    let pending = match editing {
+        Some(item) => PendingSave::Apply {
+            item,
+            view: Box::new(view),
+        },
+        None => PendingSave::Add {
+            view: Box::new(view),
+        },
     };
-    let msg = match result {
-        Ok(m) => m,
-        Err(e) => {
-            app.toast(format!("{e}"), true);
-            return;
-        }
-    };
-    if let Err(e) = app.config.save() {
-        app.toast(format!("save failed: {e}"), true);
+    open_diff_preview(app, pending);
+}
+
+/// Apply a pending mutation to `cfg`. Shared verbatim by the preview (on a clone)
+/// and the commit (on the real config) so what the user reviews is exactly what
+/// gets written — the load-bearing "no divergence" guarantee from issue #42.
+pub fn apply_pending(cfg: &mut SshConfig, pending: &PendingSave) -> Result<(), ConfigError> {
+    match pending {
+        PendingSave::Apply { item, view } => cfg.apply_view(*item, view),
+        PendingSave::Add { view } => cfg.add_host(view).map(|_| ()),
+    }
+}
+
+/// Compute the before-save diff (current on-disk file → what the save will
+/// write) and, when it shows a real change, open the preview modal over the edit
+/// form. A no-op edit short-circuits with a toast instead of an empty modal.
+fn open_diff_preview(app: &mut App, pending: PendingSave) {
+    // `old` is re-read from disk on purpose: if the file was edited externally
+    // since load, the diff honestly shows the save replacing those edits (issue
+    // #42). A missing file reads as empty (the first save creates it).
+    let old = std::fs::read_to_string(&app.config.path).unwrap_or_default();
+
+    // `new` is what `save()` would write: apply the pending op to a CLONE via the
+    // same function the commit uses, then render. The real config stays untouched
+    // until commit.
+    let mut preview = app.config.clone();
+    if let Err(e) = apply_pending(&mut preview, &pending) {
+        // e.g. a duplicate-alias add: surface it now and stay on the form.
+        app.toast(format!("{e}"), true);
         return;
     }
+    let new = preview.render();
+
+    let d = diff::diff(&old, &new);
+    if diff::stats(&d) == (0, 0) {
+        // Byte-identical to disk (a no-op edit): nothing to write.
+        app.toast("no changes to save", false);
+        app.screen = Screen::List;
+        return;
+    }
+
+    app.diff_preview = d;
+    app.diff_scroll = 0;
+    app.pending_save = Some(pending);
+    open_overlay(app, Screen::DiffPreview);
+}
+
+/// The before-save diff preview modal. Enter / Ctrl-S commits the previewed save;
+/// Esc cancels back to the edit form; j/k (and arrows / page keys) scroll.
+fn handle_diff_preview(app: &mut App, key: KeyEvent) {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    // Loose cap so scrolling can't run past the last line into blank space; the
+    // exact viewport height isn't known here (app convention — see detail_scroll).
+    let max_scroll = app
+        .diff_preview
+        .len()
+        .saturating_sub(1)
+        .min(u16::MAX as usize) as u16;
+    match key.code {
+        KeyCode::Enter => commit_pending_save(app),
+        KeyCode::Char('s') if ctrl => commit_pending_save(app),
+        KeyCode::Esc => {
+            app.pending_save = None;
+            app.diff_preview.clear();
+            app.diff_scroll = 0;
+            close_overlay(app);
+        }
+        KeyCode::Char('j') | KeyCode::Down => {
+            app.diff_scroll = app.diff_scroll.saturating_add(1).min(max_scroll);
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            app.diff_scroll = app.diff_scroll.saturating_sub(1);
+        }
+        KeyCode::Char(' ') | KeyCode::PageDown => {
+            app.diff_scroll = app.diff_scroll.saturating_add(10).min(max_scroll);
+        }
+        KeyCode::PageUp => {
+            app.diff_scroll = app.diff_scroll.saturating_sub(10);
+        }
+        KeyCode::Home => app.diff_scroll = 0,
+        KeyCode::End => app.diff_scroll = max_scroll,
+        _ => {}
+    }
+}
+
+/// Commit the previewed mutation and return to the list. Called from the diff
+/// preview on Enter / Ctrl-S. The op is applied to a *clone* which is then saved;
+/// the real `app.config` is only replaced once the write succeeds. So a failed
+/// save leaves both the on-disk file **and** the in-memory model untouched —
+/// otherwise a failed `Add` would strand a phantom host in memory and every
+/// retry would fail with a duplicate-alias error. On failure it surfaces a toast
+/// and drops back to the edit form to retry.
+fn commit_pending_save(app: &mut App) {
+    let Some(pending) = app.pending_save.take() else {
+        // No pending op (shouldn't happen): just close the preview.
+        close_overlay(app);
+        return;
+    };
+    let msg = match &pending {
+        PendingSave::Apply { .. } => "host saved",
+        PendingSave::Add { .. } => "host added",
+    };
+
+    let mut next = app.config.clone();
+    // apply_pending already succeeded on the preview clone, so this is a
+    // defensive branch; keep it so a future non-idempotent op can't panic here.
+    if let Err(e) = apply_pending(&mut next, &pending) {
+        app.toast(format!("{e}"), true);
+        close_overlay(app);
+        return;
+    }
+    if let Err(e) = next.save() {
+        app.toast(format!("save failed: {e}"), true);
+        close_overlay(app);
+        return;
+    }
+    // Adopt the saved config only now that the write is durable.
+    app.config = next;
+
+    app.diff_preview.clear();
+    app.diff_scroll = 0;
     app.rebuild_hosts();
     app.refresh_all_liveness();
     app.screen = Screen::List;
+    app.prev_screen = None;
     app.toast(msg, false);
 }
 
@@ -4538,5 +4661,249 @@ mod tests {
             !un.iter().any(|a| a == "BatchMode=no"),
             "un-armed transfer must never emit BatchMode=no (no live askpass env)"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Before-save diff preview (issue #42)
+    // -----------------------------------------------------------------------
+
+    /// Like [`app_fixture`] but leaves the scratch config file ON DISK (the
+    /// default fixture deletes it), so `open_diff_preview`'s re-read of the file
+    /// sees real content. Returns `(app, path)`; the caller removes the dir.
+    fn app_fixture_on_disk(config_body: &str) -> (App, std::path::PathBuf) {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("sshm-diffp-{}-{}", std::process::id(), n));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(config_body.as_bytes())
+            .unwrap();
+        let app = App::new(path.clone()).expect("App::new over scratch config");
+        (app, path)
+    }
+
+    // The load-bearing guarantee: what the preview renders is byte-for-byte what
+    // the commit writes, because both run the SAME `apply_pending`. If they ever
+    // diverged (two hand-written apply paths), this catches it.
+    #[test]
+    fn apply_preview_matches_committed_bytes() {
+        let (mut app, path) =
+            app_fixture_on_disk("Host a\n    HostName old.example.com\n    User deploy\n");
+        let item = app.host_items[0];
+        let mut view = app.hosts[0].clone();
+        view.host_name = Some("new.example.com".into());
+        let pending = PendingSave::Apply {
+            item,
+            view: Box::new(view),
+        };
+
+        // Independently compute what the save SHOULD write (clone + same apply fn).
+        let mut expected_cfg = app.config.clone();
+        apply_pending(&mut expected_cfg, &pending).unwrap();
+        let expected = expected_cfg.render();
+
+        // Drive the real preview → commit path.
+        app.screen = Screen::Edit {
+            editing: Some(item),
+        };
+        open_diff_preview(&mut app, pending);
+        assert_eq!(app.screen, Screen::DiffPreview, "preview modal must open");
+        assert!(app.pending_save.is_some());
+        assert_ne!(
+            diff::stats(&app.diff_preview),
+            (0, 0),
+            "diff must show the change"
+        );
+
+        commit_pending_save(&mut app);
+        assert_eq!(app.screen, Screen::List);
+        assert!(app.pending_save.is_none());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            expected,
+            "committed bytes must equal the previewed render"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn add_preview_matches_committed_bytes() {
+        let (mut app, path) = app_fixture_on_disk("Host a\n    HostName 1.1.1.1\n");
+        let view = HostView {
+            patterns: vec!["web1".into()],
+            host_name: Some("10.0.0.1".into()),
+            ..Default::default()
+        };
+        let pending = PendingSave::Add {
+            view: Box::new(view),
+        };
+
+        let mut expected_cfg = app.config.clone();
+        apply_pending(&mut expected_cfg, &pending).unwrap();
+        let expected = expected_cfg.render();
+
+        app.screen = Screen::Edit { editing: None };
+        open_diff_preview(&mut app, pending);
+        assert_eq!(app.screen, Screen::DiffPreview);
+
+        commit_pending_save(&mut app);
+        assert_eq!(app.screen, Screen::List);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+        assert!(
+            app.hosts.iter().any(|h| h.alias() == "web1"),
+            "the new host is in the rebuilt projection"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn no_op_edit_previews_no_changes_and_skips_modal() {
+        let (mut app, path) =
+            app_fixture_on_disk("Host a\n    HostName 1.1.1.1\n    User deploy\n");
+        let item = app.host_items[0];
+        let view = app.hosts[0].clone(); // unchanged
+        app.screen = Screen::Edit {
+            editing: Some(item),
+        };
+        open_diff_preview(
+            &mut app,
+            PendingSave::Apply {
+                item,
+                view: Box::new(view),
+            },
+        );
+
+        assert_eq!(app.screen, Screen::List, "a no-op edit returns to the list");
+        assert!(app.pending_save.is_none(), "nothing left pending");
+        assert!(app.diff_preview.is_empty());
+        assert!(
+            !app.toast.is_error,
+            "the 'no changes' toast is not an error"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn external_edit_is_shown_in_preview() {
+        // Design decision from issue #42: the diff base is the CURRENT on-disk
+        // file, so a save that would overwrite an external edit shows that
+        // honestly — even when the form itself changed nothing.
+        let (mut app, path) = app_fixture_on_disk("Host a\n    HostName 1.1.1.1\n");
+        // Someone edits the file behind our back.
+        std::fs::write(&path, "Host a\n    HostName 9.9.9.9\n").unwrap();
+
+        let item = app.host_items[0];
+        let view = app.hosts[0].clone(); // form unchanged (still 1.1.1.1 in memory)
+        app.screen = Screen::Edit {
+            editing: Some(item),
+        };
+        open_diff_preview(
+            &mut app,
+            PendingSave::Apply {
+                item,
+                view: Box::new(view),
+            },
+        );
+
+        assert_eq!(
+            app.screen,
+            Screen::DiffPreview,
+            "an external edit the save would clobber must surface a diff"
+        );
+        let del_external = app
+            .diff_preview
+            .iter()
+            .any(|l| matches!(l, diff::DiffLine::Del(s) if s.contains("9.9.9.9")));
+        let add_ours = app
+            .diff_preview
+            .iter()
+            .any(|l| matches!(l, diff::DiffLine::Add(s) if s.contains("1.1.1.1")));
+        assert!(del_external, "preview must show the external line removed");
+        assert!(add_ours, "preview must show our line written back");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn esc_cancels_preview_without_writing() {
+        let (mut app, path) = app_fixture_on_disk("Host a\n    HostName 1.1.1.1\n");
+        let before = std::fs::read_to_string(&path).unwrap();
+        let item = app.host_items[0];
+        let mut view = app.hosts[0].clone();
+        view.host_name = Some("2.2.2.2".into());
+        app.screen = Screen::Edit {
+            editing: Some(item),
+        };
+        open_diff_preview(
+            &mut app,
+            PendingSave::Apply {
+                item,
+                view: Box::new(view),
+            },
+        );
+        assert_eq!(app.screen, Screen::DiffPreview);
+
+        handle_diff_preview(&mut app, KeyEvent::from(KeyCode::Esc));
+        assert_eq!(
+            app.screen,
+            Screen::Edit {
+                editing: Some(item)
+            },
+            "Esc returns to the edit form"
+        );
+        assert!(app.pending_save.is_none());
+        assert!(app.diff_preview.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "cancelling writes nothing"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn failed_save_does_not_mutate_in_memory_config() {
+        // Regression: commit applies to a clone and only adopts it once the write
+        // succeeds, so a failed save leaves the in-memory config untouched. Without
+        // that, a failed Add would strand a phantom host and every retry would fail
+        // with a duplicate-alias error, permanently blocking the add.
+        let (mut app, path) = app_fixture_on_disk("Host a\n    HostName 1.1.1.1\n");
+        // Force `save()` to fail: point the config at a path whose parent is a
+        // FILE, so the temp-file create under it errors with "not a directory".
+        let blocker = path.parent().unwrap().join("blocker");
+        std::fs::write(&blocker, b"x").unwrap();
+        app.config.path = blocker.join("config");
+
+        let hosts_before = app.config.host_views().len();
+        let view = HostView {
+            patterns: vec!["web1".into()],
+            host_name: Some("10.0.0.1".into()),
+            ..Default::default()
+        };
+        app.pending_save = Some(PendingSave::Add {
+            view: Box::new(view),
+        });
+        app.prev_screen = Some(Screen::Edit { editing: None });
+        app.screen = Screen::DiffPreview;
+
+        commit_pending_save(&mut app);
+
+        assert!(app.toast.is_error, "a failed save must surface an error");
+        assert_eq!(
+            app.config.host_views().len(),
+            hosts_before,
+            "a failed save must not add a phantom host in memory"
+        );
+        assert!(
+            !app.config
+                .host_views()
+                .iter()
+                .any(|(_, v)| v.alias() == "web1"),
+            "the un-written host must not linger in the in-memory config"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }
