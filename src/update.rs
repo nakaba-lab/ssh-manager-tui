@@ -35,7 +35,8 @@ use crate::os::connect::{
 use crate::os::keys::{generate_key, read_public_key};
 use crate::os::known_hosts::remove_entry;
 use crate::os::resolve::{
-    ResolvedConfig, has_match_exec, is_host_known, resolve_config_with_options, tofu_lookup_key,
+    ResolvedConfig, has_match_exec, inspect_block_reason, is_host_known,
+    resolve_config_with_options, resolve_full, tofu_lookup_key,
 };
 use crate::os::sftp::{SftpOp, SftpSession, remote_join, remote_parent, sftp_quote, stage_batch};
 use crate::os::ssh_dir;
@@ -58,6 +59,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent, terminal: &mut DefaultTerminal) 
         Screen::DiffPreview => handle_diff_preview(app, key),
         Screen::KeyManager => handle_keys(app, key)?,
         Screen::KnownHosts => handle_known_hosts(app, key),
+        Screen::Inspect => handle_inspect(app, key),
         Screen::Help => handle_help(app, key),
         Screen::Confirm(action) => handle_confirm(app, key, action, terminal)?,
         Screen::ActionMenu(idx) => handle_action_menu(app, key, idx, terminal)?,
@@ -340,6 +342,7 @@ fn handle_list(app: &mut App, key: KeyEvent, terminal: &mut DefaultTerminal) -> 
             app.reload_known_hosts();
             app.screen = Screen::KnownHosts;
         }
+        KeyCode::Char('i') => open_inspect(app),
         KeyCode::Char('P') => open_vault(app),
         _ => {}
     }
@@ -2997,6 +3000,82 @@ fn handle_known_hosts(app: &mut App, key: KeyEvent) {
             app.reload_known_hosts();
             app.toast("known_hosts reloaded", false);
         }
+        _ => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #43 effective-config inspector (`ssh -G` view)
+// ---------------------------------------------------------------------------
+
+/// Open the effective-config inspector for the selected host. Refuses (sticky
+/// error toast) when `ssh -G` could execute a `Match exec` predicate — a
+/// `Match exec` in the main file, or ANY `Include` (see `inspect_block_reason`).
+/// Otherwise runs `ssh -G` ONCE here (bounded 500ms), stashes the ordered
+/// key/value rows on `App`, and switches to the base `Screen::Inspect`. The
+/// resolve never runs per-draw. On `ssh -G` failure the screen is not entered.
+fn open_inspect(app: &mut App) {
+    let Some(h) = app.selected_host() else { return };
+    let alias = app.hosts[h].alias().to_string();
+    if let Some(reason) = inspect_block_reason(&app.config.render(), app.config.include_count()) {
+        app.toast(reason, true);
+        return;
+    }
+    match resolve_full(&[], &alias) {
+        Ok(rows) => {
+            app.inspect_alias = alias;
+            app.inspect_rows = rows;
+            app.inspect_search.clear();
+            app.inspect_searching = false;
+            app.inspect_state
+                .select((!app.inspect_rows.is_empty()).then_some(0));
+            app.screen = Screen::Inspect;
+        }
+        Err(e) => app.toast(format!("ssh -G failed: {e}"), true),
+    }
+}
+
+/// Key handling for the effective-config inspector. Mirrors `handle_known_hosts`:
+/// `/` enters a substring filter; j/k/g/G scroll; Esc clears an active filter
+/// then closes back to the list. Read-only (no mutation of the resolved rows).
+fn handle_inspect(app: &mut App, key: KeyEvent) {
+    if app.inspect_searching {
+        match key.code {
+            KeyCode::Esc => {
+                app.inspect_searching = false;
+                app.inspect_search.clear();
+                app.clamp_inspect_selection();
+            }
+            KeyCode::Enter => app.inspect_searching = false,
+            KeyCode::Backspace => {
+                app.inspect_search.pop();
+                app.clamp_inspect_selection();
+            }
+            KeyCode::Char(c) => {
+                app.inspect_search.push(c);
+                app.clamp_inspect_selection();
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    let filtered_len = app.inspect_filtered().len();
+    match key.code {
+        KeyCode::Esc => {
+            if !app.inspect_search.is_empty() {
+                app.inspect_search.clear();
+                app.clamp_inspect_selection();
+            } else {
+                app.screen = Screen::List;
+            }
+        }
+        KeyCode::Char('?') => open_overlay(app, Screen::Help),
+        KeyCode::Char('/') => app.inspect_searching = true,
+        KeyCode::Char('j') | KeyCode::Down => move_list(&mut app.inspect_state, filtered_len, 1),
+        KeyCode::Char('k') | KeyCode::Up => move_list(&mut app.inspect_state, filtered_len, -1),
+        KeyCode::Char('g') => app.inspect_state.select((filtered_len > 0).then_some(0)),
+        KeyCode::Char('G') => app.inspect_state.select(filtered_len.checked_sub(1)),
         _ => {}
     }
 }

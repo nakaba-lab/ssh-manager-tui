@@ -124,6 +124,12 @@ pub enum Screen {
     DiffPreview,
     KeyManager,
     KnownHosts,
+    /// Effective-config inspector (#43): a full-screen, filterable/scrollable view
+    /// of a host's `ssh -G` resolution. A base screen (like [`Screen::KnownHosts`]),
+    /// NOT a modal overlay; all state lives on `App` (`inspect_*`). Esc → List. The
+    /// `ssh -G` resolve runs once at open time (see `update::open_inspect`), never
+    /// per-draw, and is refused for configs that could trigger a `Match exec`.
+    Inspect,
     Help,
     Confirm(ConfirmAction),
     ActionMenu(usize),
@@ -829,6 +835,16 @@ pub struct App {
     pub kh_search: String,
     pub kh_searching: bool,
 
+    // --- #43 effective-config inspector (see Screen::Inspect) ---
+    /// Alias whose `ssh -G` resolution is shown (for the breadcrumb).
+    pub inspect_alias: String,
+    /// The resolved `ssh -G` key/value pairs, in emission order. Loaded once at
+    /// open time (never recomputed per-draw).
+    pub inspect_rows: Vec<(String, String)>,
+    pub inspect_state: ListState,
+    pub inspect_search: String,
+    pub inspect_searching: bool,
+
     // --- O3 action menu ---
     pub menu_sel: usize,
 
@@ -926,6 +942,11 @@ impl App {
             kh_state: ListState::default(),
             kh_search: String::new(),
             kh_searching: false,
+            inspect_alias: String::new(),
+            inspect_rows: Vec::new(),
+            inspect_state: ListState::default(),
+            inspect_search: String::new(),
+            inspect_searching: false,
             menu_sel: 0,
             vault: None,
             vault_state: ListState::default(),
@@ -1396,6 +1417,34 @@ impl App {
         } else {
             let sel = self.kh_state.selected().unwrap_or(0);
             self.kh_state.select(Some(sel.min(len - 1)));
+        }
+    }
+
+    /// Indices into `inspect_rows` matching the current `inspect_search`
+    /// (case-insensitive substring over the key OR the value). Identity when the
+    /// search is empty. Mirrors [`kh_filtered`](Self::kh_filtered). (#43)
+    pub fn inspect_filtered(&self) -> Vec<usize> {
+        if self.inspect_search.is_empty() {
+            return (0..self.inspect_rows.len()).collect();
+        }
+        let needle = self.inspect_search.to_lowercase();
+        self.inspect_rows
+            .iter()
+            .enumerate()
+            .filter(|(_, (key, val))| {
+                key.to_lowercase().contains(&needle) || val.to_lowercase().contains(&needle)
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    pub fn clamp_inspect_selection(&mut self) {
+        let len = self.inspect_filtered().len();
+        if len == 0 {
+            self.inspect_state.select(None);
+        } else {
+            let sel = self.inspect_state.selected().unwrap_or(0);
+            self.inspect_state.select(Some(sel.min(len - 1)));
         }
     }
 }
@@ -2262,6 +2311,34 @@ mod tests {
             app.pick_jump_self_alias(&PickOrigin::Edit { editing: None }),
             ""
         );
+    }
+
+    #[test]
+    fn inspect_filtered_matches_key_or_value_case_insensitively() {
+        // #43: the effective-config inspector filters by a case-insensitive
+        // substring over BOTH the key and the value, mirroring `kh_filtered`.
+        let mut app = app_fixture("Host a\n  HostName 1.2.3.4\n");
+        app.inspect_rows = vec![
+            ("hostname".to_string(), "10.0.0.5".to_string()),
+            ("user".to_string(), "deploy".to_string()),
+            ("port".to_string(), "2222".to_string()),
+        ];
+
+        // Empty search = identity (every row shown).
+        app.inspect_search.clear();
+        assert_eq!(app.inspect_filtered(), vec![0, 1, 2]);
+
+        // Match on the key (case-insensitive).
+        app.inspect_search = "USER".to_string();
+        assert_eq!(app.inspect_filtered(), vec![1]);
+
+        // Match on the value.
+        app.inspect_search = "10.0".to_string();
+        assert_eq!(app.inspect_filtered(), vec![0]);
+
+        // No match = empty.
+        app.inspect_search = "zzz".to_string();
+        assert!(app.inspect_filtered().is_empty());
     }
 
     #[test]
