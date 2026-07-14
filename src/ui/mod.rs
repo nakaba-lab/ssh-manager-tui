@@ -7,6 +7,7 @@ pub mod connect_override;
 pub mod diff;
 pub mod edit;
 pub mod help;
+pub mod inspect;
 pub mod keys;
 pub mod known_hosts;
 pub mod list;
@@ -92,6 +93,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Screen::Edit { .. } => edit::draw(f, app, body_a),
         Screen::KeyManager => keys::draw(f, app, body_a),
         Screen::KnownHosts => known_hosts::draw(f, app, body_a),
+        Screen::Inspect => inspect::draw(f, app, body_a),
         Screen::Vault => vault::draw(f, app, body_a),
         Screen::SftpBrowser => sftp::draw_browser(f, app, body_a),
         _ => list::draw(f, app, body_a),
@@ -133,6 +135,7 @@ fn draw_title(f: &mut Frame, app: &App, base: &Screen, area: Rect) {
         Screen::Edit { editing: None } => "Add host",
         Screen::KeyManager => "Keys",
         Screen::KnownHosts => "Known hosts",
+        Screen::Inspect => "Inspect",
         Screen::Vault => "Passwords",
         Screen::SftpBrowser => "SFTP browser",
         _ => "SSH Manager",
@@ -146,6 +149,7 @@ fn draw_title(f: &mut Frame, app: &App, base: &Screen, area: Rect) {
         ),
         Screen::KeyManager => format!("  {} keys ", app.keys.len()),
         Screen::KnownHosts => format!("  {} entries ", app.known_hosts.len()),
+        Screen::Inspect => format!("  {} · ssh -G ", app.inspect_alias),
         Screen::Vault => format!(
             "  {} secrets ",
             app.vault.as_ref().map(|v| v.entries.len()).unwrap_or(0)
@@ -301,6 +305,12 @@ fn draw_footer(f: &mut Frame, app: &App, base: &Screen, area: Rect) {
             ("d", "delete"),
             ("Esc", "back"),
         ]),
+        (Screen::Inspect, a) if a.inspect_searching => {
+            widgets::footer_hints(&[("type", "filter"), ("Esc", "clear")])
+        }
+        (Screen::Inspect, _) => {
+            widgets::footer_hints(&[("j/k", "move"), ("/", "filter"), ("Esc", "back")])
+        }
         (Screen::Vault, _) => widgets::footer_hints(&[
             ("j/k", "move"),
             ("a", "add"),
