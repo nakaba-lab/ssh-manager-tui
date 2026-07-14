@@ -241,17 +241,44 @@ pub fn has_match_exec(config_text: &str) -> bool {
     false
 }
 
+/// True if the raw SSH config text contains an `Include` directive. Uses the
+/// SAME widen-only normalization as [`has_match_exec`] (quote-splice removal,
+/// `=`→space, `#`-comment skip, indentation-agnostic) so quote-decorated
+/// (`"Include"`, `Inc"lude"`), `=`-separated, and block-nested/indented includes
+/// are all caught. Deliberately NOT derived from the parser's `include_count()`:
+/// that recognizes only bare TOP-LEVEL `Include`, whereas `ssh -G` also honors
+/// nested and quote-spliced includes — either of which could pull in a file
+/// carrying a `Match exec` (Issue #43 risk #1). Syntax-only; never opens the file.
+pub fn has_include(config_text: &str) -> bool {
+    for line in config_text.lines() {
+        let line = line.trim_start();
+        if line.starts_with('#') {
+            continue;
+        }
+        let normalized = line.replace('"', "").replace('=', " ");
+        if normalized
+            .split_whitespace()
+            .next()
+            .is_some_and(|w| w.eq_ignore_ascii_case("Include"))
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Why the effective-config inspector (#43) must NOT run `ssh -G` for this
 /// config, or `None` if it is safe to. `ssh -G` executes any `Match exec`
 /// predicate, so it is refused fail-safe when the config could trigger one:
-/// a `Match exec` in the main file, OR ANY `Include` — whose target this scan
+/// a `Match exec` in the config, OR ANY `Include` — whose target this scan
 /// cannot see and which could itself carry a `Match exec` (Issue #43 risk #1).
-/// The `Match exec` reason takes precedence when both hold. `include_count` is
-/// the caller's `SshConfig::include_count()`.
-pub fn inspect_block_reason(config_text: &str, include_count: usize) -> Option<&'static str> {
+/// Both checks scan the rendered text with matching normalization (see
+/// [`has_include`]) so quote-spliced / nested forms cannot slip past. The
+/// `Match exec` reason takes precedence when both hold.
+pub fn inspect_block_reason(config_text: &str) -> Option<&'static str> {
     if has_match_exec(config_text) {
         Some("host config uses `Match exec` — ssh -G would run it; inspector skipped")
-    } else if include_count > 0 {
+    } else if has_include(config_text) {
         Some("config uses `Include` — can't verify Match exec safety; inspector skipped")
     } else {
         None
@@ -786,22 +813,57 @@ identityfile ~/.ssh/id_rsa
         // execute a `Match exec` predicate: directly in the main file, OR hidden
         // behind ANY `Include` (whose target the main-file scan cannot see).
         assert!(
-            inspect_block_reason("Match exec \"cmd\"\nHost a\n", 0).is_some(),
+            inspect_block_reason("Match exec \"cmd\"\nHost a\n").is_some(),
             "a main-file Match exec must block"
         );
         assert!(
-            inspect_block_reason("Host a\n  HostName 1.2.3.4\n", 1).is_some(),
-            "any Include must block (Match exec could hide inside it)"
+            inspect_block_reason("Include ~/.ssh/more\nHost a\n").is_some(),
+            "a top-level Include must block"
+        );
+        // Block-NESTED Include: ssh -G honors conditional includes inside a
+        // matching block, but the parser's `include_count()` (top-level only)
+        // missed this — the bypass the text scan closes.
+        assert!(
+            inspect_block_reason("Host web\n  HostName 1.2.3.4\n  Include ~/.ssh/extra\n")
+                .is_some(),
+            "a block-nested Include must block (ssh -G still processes it)"
+        );
+        // Quote-spliced keyword: ssh splices the quotes to `Include`; a
+        // parser-classification gate misses it, a normalized text scan catches it.
+        assert!(
+            inspect_block_reason("\"Include\" ~/.ssh/more\n").is_some(),
+            "a quote-decorated Include keyword must block"
         );
         assert!(
-            inspect_block_reason("Host a\n  HostName 1.2.3.4\n", 0).is_none(),
+            inspect_block_reason("Host a\n  HostName 1.2.3.4\n").is_none(),
             "plain config with no Match exec and no Include is safe"
         );
-        let both =
-            inspect_block_reason("Match exec \"cmd\"\n", 2).expect("Match exec present must block");
+        assert!(
+            inspect_block_reason("# Include ~/.ssh/more\nHost a\n").is_none(),
+            "a commented Include must not block"
+        );
+        let both = inspect_block_reason("Match exec \"cmd\"\nInclude ~/.ssh/x\n")
+            .expect("Match exec present must block");
         assert!(
             both.contains("Match exec"),
             "when both hold, the message names the exec risk first"
         );
+    }
+
+    #[test]
+    fn detects_include_quoted_nested_and_equals() {
+        // Mirrors `has_match_exec`'s robustness: quote-splice, `=` separator,
+        // casing, and indentation (block-nested) are all caught; comments and
+        // value/name occurrences of "include" are not.
+        assert!(has_include("Include ~/.ssh/conf.d/*\n"));
+        assert!(has_include("  Include ~/.ssh/more\n")); // indented / block-nested
+        assert!(has_include("include ~/.ssh/more\n")); // case-insensitive
+        assert!(has_include("\"Include\" ~/.ssh/more\n")); // quote-spliced keyword
+        assert!(has_include("Inc\"lude\" ~/.ssh/more\n")); // mid-token splice
+        assert!(has_include("Include=~/.ssh/more\n")); // `=` separator
+        assert!(!has_include("# Include ~/.ssh/more\n")); // commented
+        assert!(!has_include("Host include-server\n  HostName x\n")); // name, not keyword
+        assert!(!has_include("IdentityFile ~/Include/key\n")); // value path, not keyword
+        assert!(!has_include(""));
     }
 }

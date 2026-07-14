@@ -2342,6 +2342,30 @@ mod tests {
     }
 
     #[test]
+    fn clamp_inspect_selection_shrinks_to_last_row_or_none() {
+        // #43: when the filter narrows below the current selection, the
+        // selection must clamp to the new last index (or clear when empty).
+        let mut app = app_fixture("Host a\n  HostName 1.2.3.4\n");
+        app.inspect_rows = vec![
+            ("hostname".to_string(), "10.0.0.5".to_string()),
+            ("user".to_string(), "deploy".to_string()),
+            ("port".to_string(), "2222".to_string()),
+        ];
+
+        // Select the last row, then narrow the filter to a single match: the
+        // selection clamps to the new last index (0).
+        app.inspect_state.select(Some(2));
+        app.inspect_search = "user".to_string();
+        app.clamp_inspect_selection();
+        assert_eq!(app.inspect_state.selected(), Some(0));
+
+        // A filter matching nothing clears the selection.
+        app.inspect_search = "zzz".to_string();
+        app.clamp_inspect_selection();
+        assert_eq!(app.inspect_state.selected(), None);
+    }
+
+    #[test]
     fn sort_mode_cycles_through_all_and_wraps() {
         let mut m = SortMode::default();
         assert_eq!(m, SortMode::Config);

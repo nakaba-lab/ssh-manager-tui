@@ -3017,7 +3017,7 @@ fn handle_known_hosts(app: &mut App, key: KeyEvent) {
 fn open_inspect(app: &mut App) {
     let Some(h) = app.selected_host() else { return };
     let alias = app.hosts[h].alias().to_string();
-    if let Some(reason) = inspect_block_reason(&app.config.render(), app.config.include_count()) {
+    if let Some(reason) = inspect_block_reason(&app.config.render()) {
         app.toast(reason, true);
         return;
     }
