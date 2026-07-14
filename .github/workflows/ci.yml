@@ -20,7 +20,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       # Edition 2024 needs a recent toolchain; stable on GitHub runners is well
       # ahead of the MSRV pinned in Cargo.toml (rust-version = "1.94").
@@ -52,7 +52,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       # Surface RUSTSEC advisories / yanked crates in the dependency graph — the
       # vault's crypto stack (argon2, chacha20poly1305, zeroize, getrandom) is the
