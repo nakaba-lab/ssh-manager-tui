@@ -29,12 +29,21 @@ flowchart TD
 
 ## 秘密の解放判断（認可の代替＝単一ユーザーのため役割表ではなく解放条件表）
 
-| 条件 | 要求 | 不成立時 |
-|------|------|---------|
-| OpenSSH クライアントが `System32\OpenSSH` 由来か | `is_system32`（`GetSystemDirectoryW` で解決） | 解放しない |
-| プロンプトの分類（パスワード / パスフレーズ） | `SecretKind` に一致 | 解放しない |
-| 解決した identity（`ssh -G`）と vault エントリの束縛 | 一致 | 解放しない |
-| セッションのユーザー同意（オートフィル opt-in） | `prefs` の consent | 解放しない |
+**共通ゲート（password・passphrase の両方に必須。1 つでも不成立なら解放しない）:**
+
+| 条件 | 要求 |
+|------|------|
+| OpenSSH クライアントが `System32\OpenSSH` 由来か | `is_system32`（`GetSystemDirectoryW` で解決） |
+| プロンプトの分類（password / passphrase） | `SecretKind` に一致 |
+| 解決した identity（`ssh -G`）と vault エントリの束縛 | 一致 |
+| vault がアンロック済みか | マスターパスワードで復号済み |
+
+**種別ごとの consent（`decide()` の分岐。ここが password と passphrase で異なる）:**
+
+| 秘密の種別 | consent 要求 | 実装 |
+|-----------|------------|------|
+| **ログインパスワード** | **2 層 consent（両方必須）**: ①永続 opt-in（`prefs.rs` の `password_autofill_enabled`）＋②per-target 同意（`update.rs` の `confirmed_password_targets` モーダル承認）。加えて override のユーザー変更ガード・OpenSSH<8.5 分離・`Match exec` degrade 等の password 固有ゲート | `prefs.rs` / `update.rs` / `askpass.rs` |
+| **鍵パスフレーズ** | **consent 非依存＝ローカル限定で常時有効**（`askpass.rs`「passphrase auto-fill is local-only and stays enabled」）。opt-in を見ず、identity 一致と per-path single-shot のみ判定 | `askpass.rs` の `decide()` Passphrase 分岐 |
 
 ## 暗号設計（vault）
 

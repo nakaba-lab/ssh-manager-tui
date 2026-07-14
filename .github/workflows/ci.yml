@@ -23,7 +23,7 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       # Edition 2024 needs a recent toolchain; stable on GitHub runners is well
-      # ahead of the minimum, and Cargo.toml pins no rust-version/MSRV.
+      # ahead of the MSRV pinned in Cargo.toml (rust-version = "1.94").
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
@@ -38,11 +38,12 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
-      # The test suite is pure: every #[cfg(test)] module exercises parsing /
-      # arg-building only (parse_fingerprint_line, build_ssh_args, parse_line,
-      # config round-trip), so no test spawns ssh / ssh-keygen / wt at runtime.
-      # OpenSSH is preinstalled on both runners anyway (ubuntu: openssh-client;
-      # windows: bundled OpenSSH client) if that ever changes.
+      # Most #[cfg(test)] modules are pure (parsing / arg-building). A few DO
+      # spawn real OpenSSH at runtime — os::resolve tests run `ssh -G` and
+      # `ssh-keygen -H` — which is why OpenSSH must be on the runner (ubuntu:
+      # openssh-client; windows: bundled OpenSSH client). Those ssh-spawning
+      # tests can flake (e.g. `ssh -G` timing out on a cold Windows runner);
+      # re-run the job or harden them (nextest --retries / #[ignore]).
       - name: Test
         run: cargo test --all
 

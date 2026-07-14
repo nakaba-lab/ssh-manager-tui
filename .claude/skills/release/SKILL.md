@@ -61,7 +61,7 @@ Distribution facts (see the `distribution-setup` memory):
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 cargo test --all
-cargo deny check advisories bans sources   # release.yml's "quality gate" runs this
+cargo deny check   # release.yml's "quality gate" runs this (all checks incl. licenses)
 ```
 
 **Run `cargo deny` locally — `release.yml`'s quality gate runs it, and a NEW RUSTSEC

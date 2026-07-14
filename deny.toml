@@ -7,7 +7,7 @@ ignore = []
 # ここに無いライセンス（GPL/AGPL/LGPL 等の強コピーレフト含む）が混入すると
 # `cargo deny check licenses` が fail する（納品・再配布の互換性を守る）。
 # 現在の allow は実ツリーで使われている permissive 群 + weak-copyleft の MPL-2.0
-# （nucleo-matcher が MPL-2.0。ファイル単位の弱コピーレフトで、改変しない限り
+# （MPL-2.0 は nucleo-matcher と option-ext の 2 クレート。ファイル単位の弱コピーレフトで、改変しない限り
 # permissive 配布と両立するため受容）。新しい permissive ライセンスの依存が増えたら
 # ここに追記する（追記＝意図的なライセンス受容の記録）。
 [licenses]

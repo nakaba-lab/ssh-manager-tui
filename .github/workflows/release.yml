@@ -35,7 +35,7 @@ jobs:
         # and broke EVERY release until bumped to `^0.19`. Re-check on each major.
         run: cargo install cargo-audit --version "^0.22" --locked && cargo install cargo-deny --version "^0.19" --locked
       - run: cargo audit
-      - run: cargo deny check advisories bans sources
+      - run: cargo deny check
 
   release:
     name: release (${{ matrix.target }})

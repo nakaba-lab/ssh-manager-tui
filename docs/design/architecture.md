@@ -82,8 +82,9 @@ sequenceDiagram
     UP->>CFG: apply_view で行粒度に mutate
     UP->>CFG: render(diff プレビュー)
     U->>UP: 差分を確認して保存承認
+    CFG->>FS: 既存を .bak にコピー（セッション初回のみ・temp 書込の前）
     CFG->>SF: O_EXCL 一時ファイルに書き込み・fsync
-    SF->>FS: fs::rename で原子置換（.bak を一度だけ作成）
+    SF->>FS: 原子置換（Windows 上書き=ReplaceFileW／初回作成・unix=fs::rename）
     FS-->>U: 変更行のみ書き換わり他はバイト単位で保持
 ```
 

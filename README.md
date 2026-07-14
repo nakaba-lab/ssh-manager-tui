@@ -294,10 +294,11 @@ On top of that:
 - **A backup on first save** — the previous file is copied to `config.bak` the first
   time you save in a session.
 - **Atomic writes** — a save is written to an unpredictable, owner-private temp file
-  (`O_EXCL`) and then renamed over the target in **one** operation, so there is no
-  delete-before-rename window and no orphan is left behind. The temp file and its parent
-  directory are fsynced; permissions are `0o600` on Unix and an owner-only ACL on
-  Windows.
+  (`O_EXCL`), then swapped over the target atomically (no delete-before-rename window, no
+  orphan). On Windows the overwrite uses `ReplaceFileW` — it preserves the destination's
+  existing ACL, which is then re-tightened to owner-only; first-time creation and Unix
+  use `rename`. The temp file and its parent directory are fsynced; permissions are
+  `0o600` on Unix and an owner-only ACL on Windows.
 - **Private keys are never read or displayed** — only key *paths* are passed to `ssh`
   via `-i`.
 - **Validation before write** — a missing alias, a non-numeric port, or a value
@@ -330,8 +331,8 @@ care includes:
 - preferring `System32\OpenSSH` over a `PATH` `ssh` that would interpret the config
   differently,
 - acting only on key **press** events (the Windows console also emits key-up),
-- a Windows-safe atomic save that replaces the destination in a single rename
-  (`MoveFileExW` + `REPLACE_EXISTING`, no delete-before-rename window), and
+- a Windows-safe atomic overwrite via `ReplaceFileW` (which preserves and then
+  re-tightens the destination ACL; first-time creation falls back to `rename`), and
 - correct `wt.exe` argument escaping for the new-tab connect.
 
 ## Architecture
@@ -363,9 +364,11 @@ cargo fmt --all
 cargo deny check                # advisory + license + supply-chain gate (deny.toml)
 ```
 
-The test suite is headless and pure — no test spawns `ssh`, `ssh-keygen`, or `wt`. When
-manually testing save behavior, always point `--config` at a throwaway file: the app
-writes to whatever path it is given.
+The test suite is mostly headless, but a few tests spawn real OpenSSH (`os::resolve`
+runs `ssh -G` / `ssh-keygen -H`), so OpenSSH must be on `PATH` — those tests can flake on
+a cold Windows runner, so re-run the job if one times out. When manually testing save
+behavior, always point `--config` at a throwaway file: the app writes to whatever path it
+is given.
 
 ### Development workflow
 

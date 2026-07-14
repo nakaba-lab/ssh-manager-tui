@@ -23,9 +23,7 @@
   "protectedGlobs": [],
   "frontendDir": "none",
   "frontendDirs": [],
-  "checks": [
-    { "match": "**/*.rs", "command": "cargo check", "cwdFromRoot": true, "timeout": 180 }
-  ],
+  "checks": [],
   "services": [],
   "commitMessage": {
     "enabled": true,

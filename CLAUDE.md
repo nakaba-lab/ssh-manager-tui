@@ -218,11 +218,11 @@ ultracode 等で **Workflow ツール（fan-out オーケストレーション�
 | `design-doc-check` | 設計書規律（feat/fix の PR/MR で `docs/design/` 更新を要求）。要件定義書の必須節チェック（`requirements-doc-check`・警告のみ）と `kind: ui` 設計書の「UI/画面設計」節チェック（`ui-section-check`）のジョブも同居 | 有効 |
 | `secret-scan`（GitHub: `.github/workflows/secret-scan.yml`／GitLab: `.gitlab/ci/secret-scan.yml`） | 秘密情報（API キー・トークン等）のコミット混入を gitleaks で検出（スキャン範囲・誤検知の逃がし・多段ガードの正は `.claude/rules/operations.md`「秘密情報の管理」） | 有効（検出のみ fail。gitleaks 取得失敗等の環境問題は警告して成功） |
 | `docs-deploy`（GitHub）／`pages`（GitLab） | `docs/` の Pages 公開＋設計書スキーマ検証（ビルド成功条件） | 有効 |
-| `app-test` | アプリのテスト/Lint/ビルド（profile の `commands` を実行）＋ feat/fix の PR/MR にテストの追加・更新を必須化（`test-required` ジョブ。逃がしは PR/MR 本文の `Test: none` 行か `test:none` ラベル） | `commands` が空のうちは安全に no-op |
-| `release-deploy`（GitHub: `release-deploy.yml`／GitLab: `.gitlab/ci/deploy.yml`） | タグ push（`v*`）起点のデプロイ雛形（build→deploy→smoke。デプロイ先依存の中身はコメント雛形） | `commands.deploy` が空のうちは no-op |
+| `ci`（`.github/workflows/ci.yml`・**プロジェクト独自**） | fmt → clippy → test を ubuntu + windows マトリクスで実行 ＋ cargo audit（テンプレの `app-test.yml` は ci.yml と重複＋`test-required` が inline `#[cfg(test)]` テスト非対応のため削除済み） | 有効（`[main, develop]`） |
+| `release`（`.github/workflows/release.yml`・**プロジェクト独自**） | `v*` タグ起点のリリースビルド → GitHub Release（fmt/clippy/test/audit/`cargo deny check` のゲート込み。テンプレの `release-deploy.yml` は重複のため削除済み） | 有効 |
 | Dependabot（`.github/dependabot.yml`・GitHub のみ） | 依存更新の自動 PR（実効エントリは `docs-site`（npm）と同梱 CI（github-actions）。スタック分はコメント例から有効化。GitLab は Renovate／Dependency Scanning を案内） | `docs-site`・github-actions が有効 |
 
-`app-test`／`release-deploy` は **`/project-setup` が `commands` 確定時に有効化**する（言語セットアップのコメント雛形を整える。不要なら削除する——GitLab はルート `.gitlab-ci.yml` の該当 `include` 行も外す）。
+このプロジェクトはテンプレの `app-test.yml`・`release-deploy.yml` を削除し、既存の `ci.yml`（fmt/clippy/test/audit）・`release.yml`（`v*` タグ起点）を使う。discipline 系（`design-doc-check`・`secret-scan`・`docs-deploy`）は同梱のまま保持している。
 
 ---
 
@@ -277,7 +277,7 @@ ultracode 等で **Workflow ツール（fan-out オーケストレーション�
 | 依存監査 | `cargo audit`（RUSTSEC）／`cargo deny check`（サプライチェーンゲート。設定 `deny.toml`） |
 
 - **push 前に CI の 3 ゲートを合わせる**（CI は Linux **と** Windows で回す）: `cargo fmt --all -- --check`・`cargo clippy --all-targets -- -D warnings`・`cargo test --all`。CI 実体は `.github/workflows/ci.yml`（fmt → clippy → test → audit）。
-- テストは**純粋**（parse / arg-building のみを検証し、実行時に `ssh`・`ssh-keygen`・`sftp`・`wt` を spawn しない）ため、ヘッドレスで完走する。
+- テストの**大半は純粋**（parse / arg-building のみ）だが、**一部は実 OpenSSH を spawn する**（`os::resolve` のテストが `ssh -G`・`ssh-keygen -H` を実行するため CI ランナーに OpenSSH が要る）。この ssh 起動テストは cold な Windows ランナーで稀にタイムアウトしてフレークする（再実行か hardening が要る＝下記「落とし穴」）。
 - OpenSSH（`ssh`・`ssh-keygen`）が `PATH` にあること。新規タブ接続には追加で `wt.exe` が要る。
 - **編集/保存の挙動を手で試すときは必ず `--config` を使い捨てファイルに向ける**（アプリは渡されたパスへそのまま書き込む）。`scratch-config` スキルがこの使い捨て config を作る。
 - **リリースは利用者起動の `/release` ランブック**（`.claude/skills/release/SKILL.md`: version bump → quality gates → release build → git tag → GitHub release）。副作用があり **user-only**（無断で走らせない。配布セットアップは crates.io=`sshm-tui`／Scoop・winget は `packaging/`）。
@@ -339,7 +339,7 @@ ultracode 等で **Workflow ツール（fan-out オーケストレーション�
 
 - **バイナリ解決**（`os/binaries.rs`）: `PATH` の素の `ssh` より `System32\OpenSSH` を優先する（Git/MSYS の `ssh` は `~/.ssh/config`・`-J`・forwards の解釈が異なるため）。フォールバック使用時は `[PATH ssh]` 警告を出す。
 - **キーイベント**: Windows コンソールは key-down と key-up の両方を出すため、`event_loop.rs` は `KeyEventKind::Press` だけに反応する（二重入力回避）。
-- **原子保存**（`writer.rs`）: `secure_fs` の O_EXCL 一時ファイルへ書いてから `fs::rename(tmp, path)` で**1 回の OS 操作として原子的に置換**する（delete-before-rename の窓なし・孤児残骸なし＝#4。unix でも `fs::rename` は既に原子的、Windows でも `MoveFileExW`+`REPLACE_EXISTING` で既存ファイルを原子置換するので remove-first は入れない）。owner-only 権限は Windows=`restrict_acl`／unix=`0o600`、親ディレクトリを fsync。
+- **原子保存**（`writer.rs`）: `secure_fs` の O_EXCL 一時ファイルへ書いてから宛先へ原子的に差し替える（delete-before-rename の窓なし・孤児残骸なし）。**Windows の上書き〔宛先が既存＝主経路〕は `ReplaceFileW`**（宛先の既存 ACL を保存するため。差し替え後に `restrict_acl` で owner-only を再付与＝#3）、**初回作成と unix は `fs::rename`**（unix でも rename は原子的）。owner-only 権限は Windows=`restrict_acl`／unix=`0o600`、親ディレクトリを fsync。保存前に一度だけ `.bak`（セッション初回のバックアップ）を作る。
 - **`wt.exe` エスケープ**（`os/connect.rs` の `escape_wt_arg`）: 空白でクオート・`;` をエスケープ・埋め込み `"` を二重化・バックスラッシュはそのまま。
 - **クロスプラットフォーム clippy**: CI は `cargo clippy --all-targets -- -D warnings` を Linux **と** Windows で回す。`#[cfg(windows)]` からしか参照されないシンボル（`find_wt`・`escape_wt_arg` 等）は Linux ビルドで `dead_code`/`unused_imports` を踏む（Windows のみのローカル clippy では見えない）。使用箇所に `#[cfg(windows)]`（テストも使うなら `#[cfg(any(windows, test))]`）でゲートする。
 
