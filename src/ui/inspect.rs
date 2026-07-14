@@ -57,7 +57,7 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
                         .fg(theme::ACCENT2)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(v.clone(), Style::default().fg(theme::TEXT)),
+                Span::styled(v.as_str(), Style::default().fg(theme::TEXT)),
             ]))
         })
         .collect();
