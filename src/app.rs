@@ -837,6 +837,17 @@ fn friendly_sftp_error(msg: &str, auth_failure: bool) -> String {
     }
 }
 
+/// Source of a host in the flattened [`App::hosts`] list. A `Main` host lives in
+/// the editable main config (indexed into `config.items`); an `Included` host is
+/// a **read-only** projection from an `Include`d file (indexed into
+/// [`App::included`]). Only `Main` reaches the surgical writer, so the type makes
+/// an included host structurally uneditable (#52).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostRef {
+    Main(usize),
+    Included(usize),
+}
+
 pub struct App {
     pub should_quit: bool,
     pub screen: Screen,
@@ -845,8 +856,12 @@ pub struct App {
     // --- config domain ---
     pub config: SshConfig,
     pub hosts: Vec<HostView>,
-    /// `config.items` index for each entry in `hosts`.
-    pub host_items: Vec<usize>,
+    /// Source (main-config item index, or read-only include) for each `hosts`
+    /// entry. `hosts` lists main hosts first, then read-only included hosts.
+    pub host_items: Vec<HostRef>,
+    /// Read-only hosts expanded from `Include`d files (#52), forming the tail of
+    /// `hosts`. Rebuilt by [`App::rebuild_hosts`]; never written back.
+    pub included: Vec<crate::config::includes::IncludedHost>,
 
     // --- S1 list ---
     pub focus: ListFocus,
@@ -984,6 +999,7 @@ impl App {
             config,
             hosts: Vec::new(),
             host_items: Vec::new(),
+            included: Vec::new(),
             focus: ListFocus::Hosts,
             list_state: TableState::default(),
             detail_scroll: 0,
@@ -1066,9 +1082,26 @@ impl App {
     /// Liveness is keyed by host index, which can shift when hosts are added or
     /// removed, so clear it here; callers re-probe afterwards.
     pub fn rebuild_hosts(&mut self) {
-        let views = self.config.host_views();
-        self.host_items = views.iter().map(|(i, _)| *i).collect();
-        self.hosts = views.into_iter().map(|(_, v)| v).collect();
+        // Read-only expansion of `Include`d files (#52): re-expand so the list
+        // reflects the current main file. Main hosts come first (editable), then
+        // the read-only included hosts as the tail of `hosts`.
+        self.included = self.expand_includes().hosts;
+
+        let main_views = self.config.host_views();
+        let total = main_views.len() + self.included.len();
+        let mut hosts = Vec::with_capacity(total);
+        let mut host_items = Vec::with_capacity(total);
+        for (item_index, view) in main_views {
+            host_items.push(HostRef::Main(item_index));
+            hosts.push(view);
+        }
+        for (k, inc) in self.included.iter().enumerate() {
+            host_items.push(HostRef::Included(k));
+            hosts.push(inc.view.clone());
+        }
+        self.hosts = hosts;
+        self.host_items = host_items;
+
         self.liveness.clear();
         self.rtt.clear();
         // A host edit can change what a confirmed target resolves to, so the
@@ -1076,6 +1109,50 @@ impl App {
         self.confirmed_password_targets.clear();
         self.refilter();
         self.clamp_selection();
+    }
+
+    /// Expand the main config's `Include` directives (read-only, #52). Relative
+    /// includes resolve against the main config's directory (OpenSSH's `~/.ssh`);
+    /// `home` only drives tilde expansion, so a missing home must not skip
+    /// expansion of relative/absolute includes.
+    fn expand_includes(&self) -> crate::config::includes::Expansion {
+        let home = dirs::home_dir().unwrap_or_default();
+        let base_dir = self
+            .config
+            .path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| home.join(".ssh"));
+        crate::config::includes::expand(&self.config, &base_dir, &home)
+    }
+
+    /// Whether connect-time secret **autofill must be withheld** because the
+    /// effective config — the main file **and** every `Include`d file `ssh -G`
+    /// would read (#52) — either carries a `Match exec` (which `ssh -G` would
+    /// execute) or uses an include form we cannot fully scan (block-nested /
+    /// quote-spliced / past `MAX_DEPTH`). It **fails safe**: an un-scannable
+    /// include is treated as unsafe rather than assumed clean. Re-expands at call
+    /// time so an externally-modified include is re-scanned before each connect
+    /// (autofill is off the hot path, so the extra read is fine).
+    pub fn autofill_config_unsafe(&self) -> bool {
+        if crate::os::resolve::has_match_exec(&self.config.render()) {
+            return true;
+        }
+        let expansion = self.expand_includes();
+        expansion.blind_spot
+            || expansion
+                .texts
+                .iter()
+                .any(|t| crate::os::resolve::has_match_exec(t))
+    }
+
+    /// Sticky toast shown when an `Include`d host's edit/delete is refused — it is
+    /// read-only in sshm and its source file must be edited directly (#52).
+    pub fn toast_included_readonly(&mut self) {
+        self.toast(
+            "included host is read-only — edit its source file directly",
+            true,
+        );
     }
 
     /// The shared connect-time **candidacy** predicate: which secret kinds a host

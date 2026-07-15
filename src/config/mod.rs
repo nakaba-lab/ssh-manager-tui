@@ -5,6 +5,7 @@
 //! rendering + editing.
 
 pub mod diff;
+pub mod includes;
 pub mod model;
 pub mod parser;
 pub mod tokens;

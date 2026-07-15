@@ -16,7 +16,7 @@ use ratatui::crossterm::terminal::{
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::app::{
-    App, ConfirmAction, ConnectMode, EditForm, FormMode, GenOrigin, ListFocus,
+    App, ConfirmAction, ConnectMode, EditForm, FormMode, GenOrigin, HostRef, ListFocus,
     PasswordConfirmOrigin, PendingSave, PickOrigin, RekeyMode, SFTP_FIELDS, Screen, SftpBrowser,
     SftpDirection, SftpForm, SftpPane, VaultEntryForm, VaultRekey, VaultUnlock, form_from_view,
     form_idx, override_form_from_host, override_idx, overrides_from_form, read_local_dir,
@@ -36,8 +36,8 @@ use crate::os::connect::{
 use crate::os::keys::{generate_key, read_public_key};
 use crate::os::known_hosts::remove_entry;
 use crate::os::resolve::{
-    ResolvedConfig, has_match_exec, inspect_block_reason, is_host_known,
-    resolve_config_with_options, resolve_full, tofu_lookup_key,
+    ResolvedConfig, inspect_block_reason, is_host_known, resolve_config_with_options, resolve_full,
+    tofu_lookup_key,
 };
 use crate::os::sftp::{SftpOp, SftpSession, remote_join, remote_parent, sftp_quote, stage_batch};
 use crate::os::ssh_dir;
@@ -341,8 +341,12 @@ fn handle_list(app: &mut App, key: KeyEvent, terminal: &mut DefaultTerminal) -> 
         KeyCode::Char('a') => open_add(app),
         KeyCode::Char('d') => {
             if let Some(h) = app.selected_host() {
-                let item = app.host_items[h];
-                open_confirm(app, ConfirmAction::DeleteHost(item));
+                match app.host_items[h] {
+                    HostRef::Main(item) => open_confirm(app, ConfirmAction::DeleteHost(item)),
+                    // Include'd hosts are read-only (#52): refuse rather than risk a
+                    // delete against the wrong file.
+                    HostRef::Included(_) => app.toast_included_readonly(),
+                }
             }
         }
         KeyCode::Char('r') => app.refresh_all_liveness(),
@@ -692,15 +696,19 @@ fn connect_by_alias(
     let (host_has_match_exec, rc) = match cached_rc {
         Some(rc) => (false, Some(rc)),
         None => {
-            let mex = has_match_exec(&app.config.render());
+            // Withhold resolve/autofill when the effective config (main + every
+            // Include'd file) carries a `Match exec` OR uses an include form we
+            // cannot fully scan (block-nested / quote-spliced / too deep) — fail
+            // safe (#52), since `ssh -G` would honor what we can't verify.
+            let unsafe_cfg = app.autofill_config_unsafe();
             // Feed the override's resolution flags (user/port/identity/proxy/-o)
             // to `ssh -G` so the resolved target, identity and TOFU key reflect
             // the *effective* connection, not the saved config.
             let opts = resolve_options(&ov);
-            let rc = (!mex)
+            let rc = (!unsafe_cfg)
                 .then(|| resolve_config_with_options(&opts, alias).ok())
                 .flatten();
-            (mex, rc)
+            (unsafe_cfg, rc)
         }
     };
     let resolved = rc.is_some();
@@ -1122,9 +1130,13 @@ fn open_edit(app: &mut App) {
     let Some(idx) = app.selected_host() else {
         return;
     };
+    // Only main-config hosts are editable; an Include'd host is read-only (#52).
+    let HostRef::Main(item) = app.host_items[idx] else {
+        app.toast_included_readonly();
+        return;
+    };
     let view = app.hosts[idx].clone();
     app.form = form_from_view(&view);
-    let item = app.host_items[idx];
     app.screen = Screen::Edit {
         editing: Some(item),
     };
@@ -1533,8 +1545,15 @@ fn set_identity_for_host(app: &mut App) {
         return;
     }
     let id_path = tildify(&k.private_path());
-    let Some(&item) = app.host_items.get(host_idx) else {
-        return;
+    let item = match app.host_items.get(host_idx).copied() {
+        Some(HostRef::Main(i)) => i,
+        // An Include'd host is read-only; writing its IdentityFile would target
+        // the wrong file (#52).
+        Some(HostRef::Included(_)) => {
+            app.toast_included_readonly();
+            return;
+        }
+        None => return,
     };
     let mut view = app.hosts[host_idx].clone();
     view.identity_files = vec![id_path.clone()];
@@ -1996,7 +2015,9 @@ fn sftp_arm_gate(app: &App, host: &HostView, alias: &str) -> Option<SftpArmGate>
         return None;
     }
     let candidacy = app.vault_secret_kinds(host)?;
-    if has_match_exec(&app.config.render()) {
+    // Fail safe: a `Match exec` or an un-scannable include form (#52) means
+    // `ssh -G` could execute a predicate, so don't arm a secret here.
+    if app.autofill_config_unsafe() {
         return None;
     }
     let rc = resolve_config_with_options(&[], alias).ok()?;
@@ -3810,10 +3831,14 @@ fn handle_action_menu(
             match sel {
                 // Delete opens its confirm WHILE the action menu is still the
                 // current screen, so cancelling the confirm returns to the menu.
-                action_idx::DELETE => {
-                    let item = app.host_items[host_idx];
-                    open_confirm(app, ConfirmAction::DeleteHost(item));
-                }
+                action_idx::DELETE => match app.host_items[host_idx] {
+                    HostRef::Main(item) => open_confirm(app, ConfirmAction::DeleteHost(item)),
+                    // Include'd hosts are read-only (#52): close the menu and refuse.
+                    HostRef::Included(_) => {
+                        close_overlay(app);
+                        app.toast_included_readonly();
+                    }
+                },
                 _ => {
                     close_overlay(app);
                     match sel {
@@ -4970,6 +4995,125 @@ mod tests {
         (app, path)
     }
 
+    /// Build an app over a scratch main config plus one `Include`d file next to it
+    /// (the main body should reference `include_name`). Returns `(app, dir)`.
+    fn app_with_include(
+        main_body: &str,
+        include_name: &str,
+        include_body: &str,
+    ) -> (App, std::path::PathBuf) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("sshm-inc-upd-{}-{}", std::process::id(), n));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(include_name), include_body).unwrap();
+        let path = dir.join("config");
+        std::fs::write(&path, main_body).unwrap();
+        let app = App::new(path).expect("App::new over scratch config with include");
+        (app, dir)
+    }
+
+    #[test]
+    fn included_host_is_listed_but_edit_is_refused() {
+        // #52 AC1/AC2/AC7: an Include'd host appears in the list, is classified
+        // Included in host_items, and open_edit refuses it (stays on List with a
+        // sticky toast) — the surgical writer path never targets an included file.
+        let (mut app, dir) = app_with_include(
+            "Include extra.conf\n\nHost main-host\n    HostName 1.1.1.1\n",
+            "extra.conf",
+            "Host inc-host\n    HostName 9.9.9.9\n",
+        );
+
+        let inc_row = app
+            .hosts
+            .iter()
+            .position(|h| h.alias() == "inc-host")
+            .expect("included host is listed");
+        let main_row = app
+            .hosts
+            .iter()
+            .position(|h| h.alias() == "main-host")
+            .expect("main host is listed");
+        assert!(matches!(app.host_items[inc_row], HostRef::Included(_)));
+        assert!(matches!(app.host_items[main_row], HostRef::Main(_)));
+
+        // Selecting the included host and editing must be refused.
+        let disp = app.filtered.iter().position(|&hi| hi == inc_row).unwrap();
+        app.list_state.select(Some(disp));
+        open_edit(&mut app);
+        assert_eq!(
+            app.screen,
+            Screen::List,
+            "included host edit must be refused"
+        );
+        assert!(app.toast.is_error, "a sticky read-only toast is shown");
+
+        // The main host still edits normally.
+        let disp_main = app.filtered.iter().position(|&hi| hi == main_row).unwrap();
+        app.list_state.select(Some(disp_main));
+        open_edit(&mut app);
+        assert!(matches!(app.screen, Screen::Edit { editing: Some(_) }));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn autofill_unsafe_on_match_exec_in_included_file() {
+        // #52 AC6: a `Match exec` hiding in an Include'd file makes the autofill
+        // gate refuse, even though the main file has none.
+        let (app, dir) = app_with_include(
+            "Include danger.conf\n\nHost main-host\n    HostName 1.1.1.1\n",
+            "danger.conf",
+            "Match exec \"cmd\"\n    User bob\n",
+        );
+        assert!(
+            app.autofill_config_unsafe(),
+            "an included Match exec must be caught by the whole-config safety scan"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn autofill_unsafe_on_block_nested_include() {
+        // #52 conservative fail-safe (security regression): a `Match exec` behind a
+        // block-nested Include (which `ssh -G` honors but expand does not follow)
+        // must NOT slip past the autofill gate — the un-scannable include form
+        // itself trips the fail-safe.
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("sshm-inc-bn-{}-{}", std::process::id(), n));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("evil.conf"), "Match exec \"cmd\"\n    User me\n").unwrap();
+        let path = dir.join("config");
+        // The Include lives inside `Host *`'s body → not a top-level Item::Include.
+        std::fs::write(
+            &path,
+            "Host *\n    Include evil.conf\nHost prod\n    HostName 10.0.0.1\n",
+        )
+        .unwrap();
+        let app = App::new(path).unwrap();
+        assert!(
+            app.autofill_config_unsafe(),
+            "a block-nested include must trip the fail-safe even if we can't scan it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn autofill_safe_for_plain_top_level_include() {
+        // Negative: a plain top-level include with no Match exec keeps autofill
+        // available (the common config.d/* case is not over-blocked).
+        let (app, dir) = app_with_include(
+            "Include plain.conf\n\nHost main-host\n    HostName 1.1.1.1\n",
+            "plain.conf",
+            "Host inc\n    HostName 2.2.2.2\n",
+        );
+        assert!(!app.autofill_config_unsafe());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // The load-bearing guarantee: what the preview renders is byte-for-byte what
     // the commit writes, because both run the SAME `apply_pending`. If they ever
     // diverged (two hand-written apply paths), this catches it.
@@ -4977,7 +5121,9 @@ mod tests {
     fn apply_preview_matches_committed_bytes() {
         let (mut app, path) =
             app_fixture_on_disk("Host a\n    HostName old.example.com\n    User deploy\n");
-        let item = app.host_items[0];
+        let HostRef::Main(item) = app.host_items[0] else {
+            unreachable!("fixture host lives in the main config")
+        };
         let mut view = app.hosts[0].clone();
         view.host_name = Some("new.example.com".into());
         let pending = PendingSave::Apply {
@@ -5048,7 +5194,9 @@ mod tests {
     fn no_op_edit_previews_no_changes_and_skips_modal() {
         let (mut app, path) =
             app_fixture_on_disk("Host a\n    HostName 1.1.1.1\n    User deploy\n");
-        let item = app.host_items[0];
+        let HostRef::Main(item) = app.host_items[0] else {
+            unreachable!("fixture host lives in the main config")
+        };
         let view = app.hosts[0].clone(); // unchanged
         app.screen = Screen::Edit {
             editing: Some(item),
@@ -5080,7 +5228,9 @@ mod tests {
         // Someone edits the file behind our back.
         std::fs::write(&path, "Host a\n    HostName 9.9.9.9\n").unwrap();
 
-        let item = app.host_items[0];
+        let HostRef::Main(item) = app.host_items[0] else {
+            unreachable!("fixture host lives in the main config")
+        };
         let view = app.hosts[0].clone(); // form unchanged (still 1.1.1.1 in memory)
         app.screen = Screen::Edit {
             editing: Some(item),
@@ -5115,7 +5265,9 @@ mod tests {
     fn esc_cancels_preview_without_writing() {
         let (mut app, path) = app_fixture_on_disk("Host a\n    HostName 1.1.1.1\n");
         let before = std::fs::read_to_string(&path).unwrap();
-        let item = app.host_items[0];
+        let HostRef::Main(item) = app.host_items[0] else {
+            unreachable!("fixture host lives in the main config")
+        };
         let mut view = app.hosts[0].clone();
         view.host_name = Some("2.2.2.2".into());
         app.screen = Screen::Edit {
