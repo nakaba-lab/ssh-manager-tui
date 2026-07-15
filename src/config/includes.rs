@@ -93,7 +93,8 @@ pub fn expand(main: &SshConfig, base_dir: &Path, home: &Path) -> Expansion {
     for item in &main.items {
         match item {
             Item::Host(b) => {
-                if let Some(alias) = b.patterns.first() {
+                // Every pattern is an alias, so each can shadow a later duplicate.
+                for alias in &b.patterns {
                     seen.insert(alias.clone());
                 }
             }
@@ -196,7 +197,12 @@ fn read_included_file(
         match item {
             Item::Host(block) => {
                 let view = HostView::from_block(block);
+                // Shadow is judged on the primary alias (first pattern); the rest
+                // of the patterns still register so a later duplicate is caught.
                 let shadowed = !seen.insert(view.alias().to_string());
+                for alias in block.patterns.iter().skip(1) {
+                    seen.insert(alias.clone());
+                }
                 acc.hosts.push(IncludedHost {
                     origin: file.to_path_buf(),
                     view,
@@ -507,6 +513,27 @@ mod tests {
         assert!(
             expand(&main, &dir, &dir).blind_spot,
             "recursing past MAX_DEPTH is a blind spot"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn secondary_pattern_shadows_later_duplicate() {
+        // A multi-pattern host (`Host primary alt`) registers ALL its aliases, so a
+        // later include defining `alt` is flagged shadowed (OpenSSH first-wins).
+        let dir = temp_dir(".inc-multi-pat");
+        std::fs::write(
+            dir.join("a.conf"),
+            "Host primary alt\n    HostName 1.1.1.1\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("b.conf"), "Host alt\n    HostName 2.2.2.2\n").unwrap();
+        let main = parser::parse(dir.join("config"), "Include a.conf\nInclude b.conf\n");
+        let hosts = expand(&main, &dir, &dir).hosts;
+        let alt = hosts.iter().find(|h| h.view.alias() == "alt").unwrap();
+        assert!(
+            alt.shadowed,
+            "a later host duplicating a secondary alias is shadowed"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
