@@ -455,7 +455,17 @@ impl Vault {
     /// in-memory key diverged from disk, so the next entry save would re-encrypt
     /// under a key the file was never written with and lock the user out.
     pub fn rekey(&mut self, new_password: &str, path: &Path) -> Result<()> {
-        let new_params = KdfParams::default();
+        // Field-wise max of the vault's params and the current default: a weak
+        // vault is raised to default (the KDF upgrade), while a hand-hardened or
+        // cross-version vault stronger in any field is never downgraded — so a
+        // plain password change can only strengthen or hold the KDF, never weaken
+        // it (honoring the same "no downgrade" invariant as `needs_kdf_upgrade`).
+        let d = KdfParams::default();
+        let new_params = KdfParams {
+            m_cost: self.params.m_cost.max(d.m_cost),
+            t_cost: self.params.t_cost.max(d.t_cost),
+            p_cost: self.params.p_cost.max(d.p_cost),
+        };
         let new_salt = random_bytes(SALT_LEN)?;
         let new_key = derive_key(new_password, &new_salt, &new_params)?;
         // Swap the new material in, keeping the old for rollback. `mem::replace`
@@ -1141,5 +1151,62 @@ mod tests {
         );
 
         let _ = fs::remove_file(&blocker);
+    }
+
+    #[test]
+    fn rekey_never_downgrades_stronger_or_mixed_params() {
+        // A password change must strengthen-or-hold the KDF, never lower a field:
+        // otherwise changing the master password would silently downgrade a
+        // hand-hardened or cross-version vault (the very invariant
+        // `needs_kdf_upgrade` protects). rekey re-keys with the field-wise max of
+        // the vault's params and the current default.
+        let d = KdfParams::default();
+
+        // given a vault STRONGER than default in every field
+        let path = temp_vault_path("rekey-no-downgrade-stronger");
+        let mut v = Vault::create("pw").unwrap();
+        v.params = KdfParams {
+            m_cost: d.m_cost + 10_000,
+            t_cost: d.t_cost + 1,
+            p_cost: d.p_cost,
+        };
+        v.save(&path).unwrap();
+
+        // when the master password is changed
+        v.rekey("new-pw", &path).unwrap();
+
+        // then no field was lowered (the stronger values are retained)
+        let f: VaultFile = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            f.kdf.m_cost,
+            d.m_cost + 10_000,
+            "stronger m_cost must be held"
+        );
+        assert_eq!(f.kdf.t_cost, d.t_cost + 1, "stronger t_cost must be held");
+        assert_eq!(f.kdf.p_cost, d.p_cost);
+        let _ = fs::remove_file(&path);
+
+        // and a MIXED vault (weaker m_cost, stronger t_cost): the weak field is
+        // raised to default while the strong field is NOT downgraded.
+        let path2 = temp_vault_path("rekey-no-downgrade-mixed");
+        let mut v2 = Vault::create("pw").unwrap();
+        v2.params = KdfParams {
+            m_cost: MIN_M_COST,
+            t_cost: d.t_cost + 1,
+            p_cost: d.p_cost,
+        };
+        v2.save(&path2).unwrap();
+        v2.rekey("new-pw", &path2).unwrap();
+        let f2: VaultFile = serde_json::from_str(&fs::read_to_string(&path2).unwrap()).unwrap();
+        assert_eq!(
+            f2.kdf.m_cost, d.m_cost,
+            "weak m_cost must be upgraded to default"
+        );
+        assert_eq!(
+            f2.kdf.t_cost,
+            d.t_cost + 1,
+            "stronger t_cost must be held (no downgrade)"
+        );
+        let _ = fs::remove_file(&path2);
     }
 }

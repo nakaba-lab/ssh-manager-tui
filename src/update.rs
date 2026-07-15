@@ -100,6 +100,15 @@ fn rekey_change_should_proceed(new: &str, confirm: &str, current_verified: bool)
     current_verified && !new.is_empty() && new == confirm
 }
 
+/// Pure gate for the "upgrade KDF" rekey submit: proceed ONLY when the current
+/// password verified. Load-bearing because `rekey` re-encrypts under the *typed*
+/// password — dropping this guard would re-key the vault under a wrong/mistyped
+/// password and permanently lock the user out, yet every other test would still
+/// pass. Pinned like `rekey_change_should_proceed` so the guard can't vanish silently.
+fn rekey_upgrade_should_proceed(current_verified: bool) -> bool {
+    current_verified
+}
+
 /// The one-time password-confirm modal: Enter/`y` confirms (re-enter the connect
 /// arming the password), Esc/`n` declines (re-enter withholding it — passphrase
 /// still arms). The cached `rc` from the first pass is handed back so the re-entry
@@ -3164,7 +3173,10 @@ fn handle_vault(app: &mut App, key: KeyEvent) {
             if app.vault.as_ref().is_some_and(|v| v.needs_kdf_upgrade()) {
                 open_vault_rekey(app, RekeyMode::UpgradeKdf);
             } else {
-                app.toast("vault KDF is already at the current default", false);
+                app.toast(
+                    "vault KDF is already at or above the current default",
+                    false,
+                );
             }
         }
         KeyCode::Char('L') => {
@@ -3440,7 +3452,7 @@ fn submit_vault_rekey(app: &mut App) {
             }
         }
         RekeyMode::UpgradeKdf => {
-            if !verified {
+            if !rekey_upgrade_should_proceed(verified) {
                 app.vault_rekey.current.zeroize();
                 app.vault_rekey.cursor = 0;
                 app.toast("incorrect master password", true);
@@ -4211,6 +4223,15 @@ mod tests {
         assert!(!rekey_change_should_proceed("newpw", "different", true)); // confirm mismatch
         assert!(!rekey_change_should_proceed("", "", true)); // empty new password
         assert!(!rekey_change_should_proceed("newpw", "newpw", false)); // current not verified
+    }
+
+    #[test]
+    fn rekey_upgrade_gate() {
+        // The KDF-upgrade path re-keys under the TYPED current password, so a
+        // dropped verify guard would re-encrypt under a wrong password and lock the
+        // user out permanently — pin that the guard is verify-gated.
+        assert!(rekey_upgrade_should_proceed(true));
+        assert!(!rekey_upgrade_should_proceed(false)); // current password not verified
     }
 
     #[test]

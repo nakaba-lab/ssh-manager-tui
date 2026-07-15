@@ -51,7 +51,16 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
     };
 
     if vault.entries.is_empty() {
-        let block = panel("Passwords", true);
+        // Surface the KDF-upgrade nudge here too: an older vault emptied of all
+        // entries can still benefit from (and `u` still performs) a re-key.
+        let block = panel(
+            if vault.needs_kdf_upgrade() {
+                "Passwords  ·  older KDF (u: upgrade)"
+            } else {
+                "Passwords"
+            },
+            true,
+        );
         let lines = vec![
             Line::from(""),
             Line::from(Span::styled(
