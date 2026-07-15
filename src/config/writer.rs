@@ -394,23 +394,33 @@ fn reconcile_directive(
         .filter_map(|(i, r)| super::model::sshm_directive(&r.text, key).map(|_| i))
         .collect();
 
+    // Strict only-rewrite-on-change: when the block's current (first-wins)
+    // directive value already equals `desired`, touch nothing. Duplicates,
+    // hand-written valueless directives (`# sshm:tags`), and non-canonical
+    // formatting then round-trip byte-for-byte across an unrelated edit.
+    let already_current = match existing.first() {
+        Some(&first) => {
+            let rest = super::model::sshm_directive(&block.pre[first].text, key).unwrap_or("");
+            unchanged(rest)
+        }
+        None => desired.is_none(),
+    };
+    if already_current {
+        return;
+    }
+
     match desired {
+        // Value transitioned to absent: remove every owned directive line.
         None => {
             for &i in existing.iter().rev() {
                 block.pre.remove(i);
             }
         }
+        // Value actually changed: rewrite the first line canonically, and only
+        // now collapse any shadowed duplicates of the same directive.
         Some(val) => match existing.first() {
             Some(&first) => {
-                let is_unchanged = {
-                    let rest =
-                        super::model::sshm_directive(&block.pre[first].text, key).unwrap_or("");
-                    unchanged(rest)
-                };
-                if !is_unchanged {
-                    block.pre[first].text = format!("{indent}# sshm:{key} {val}");
-                }
-                // Drop any later duplicates of the same directive.
+                block.pre[first].text = format!("{indent}# sshm:{key} {val}");
                 for &i in existing[1..].iter().rev() {
                     block.pre.remove(i);
                 }
