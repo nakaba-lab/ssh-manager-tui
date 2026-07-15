@@ -178,6 +178,10 @@ pub struct HostView {
     pub dynamic_forwards: Vec<String>,
     /// Every other option line (keyword, value), order-preserving.
     pub extras: Vec<(String, String)>,
+    /// #45: host tags, parsed from a `# sshm:tags a,b` directive in [`HostBlock::pre`].
+    pub tags: Vec<String>,
+    /// #45: one-line host description, from a `# sshm:desc …` directive in `pre`.
+    pub description: Option<String>,
 }
 
 impl HostView {
@@ -239,8 +243,80 @@ impl HostView {
                 v.extras.push((opt.keyword.clone(), val));
             }
         }
+        // #45: second pass over the block's owned preceding comments (`pre`) for
+        // sshm metadata directives. Only `# sshm:` lines are surfaced; arbitrary
+        // third-party comments are left untouched (footgun avoidance). The first
+        // directive of each kind wins.
+        let mut have_tags = false;
+        let mut have_desc = false;
+        for c in &block.pre {
+            if !have_tags && let Some(rest) = sshm_directive(&c.text, "tags") {
+                v.tags = parse_sshm_tags(rest);
+                have_tags = true;
+            } else if !have_desc && let Some(rest) = sshm_directive(&c.text, "desc") {
+                v.description = Some(rest.trim().to_string());
+                have_desc = true;
+            }
+        }
         v
     }
+
+    /// Concatenated fuzzy-search haystack: patterns, HostName, User, and tags.
+    /// #45 folds tags into the existing `/` search rather than a separate filter.
+    pub fn search_haystack(&self) -> String {
+        format!(
+            "{} {} {} {}",
+            self.patterns.join(" "),
+            self.host_name.as_deref().unwrap_or(""),
+            self.user.as_deref().unwrap_or(""),
+            self.tags.join(" "),
+        )
+    }
+
+    /// Tags rendered as `#`-prefixed chips for the host list row (#45). Empty
+    /// string when the host has no tags.
+    pub fn tags_display(&self) -> String {
+        self.tags
+            .iter()
+            .map(|t| format!("#{t}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+/// Recognize a `# sshm:<key> <rest>` metadata directive in a raw comment line
+/// (#45). Indent- and `#`-spacing-independent; `sshm:` and `<key>` match
+/// case-insensitively. Returns the remainder after the key token (leading
+/// whitespace trimmed), or `None` when the line is not this directive — so only
+/// `# sshm:`-prefixed lines are ever treated as owned metadata.
+pub(crate) fn sshm_directive<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    /// Case-insensitive prefix strip. Only slices when the (ASCII) prefix
+    /// matched, so the split index is always a UTF-8 char boundary.
+    fn strip_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+        let n = prefix.len();
+        let b = s.as_bytes();
+        (b.len() >= n && b[..n].eq_ignore_ascii_case(prefix.as_bytes())).then(|| &s[n..])
+    }
+    let s = line.trim_start();
+    let s = s.strip_prefix('#')?;
+    let s = s.trim_start();
+    let s = strip_ci(s, "sshm:")?;
+    let s = strip_ci(s, key)?;
+    match s.chars().next() {
+        None => Some(""),
+        Some(c) if c.is_whitespace() => Some(s.trim_start()),
+        Some(_) => None, // e.g. `sshm:tagsX` is not the `tags` directive
+    }
+}
+
+/// Split a comma-separated tags string into trimmed, non-empty values (#45).
+/// Shared by the `# sshm:tags` directive parser and the edit form's Tags line so
+/// both honor the exact same grammar.
+pub(crate) fn parse_sshm_tags(rest: &str) -> Vec<String> {
+    rest.split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 #[cfg(test)]
@@ -290,6 +366,36 @@ mod proxied_tests {
     #[test]
     fn unrelated_extras_do_not_count() {
         assert!(!view_with_extra("ForwardAgent", "yes").is_proxied());
+    }
+
+    // --- #45: tags feed the fuzzy-search haystack and the list-row chips ---
+
+    #[test]
+    fn search_haystack_includes_tags() {
+        // #45 AC7: tags join the fuzzy-search haystack so `/` search matches them
+        // alongside patterns / HostName / User.
+        let v = HostView {
+            patterns: vec!["web".into()],
+            host_name: Some("10.0.0.1".into()),
+            user: Some("deploy".into()),
+            tags: vec!["prod".into(), "db".into()],
+            ..Default::default()
+        };
+        let hay = v.search_haystack();
+        for needle in ["web", "10.0.0.1", "deploy", "prod", "db"] {
+            assert!(hay.contains(needle), "haystack {hay:?} missing {needle:?}");
+        }
+    }
+
+    #[test]
+    fn tags_display_formats_hash_chips() {
+        // #45 AC6: the list row shows tags as `#`-prefixed chips; no tags -> empty.
+        assert_eq!(HostView::default().tags_display(), "");
+        let v = HostView {
+            tags: vec!["prod".into(), "db".into()],
+            ..Default::default()
+        };
+        assert_eq!(v.tags_display(), "#prod #db");
     }
 
     #[test]

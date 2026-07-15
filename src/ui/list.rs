@@ -80,12 +80,20 @@ fn draw_list_pane(f: &mut Frame, app: &mut App, area: Rect) {
         .filter_map(|&i| app.hosts.get(i).map(|h| (i, h)))
         .map(|(i, h)| {
             let state = app.liveness_by_index(i);
+            let mut alias_spans = vec![
+                secret_indicator_span(app, h),
+                Span::raw(h.alias().to_string()),
+            ];
+            // #45: tags as inline `#chip`s right of the alias, in the accent color.
+            if !h.tags.is_empty() {
+                alias_spans.push(Span::styled(
+                    format!("  {}", h.tags_display()),
+                    Style::default().fg(theme::ACCENT),
+                ));
+            }
             Row::new(vec![
                 Line::from(liveness_span(state)),
-                Line::from(vec![
-                    secret_indicator_span(app, h),
-                    Span::raw(h.alias().to_string()),
-                ]),
+                Line::from(alias_spans),
                 Line::from(h.host_name.clone().unwrap_or_else(|| "—".into())),
                 Line::from(h.user.clone().unwrap_or_else(|| "—".into())),
             ])
@@ -148,7 +156,7 @@ fn draw_search(f: &mut Frame, app: &App, area: Rect) {
     spans.extend(body.spans);
     if app.search.is_empty() && !app.searching {
         spans.push(Span::styled(
-            "search (alias / hostname / user)",
+            "search (alias / hostname / user / tag)",
             Style::default().fg(theme::FAINT),
         ));
     }
@@ -307,6 +315,18 @@ fn draw_detail_pane(f: &mut Frame, app: &App, area: Rect) {
             "Auto-fill",
             format!("{}{suffix}", parts.join(" + ")),
         ));
+    }
+
+    // Metadata: tags & description (#45; only when present).
+    if !h.tags.is_empty() || h.description.is_some() {
+        lines.push(Line::from(""));
+        lines.push(section_header("Metadata"));
+        if !h.tags.is_empty() {
+            lines.push(kv_line("Tags", h.tags_display()));
+        }
+        if let Some(d) = &h.description {
+            lines.push(kv_line("Description", d.clone()));
+        }
     }
 
     // Identity (only when present).

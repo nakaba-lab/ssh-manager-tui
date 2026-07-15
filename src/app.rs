@@ -15,7 +15,7 @@ pub const VAULT_IDLE_LOCK: Duration = Duration::from_secs(15 * 60);
 
 use crate::config::SshConfig;
 use crate::config::diff::DiffLine;
-use crate::config::model::HostView;
+use crate::config::model::{HostView, parse_sshm_tags};
 use crate::os::connect::{ConnectOverrides, Protocol};
 use crate::os::history::History;
 use crate::os::keys::KeyInfo;
@@ -28,7 +28,7 @@ use crate::os::{self, keys, known_hosts};
 
 /// Ordered labels of the edit-form fields. Indices are referenced by name in
 /// [`FormIdx`].
-pub const FIELD_LABELS: [&str; 10] = [
+pub const FIELD_LABELS: [&str; 12] = [
     "Host (alias / patterns)",
     "HostName",
     "User",
@@ -39,6 +39,8 @@ pub const FIELD_LABELS: [&str; 10] = [
     "RemoteForward",
     "DynamicForward",
     "Extra options (Key Value)",
+    "Tags (comma-separated)",
+    "Description",
 ];
 
 /// Symbolic indices into the edit form's `fields` vector.
@@ -53,6 +55,10 @@ pub mod form_idx {
     pub const REMOTE_FWD: usize = 7;
     pub const DYNAMIC_FWD: usize = 8;
     pub const EXTRAS: usize = 9;
+    // #45: host metadata persisted as `# sshm:` comments (single-line fields,
+    // appended after EXTRAS so the existing indices never shift).
+    pub const TAGS: usize = 10;
+    pub const DESCRIPTION: usize = 11;
 }
 
 /// Field indices that hold a list of rows rather than a single value.
@@ -1122,12 +1128,8 @@ impl App {
         let mut scored: Vec<(usize, u32)> = Vec::new();
         let mut buf = Vec::new();
         for (i, h) in self.hosts.iter().enumerate() {
-            let hay = format!(
-                "{} {} {}",
-                h.patterns.join(" "),
-                h.host_name.as_deref().unwrap_or(""),
-                h.user.as_deref().unwrap_or("")
-            );
+            // #45: tags fold into the fuzzy haystack (patterns/HostName/User/tags).
+            let hay = h.search_haystack();
             let hs = Utf32Str::new(&hay, &mut buf);
             if let Some(score) = pattern.score(hs, &mut matcher) {
                 scored.push((i, score));
@@ -1560,6 +1562,11 @@ pub fn form_from_view(view: &HostView) -> EditForm {
         .iter()
         .map(|(k, v)| format!("{k} {v}"))
         .collect();
+    // #45: tags edited as a single comma-separated line; description as one line.
+    set_single(&mut fields[form_idx::TAGS], &view.tags.join(", "));
+    if let Some(v) = &view.description {
+        set_single(&mut fields[form_idx::DESCRIPTION], v);
+    }
 
     EditForm {
         fields,
@@ -1617,6 +1624,9 @@ pub fn view_from_form(form: &EditForm) -> HostView {
         remote_forwards: rows(&f[form_idx::REMOTE_FWD]),
         dynamic_forwards: rows(&f[form_idx::DYNAMIC_FWD]),
         extras,
+        // #45: tags reuse the sshm:tags grammar (parse_sshm_tags); desc is one line.
+        tags: parse_sshm_tags(&f[form_idx::TAGS].value),
+        description: opt(&f[form_idx::DESCRIPTION].value),
     }
 }
 
@@ -2381,6 +2391,20 @@ mod tests {
             app.pick_jump_self_alias(&PickOrigin::Edit { editing: None }),
             ""
         );
+    }
+
+    #[test]
+    fn search_matches_host_by_tag() {
+        // #45 AC7: typing a tag name in the `/` search matches the tagged host
+        // via the existing fuzzy filter (tags folded into the haystack), even
+        // though the tag appears in neither the alias nor the HostName.
+        let mut app = app_fixture(
+            "# sshm:tags prod,db\nHost web\n  HostName 1.1.1.1\n\nHost mail\n  HostName 2.2.2.2\n",
+        );
+        app.search = "prod".to_string();
+        app.refilter();
+        let matched: Vec<&str> = app.filtered.iter().map(|&i| app.hosts[i].alias()).collect();
+        assert_eq!(matched, vec!["web"]);
     }
 
     #[test]

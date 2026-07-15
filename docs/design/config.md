@@ -1,14 +1,12 @@
 ---
 title: config 領域 設計
 area: config
-status: draft
+status: active
 relatedIssues: [45]
 updated: 2026-07-15
 ---
 
 # config 領域 設計（`src/config/`）
-
-> status: draft — 初期骨子。実装の現状に合わせて随時確定（`status: active` へ）する。
 
 ## 責務
 
@@ -29,9 +27,9 @@ flowchart LR
 
 `load → host_views（編集用射影）→ apply_view（行粒度 mutate）→ render`。詳細な保存シーケンスは [architecture.md](./architecture.md) を参照。
 
-## ホストメタデータ（タグ・説明）— `# sshm:` ディレクティブ（#45・実装前 draft）
+## ホストメタデータ（タグ・説明）— `# sshm:` ディレクティブ（#45）
 
-> status: draft の実装前設計。ホスト直上コメント（`HostBlock.pre: Vec<RawLine>`）に **sshm 所有のメタデータ**をコメントで永続化する。「並行 DB を持たない・実ファイルが真実の源泉」という製品思想と両立する。
+> ホスト直上コメント（`HostBlock.pre: Vec<RawLine>`）に **sshm 所有のメタデータ**をコメントで永続化する。「並行 DB を持たない・実ファイルが真実の源泉」という製品思想と両立する。
 
 - **ワイヤーフォーマット（sshm 所有は `# sshm:` 接頭辞行のみ）**:
   - `# sshm:tags <csv>` — カンマ区切りのタグ（`prod,db`）。値の trim・空要素除去。タグ値にカンマは使えない。

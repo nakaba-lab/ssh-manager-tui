@@ -11,7 +11,7 @@ title: 設計書
 | 領域 | ファイル | 状態 | 最終更新 |
 |------|---------|------|---------|
 | アーキテクチャ（全体構成） | [architecture.md](./architecture.md) | active | 2026-07-14 |
-| config（無損失往復） | [config.md](./config.md) | draft | 2026-07-14 |
+| config（無損失往復） | [config.md](./config.md) | active | 2026-07-15 |
 | os（外部連携） | [os.md](./os.md) | draft | 2026-07-14 |
 | security（vault 暗号・askpass・信頼境界） | [security.md](./security.md) | active | 2026-07-15 |
 | ui（TUI 画面） | [ui.md](./ui.md) | active | 2026-07-15 |
