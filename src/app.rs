@@ -168,6 +168,12 @@ pub enum Screen {
     VaultEntry {
         editing: Option<usize>,
     },
+    /// Change the master password, or upgrade the vault's KDF parameters (#44). A
+    /// modal overlay over [`Screen::Vault`]; the mode and typed passwords live off
+    /// the `Screen` enum on [`App::vault_rekey`] (a unit variant here), so no
+    /// plaintext password is ever cloned or formatted through `Screen`'s derived
+    /// `Debug`/`Clone`.
+    VaultRekey,
     /// One-time **password** consent modal, shown before arming a stored password
     /// the first time the resolved `<user@host>` is targeted this session — from
     /// either the connect path or the SFTP browser launch (see `origin`). Carries
@@ -463,6 +469,64 @@ impl std::fmt::Debug for VaultUnlock {
         f.debug_struct("VaultUnlock")
             .field("creating", &self.creating)
             .field("password", &"***")
+            .field("confirm", &"***")
+            .field("field", &self.field)
+            .field("cursor", &self.cursor)
+            .finish()
+    }
+}
+
+/// Which rekey operation the [`Screen::VaultRekey`] modal is performing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RekeyMode {
+    /// Change the master password: current + new + confirm fields.
+    #[default]
+    ChangePassword,
+    /// Upgrade the vault's KDF parameters, keeping the same password: only the
+    /// current-password field is shown (re-deriving the key needs the plaintext,
+    /// which the unlocked vault does not retain).
+    UpgradeKdf,
+}
+
+/// Master-password change / KDF-upgrade modal state. Held off the `Screen` enum
+/// (which derives `Debug`/`Clone`) so the typed passwords are never cloned or
+/// formatted through it; each field scrubs on drop and is redacted in `Debug`.
+#[derive(Default, Clone)]
+pub struct VaultRekey {
+    pub mode: RekeyMode,
+    pub current: String,
+    pub new: String,
+    pub confirm: String,
+    /// Focused field: 0 = current, 1 = new, 2 = confirm. `UpgradeKdf` uses only 0.
+    pub field: usize,
+    pub cursor: usize,
+}
+
+impl VaultRekey {
+    /// Focusable field count for the current mode (3 for a password change, 1 for
+    /// a KDF-only upgrade).
+    pub fn field_count(&self) -> usize {
+        match self.mode {
+            RekeyMode::ChangePassword => 3,
+            RekeyMode::UpgradeKdf => 1,
+        }
+    }
+}
+
+impl Drop for VaultRekey {
+    fn drop(&mut self) {
+        self.current.zeroize();
+        self.new.zeroize();
+        self.confirm.zeroize();
+    }
+}
+
+impl std::fmt::Debug for VaultRekey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VaultRekey")
+            .field("mode", &self.mode)
+            .field("current", &"***")
+            .field("new", &"***")
             .field("confirm", &"***")
             .field("field", &self.field)
             .field("cursor", &self.cursor)
@@ -853,6 +917,7 @@ pub struct App {
     pub vault: Option<Vault>,
     pub vault_state: ListState,
     pub vault_unlock: VaultUnlock,
+    pub vault_rekey: VaultRekey,
     pub vault_entry: VaultEntryForm,
     /// When true, secrets are shown in the clear instead of masked.
     pub vault_reveal: bool,
@@ -951,6 +1016,7 @@ impl App {
             vault: None,
             vault_state: ListState::default(),
             vault_unlock: VaultUnlock::default(),
+            vault_rekey: VaultRekey::default(),
             vault_entry: VaultEntryForm::default(),
             vault_reveal: false,
             has_vault_file: crate::os::vault::default_path()
@@ -1328,10 +1394,11 @@ impl App {
         self.vault = None;
         self.vault_reveal = false;
         self.confirmed_password_targets.clear();
-        // Scrub any typed-but-unsaved secret in the entry/unlock forms too (both
-        // Drop-zeroize when replaced), so a lock leaves nothing behind.
+        // Scrub any typed-but-unsaved secret in the entry/unlock/rekey forms too
+        // (all Drop-zeroize when replaced), so a lock leaves nothing behind.
         self.vault_entry = VaultEntryForm::default();
         self.vault_unlock = VaultUnlock::default();
+        self.vault_rekey = VaultRekey::default();
         // A locked vault must not keep auto-filling an already-open browser: disarm
         // its session (drops + zeroizes the held SftpArm secrets).
         if let Some(b) = self.sftp_browser.as_mut() {
@@ -1353,7 +1420,10 @@ impl App {
             // excludes it — don't "fix" the apparent asymmetry.
             if matches!(
                 self.screen,
-                Screen::Vault | Screen::VaultEntry { .. } | Screen::PasswordConfirm { .. }
+                Screen::Vault
+                    | Screen::VaultEntry { .. }
+                    | Screen::VaultRekey
+                    | Screen::PasswordConfirm { .. }
             ) {
                 self.screen = Screen::List;
                 self.prev_screen = None;

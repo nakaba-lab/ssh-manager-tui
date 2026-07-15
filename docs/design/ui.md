@@ -1,14 +1,14 @@
 ---
 title: ui 領域 設計
 area: ui
-status: draft
+status: active
 relatedIssues: [43, 44]
 updated: 2026-07-15
 ---
 
 # ui 領域 設計（`src/ui/` — TUI 描画）
 
-> status: draft — 初期骨子。**TUI（ratatui）であり Web フロントではない**（`frontendDir: none`）。ブラウザ向けの a11y/レスポンシブ検証（`frontend-reviewer`）は対象外で、UI 配慮は本領域の記述で担保する。
+> **TUI（ratatui）であり Web フロントではない**（`frontendDir: none`）。ブラウザ向けの a11y/レスポンシブ検証（`frontend-reviewer`）は対象外で、UI 配慮は本領域の記述で担保する。
 
 ## 責務
 

@@ -92,6 +92,8 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
             lines.push(key("d", "delete secret"));
             lines.push(key("Space", "reveal / mask secrets"));
             lines.push(key("p", "toggle connect-time password auto-fill"));
+            lines.push(key("m", "change master password (re-encrypt vault)"));
+            lines.push(key("u", "upgrade vault KDF to current default"));
             lines.push(key("L", "lock vault now (forget master password)"));
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(

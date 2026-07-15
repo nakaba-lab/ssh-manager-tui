@@ -413,6 +413,65 @@ impl Vault {
         }
         Ok(())
     }
+
+    /// Verify `password` against the unlocked vault by re-deriving the key with the
+    /// current salt+params and comparing it (in constant time) to the in-memory
+    /// key. True iff `password` is the current master password. Authorizes a
+    /// [`Vault::rekey`]: an unlocked-but-idle session must not let a walk-up
+    /// attacker change the master password without proving the old one.
+    pub fn verify_password(&self, password: &str) -> bool {
+        match derive_key(password, &self.salt, &self.params) {
+            Ok(candidate) => ct_eq(&candidate, &self.key),
+            Err(_) => false,
+        }
+    }
+
+    /// True iff the vault's KDF parameters are **strictly weaker** than the current
+    /// [`KdfParams::default`] — every field `<=` default and at least one `<` it
+    /// (dominated by the default). A vault equal to, stronger than, or *mixed*
+    /// (stronger in any field) against the default returns false, so a manually
+    /// strengthened vault is never nudged into a downgrade. Gates the KDF-upgrade
+    /// affordance in the UI (a rekey to the default would never lower a field).
+    pub fn needs_kdf_upgrade(&self) -> bool {
+        let d = KdfParams::default();
+        let weakly_dominated = self.params.m_cost <= d.m_cost
+            && self.params.t_cost <= d.t_cost
+            && self.params.p_cost <= d.p_cost;
+        let strictly_weaker = self.params.m_cost < d.m_cost
+            || self.params.t_cost < d.t_cost
+            || self.params.p_cost < d.p_cost;
+        weakly_dominated && strictly_weaker
+    }
+
+    /// Re-encrypt the vault under `new_password` with a **fresh salt** and the
+    /// current [`KdfParams::default`], then persist to `path`. Changing the master
+    /// password and upgrading an old vault's KDF are the same operation — a
+    /// KDF-only upgrade passes the *current* password as `new_password`.
+    ///
+    /// The caller must have authorized the change (see [`Vault::verify_password`]).
+    /// On a save failure the previous `(key, salt, params)` are restored so the
+    /// in-memory vault matches the untouched on-disk file — the same rollback
+    /// discipline as [`Vault::upsert_and_save`]. Skipping it would leave the
+    /// in-memory key diverged from disk, so the next entry save would re-encrypt
+    /// under a key the file was never written with and lock the user out.
+    pub fn rekey(&mut self, new_password: &str, path: &Path) -> Result<()> {
+        let new_params = KdfParams::default();
+        let new_salt = random_bytes(SALT_LEN)?;
+        let new_key = derive_key(new_password, &new_salt, &new_params)?;
+        // Swap the new material in, keeping the old for rollback. `mem::replace`
+        // hands back ownership, so on success the old key (Zeroizing) scrubs on
+        // drop at function end; the salt is public so needs no scrubbing.
+        let old_key = std::mem::replace(&mut self.key, new_key);
+        let old_salt = std::mem::replace(&mut self.salt, new_salt);
+        let old_params = std::mem::replace(&mut self.params, new_params);
+        if let Err(e) = self.save(path) {
+            self.key = old_key;
+            self.salt = old_salt;
+            self.params = old_params;
+            return Err(e);
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -467,6 +526,21 @@ fn decrypt(key: &[u8], nonce: &[u8], ciphertext: &[u8], aad: &[u8]) -> Result<Ze
         )
         .map_err(|_| anyhow!("decryption failed"))?;
     Ok(Zeroizing::new(pt))
+}
+
+/// Constant-time byte-slice equality, used to compare a candidate derived key
+/// against the in-memory key so verifying a master password leaks no timing
+/// signal about how many bytes matched. Unequal lengths are unequal (both are
+/// `KEY_LEN`); equal lengths are compared without early exit.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 pub(crate) fn random_bytes(n: usize) -> Result<Vec<u8>> {
@@ -933,5 +1007,139 @@ mod tests {
         let s: Secret = "topsecret".into();
         assert_eq!(format!("{s:?}"), "\"***\"");
         assert!(!format!("{s:?}").contains("topsecret"));
+    }
+
+    #[test]
+    fn verify_password_accepts_correct_rejects_wrong() {
+        // given a vault protected by a known master password
+        let v = Vault::create("correct horse").unwrap();
+        // when / then: only the exact master password verifies (constant-time re-derive)
+        assert!(v.verify_password("correct horse"));
+        assert!(!v.verify_password("wrong"));
+        assert!(!v.verify_password(""));
+    }
+
+    #[test]
+    fn needs_kdf_upgrade_false_for_default_params() {
+        // given a freshly created vault (which uses KdfParams::default())
+        let v = Vault::create("m").unwrap();
+        // then no upgrade is offered — the current params are exactly the default
+        assert!(!v.needs_kdf_upgrade());
+    }
+
+    #[test]
+    fn needs_kdf_upgrade_true_when_strictly_weaker() {
+        // given a vault whose m_cost was weakened below the default (t_cost/p_cost
+        // left at default), so every field is <= default and one is strictly <
+        let mut v = Vault::create("m").unwrap();
+        v.params.m_cost = MIN_M_COST; // below the default 19_456
+        // then it is strictly dominated by default and an upgrade is offered
+        assert!(v.needs_kdf_upgrade());
+    }
+
+    #[test]
+    fn needs_kdf_upgrade_false_when_stronger_or_mixed() {
+        // given a vault strictly STRONGER than default (higher m_cost)
+        let mut stronger = Vault::create("m").unwrap();
+        stronger.params.m_cost = KdfParams::default().m_cost + 10_000; // still <= MAX_M_COST
+        // then a manually-strengthened vault is never offered a downgrade
+        assert!(!stronger.needs_kdf_upgrade());
+
+        // given a MIXED vault (weaker m_cost but STRONGER t_cost) — not dominated
+        let mut mixed = Vault::create("m").unwrap();
+        mixed.params.m_cost = MIN_M_COST;
+        mixed.params.t_cost = KdfParams::default().t_cost + 1;
+        // then it is not offered a downgrade either (stronger in one field)
+        assert!(!mixed.needs_kdf_upgrade());
+    }
+
+    #[test]
+    fn rekey_changes_the_master_password() {
+        // given a saved vault protected by "old-pass" with a Password and a Passphrase
+        let path = temp_vault_path("rekey-change");
+        let mut v = Vault::create("old-pass").unwrap();
+        v.upsert(None, entry("web", SecretKind::Password, "s3cret"));
+        v.upsert(None, entry("web", SecretKind::Passphrase, "key-pass"));
+        v.save(&path).unwrap();
+
+        // when the master password is changed to "new-pass"
+        v.rekey("new-pass", &path).unwrap();
+
+        // then the new password unlocks the file and the entries are preserved
+        let opened = Vault::unlock(&path, "new-pass").unwrap();
+        assert_eq!(opened.entries.len(), 2);
+        assert_eq!(opened.entries[0].host, "web");
+        assert_eq!(opened.entries[0].kind, SecretKind::Password);
+        assert_eq!(opened.entries[0].secret.as_str(), "s3cret");
+        assert_eq!(opened.entries[1].kind, SecretKind::Passphrase);
+        assert_eq!(opened.entries[1].secret.as_str(), "key-pass");
+
+        // and the old password no longer works
+        match Vault::unlock(&path, "old-pass") {
+            Ok(_) => panic!("old password must not unlock after a rekey"),
+            Err(e) => assert!(
+                e.to_string().contains("incorrect master password"),
+                "unexpected error: {e}"
+            ),
+        }
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn rekey_upgrades_kdf_params_and_rotates_salt() {
+        // given a saved vault whose KDF was weakened below default
+        let path = temp_vault_path("rekey-kdf");
+        let mut v = Vault::create("m").unwrap();
+        v.params.m_cost = MIN_M_COST;
+        v.save(&path).unwrap();
+
+        // capture the on-disk salt + kdf before the rekey
+        let before: VaultFile = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let old_salt = before.salt.clone();
+        assert_eq!(before.kdf.m_cost, MIN_M_COST); // sanity: the weakened value was written
+
+        // when rekeyed
+        v.rekey("whatever", &path).unwrap();
+
+        // then the on-disk KDF params are re-keyed back to default and the salt rotated
+        let after: VaultFile = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(after.kdf.m_cost, KdfParams::default().m_cost);
+        assert_eq!(after.kdf.t_cost, KdfParams::default().t_cost);
+        assert_eq!(after.kdf.p_cost, KdfParams::default().p_cost);
+        assert_ne!(after.salt, old_salt, "rekey must rotate to a fresh salt");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn rekey_rolls_back_on_save_failure() {
+        // A vault path whose parent is a regular FILE makes every save fail
+        // deterministically and cross-platform (same technique as
+        // a_failed_save_rolls_back_the_in_memory_mutation), so the rollback is
+        // provable without mocking I/O.
+        let blocker = temp_vault_path("rekey-rollback-blocker");
+        fs::write(&blocker, b"x").unwrap();
+        let bad_path = blocker.join("vault.json");
+
+        // given an in-memory vault protected by "old-pass"
+        let mut v = Vault::create("old-pass").unwrap();
+        v.upsert(None, entry("h", SecretKind::Password, "s"));
+
+        // when a rekey save fails
+        assert!(v.rekey("new-pass", &bad_path).is_err());
+
+        // then the in-memory (key, salt, params) were rolled back so memory matches
+        // the unchanged on-disk file: the OLD password verifies, the NEW one does not.
+        assert!(
+            v.verify_password("old-pass"),
+            "a failed rekey must roll the key back to the old password"
+        );
+        assert!(
+            !v.verify_password("new-pass"),
+            "the new password must not take effect when the save failed"
+        );
+
+        let _ = fs::remove_file(&blocker);
     }
 }

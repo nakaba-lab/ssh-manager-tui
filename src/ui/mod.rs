@@ -57,6 +57,7 @@ fn base_screen(app: &App) -> Screen {
         | Screen::Confirm(_)
         | Screen::ActionMenu(_)
         | Screen::VaultUnlock
+        | Screen::VaultRekey
         | Screen::ConnectOverride { .. }
         | Screen::SftpTransfer
         | Screen::DiffPreview
@@ -118,6 +119,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Screen::DiffPreview => diff::draw(f, app, body_a),
         Screen::SftpTransfer => sftp::draw_transfer(f, app, body_a),
         Screen::VaultUnlock => vault::draw_unlock(f, app, body_a),
+        Screen::VaultRekey => vault::draw_rekey(f, app, body_a),
         Screen::VaultEntry { .. } => vault::draw_entry(f, app, body_a),
         Screen::PasswordConfirm { target, kinds, .. } => {
             vault::draw_password_confirm(f, target, *kinds, body_a)
@@ -319,6 +321,7 @@ fn draw_footer(f: &mut Frame, app: &App, base: &Screen, area: Rect) {
             ("d", "del"),
             ("Space", "reveal"),
             ("p", "pw-autofill"),
+            ("m", "master-pw"),
             ("L", "lock"),
             ("Esc", "back"),
         ]),

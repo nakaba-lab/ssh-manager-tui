@@ -1,14 +1,14 @@
 ---
 title: security 領域 設計
 area: security
-status: draft
+status: active
 relatedIssues: [44]
 updated: 2026-07-15
 ---
 
 # security 領域 設計（vault・askpass・信頼境界）
 
-> status: draft — 初期骨子。本プロジェクトの中核。`security-reviewer`／`windows-first-reviewer` が実装との整合をこの記述と照合する。
+> 本プロジェクトの中核。`security-reviewer`／`windows-first-reviewer` が実装との整合をこの記述と照合する。
 
 ## 責務
 
@@ -62,7 +62,7 @@ flowchart TD
 | メソッド | 契約 |
 |---------|------|
 | `verify_password(&self, pw) -> bool` | 現行 `salt`/`params` で `derive_key` して現行 `key` と**定数時間比較**。rekey を認可する前ゲート（アンロック放置中の walk-up 攻撃者にマスターパスワード変更を許さない）。 |
-| `needs_kdf_upgrade(&self) -> bool` | 現 `params` が `KdfParams::default()` より**厳密に弱い**ときのみ真（手動強化した vault にダウングレードを勧めない）。KDF 昇格導線の可視性ゲート。 |
+| `needs_kdf_upgrade(&self) -> bool` | 現 `params` が `KdfParams::default()` に**支配される**ときのみ真＝全フィールドが default 以下かつ 1 つ以上が default 未満。default と等しい／強い／**混在**（あるフィールドだけ強い）は偽で、手動強化した vault にダウングレードを勧めない（昇格＝default 貼り直しがどのフィールドも下げない範囲でだけ真）。KDF 昇格導線の可視性ゲート。 |
 | `rekey(&mut self, new_pw, path) -> Result<()>` | 新 `salt`＋デフォルト `params` で `new_pw` から鍵を再導出し既存 `save()`。**失敗時は旧 (key, salt, params) を復元**（`upsert_and_save` と同じロールバック規律）。パスワード変更と KDF 昇格の**両導線がこの 1 本に集約**（KDF 昇格は `new_pw == current_pw`）。 |
 
 **rekey シーケンス（save 失敗ロールバック込み）:**

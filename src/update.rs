@@ -17,9 +17,10 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::app::{
     App, ConfirmAction, ConnectMode, EditForm, FormMode, GenOrigin, ListFocus,
-    PasswordConfirmOrigin, PendingSave, PickOrigin, SFTP_FIELDS, Screen, SftpBrowser,
-    SftpDirection, SftpForm, SftpPane, VaultEntryForm, VaultUnlock, form_from_view, form_idx,
-    override_form_from_host, override_idx, overrides_from_form, read_local_dir, view_from_form,
+    PasswordConfirmOrigin, PendingSave, PickOrigin, RekeyMode, SFTP_FIELDS, Screen, SftpBrowser,
+    SftpDirection, SftpForm, SftpPane, VaultEntryForm, VaultRekey, VaultUnlock, form_from_view,
+    form_idx, override_form_from_host, override_idx, overrides_from_form, read_local_dir,
+    view_from_form,
 };
 use crate::config::SshConfig;
 use crate::config::diff;
@@ -71,6 +72,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent, terminal: &mut DefaultTerminal) 
         Screen::SftpBrowser => handle_sftp_browser(app, key, terminal)?,
         Screen::Vault => handle_vault(app, key),
         Screen::VaultUnlock => handle_vault_unlock(app, key),
+        Screen::VaultRekey => handle_vault_rekey(app, key),
         Screen::VaultEntry { editing } => handle_vault_entry(app, key, editing),
         Screen::PasswordConfirm { target, origin, .. } => {
             handle_password_confirm(app, key, target, origin, terminal)?
@@ -88,6 +90,14 @@ pub fn handle_key(app: &mut App, key: KeyEvent, terminal: &mut DefaultTerminal) 
 /// would otherwise pass the whole suite silently.
 fn consent_should_be_recorded(confirmed: bool, vault_unlocked: bool) -> bool {
     confirmed && vault_unlocked
+}
+
+/// Pure gate for the "change master password" rekey submit: proceed ONLY when the
+/// current password verified AND the new password is non-empty AND matches its
+/// confirmation. Pure, so the load-bearing order (verify + validate BEFORE any
+/// re-encrypt/write) is unit-tested independently of the modal plumbing.
+fn rekey_change_should_proceed(new: &str, confirm: &str, current_verified: bool) -> bool {
+    current_verified && !new.is_empty() && new == confirm
 }
 
 /// The one-time password-confirm modal: Enter/`y` confirms (re-enter the connect
@@ -3146,6 +3156,17 @@ fn handle_vault(app: &mut App, key: KeyEvent) {
             }
         }
         KeyCode::Char('p') => toggle_password_autofill(app),
+        KeyCode::Char('m') => open_vault_rekey(app, RekeyMode::ChangePassword),
+        KeyCode::Char('u') => {
+            // The KDF-upgrade affordance only exists for a vault whose params are
+            // strictly weaker than the current default (never nudge a manually
+            // strengthened vault into a downgrade — see `Vault::needs_kdf_upgrade`).
+            if app.vault.as_ref().is_some_and(|v| v.needs_kdf_upgrade()) {
+                open_vault_rekey(app, RekeyMode::UpgradeKdf);
+            } else {
+                app.toast("vault KDF is already at the current default", false);
+            }
+        }
         KeyCode::Char('L') => {
             // Lock via the shared teardown: drops the decrypted vault, forgets the
             // session password-confirm consents (must not survive a re-unlock), scrubs
@@ -3310,6 +3331,156 @@ fn submit_vault_unlock(app: &mut App) {
             app.vault_unlock.confirm.zeroize();
             app.vault_unlock.cursor = 0;
             app.vault_unlock.field = 0;
+            app.toast(format!("{e}"), true);
+        }
+    }
+}
+
+/// Open the master-password change / KDF-upgrade modal (#44) in `mode` over the
+/// vault list. Starts from a fresh (empty, scrubbed) form focused on the
+/// current-password field.
+fn open_vault_rekey(app: &mut App, mode: RekeyMode) {
+    // Struct-update (`..Default::default()`) can't move out of a Drop type.
+    let mut r = VaultRekey::default();
+    r.mode = mode;
+    app.vault_rekey = r;
+    open_overlay(app, Screen::VaultRekey);
+}
+
+/// Move focus among the rekey form's fields (wrapping), resetting the shared
+/// cursor to the end of the newly focused field. A no-op in `UpgradeKdf` mode
+/// (single field).
+fn rekey_focus(app: &mut App, dir: i32) {
+    let r = &mut app.vault_rekey;
+    let n = r.field_count();
+    if n <= 1 {
+        return;
+    }
+    r.field = (r.field as i32 + dir).rem_euclid(n as i32) as usize;
+    r.cursor = match r.field {
+        0 => r.current.len(),
+        1 => r.new.len(),
+        _ => r.confirm.len(),
+    };
+}
+
+fn handle_vault_rekey(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => {
+            app.vault_rekey = VaultRekey::default();
+            close_overlay(app);
+        }
+        KeyCode::Tab | KeyCode::Down => rekey_focus(app, 1),
+        KeyCode::BackTab | KeyCode::Up => rekey_focus(app, -1),
+        KeyCode::Enter => submit_vault_rekey(app),
+        KeyCode::Backspace => {
+            // Disjoint field borrows (value field + cursor) — do not extract into a
+            // helper returning `&mut String`, which would borrow the whole struct.
+            let r = &mut app.vault_rekey;
+            let s = match r.field {
+                0 => &mut r.current,
+                1 => &mut r.new,
+                _ => &mut r.confirm,
+            };
+            backspace_secret(s, &mut r.cursor);
+        }
+        KeyCode::Char(c) => {
+            let r = &mut app.vault_rekey;
+            let s = match r.field {
+                0 => &mut r.current,
+                1 => &mut r.new,
+                _ => &mut r.confirm,
+            };
+            insert_char_secret(s, &mut r.cursor, c);
+        }
+        _ => {}
+    }
+}
+
+fn submit_vault_rekey(app: &mut App) {
+    let Some(path) = vault::default_path() else {
+        app.toast("cannot resolve ~/.ssh", true);
+        return;
+    };
+    let mode = app.vault_rekey.mode;
+    // Verify the current password against the unlocked vault. Scope the immutable
+    // borrow to the match so the later `as_mut` rekey borrow is free.
+    let verified = match app.vault.as_ref() {
+        Some(v) => v.verify_password(&app.vault_rekey.current),
+        None => {
+            // Reachable only while unlocked; stay defensive.
+            app.toast("vault is locked", true);
+            return;
+        }
+    };
+
+    match mode {
+        RekeyMode::ChangePassword => {
+            if !rekey_change_should_proceed(
+                &app.vault_rekey.new,
+                &app.vault_rekey.confirm,
+                verified,
+            ) {
+                let msg = if !verified {
+                    "incorrect current master password"
+                } else if app.vault_rekey.new.is_empty() {
+                    "new master password is required"
+                } else {
+                    "new passwords do not match"
+                };
+                // Scrub the current-password field on a wrong password so a retry
+                // starts clean; keep new/confirm so the user needn't retype them.
+                if !verified {
+                    app.vault_rekey.current.zeroize();
+                    app.vault_rekey.cursor = 0;
+                    app.vault_rekey.field = 0;
+                }
+                app.toast(msg, true);
+                return;
+            }
+        }
+        RekeyMode::UpgradeKdf => {
+            if !verified {
+                app.vault_rekey.current.zeroize();
+                app.vault_rekey.cursor = 0;
+                app.toast("incorrect master password", true);
+                return;
+            }
+        }
+    }
+
+    // Re-key. For a KDF-only upgrade the "new" password is the current one. Borrow
+    // the typed value directly — never clone the whole form onto the heap.
+    let result = {
+        let vault = app.vault.as_mut().expect("vault present (verified above)");
+        match mode {
+            RekeyMode::ChangePassword => vault.rekey(&app.vault_rekey.new, &path),
+            RekeyMode::UpgradeKdf => vault.rekey(&app.vault_rekey.current, &path),
+        }
+    };
+
+    match result {
+        Ok(()) => {
+            // Replacing the struct drops the old one, whose Drop scrubs the fields.
+            app.vault_rekey = VaultRekey::default();
+            close_overlay(app);
+            app.toast(
+                match mode {
+                    RekeyMode::ChangePassword => "master password changed",
+                    RekeyMode::UpgradeKdf => "vault KDF upgraded to current default",
+                },
+                false,
+            );
+        }
+        Err(e) => {
+            // rekey rolled the in-memory key/salt/params back to the old password,
+            // so the vault is still usable; scrub the typed passwords and let the
+            // user retry from the still-open modal.
+            app.vault_rekey.current.zeroize();
+            app.vault_rekey.new.zeroize();
+            app.vault_rekey.confirm.zeroize();
+            app.vault_rekey.cursor = 0;
+            app.vault_rekey.field = 0;
             app.toast(format!("{e}"), true);
         }
     }
@@ -4027,6 +4198,19 @@ mod tests {
         assert!(!consent_should_be_recorded(true, false)); // vault locked mid-modal
         assert!(!consent_should_be_recorded(false, true)); // declined
         assert!(!consent_should_be_recorded(false, false));
+    }
+
+    #[test]
+    fn rekey_change_gate() {
+        // The "Change master password" submit proceeds ONLY when the current
+        // password verified, the new password is non-empty, and it matches its
+        // confirmation. Pure so the load-bearing order (verify + validate BEFORE any
+        // write) is pinned by a unit test — a dropped `current_verified` gate would
+        // otherwise pass the whole suite silently.
+        assert!(rekey_change_should_proceed("newpw", "newpw", true));
+        assert!(!rekey_change_should_proceed("newpw", "different", true)); // confirm mismatch
+        assert!(!rekey_change_should_proceed("", "", true)); // empty new password
+        assert!(!rekey_change_should_proceed("newpw", "newpw", false)); // current not verified
     }
 
     #[test]

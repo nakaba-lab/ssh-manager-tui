@@ -103,12 +103,19 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
         .collect();
 
     let title = format!(
-        "Passwords{}  ·  pw-autofill {}",
+        "Passwords{}  ·  pw-autofill {}{}",
         if app.vault_reveal { "  (revealed)" } else { "" },
         if app.password_autofill_enabled {
             "on"
         } else {
             "off"
+        },
+        // Only nudge when the KDF is strictly weaker than today's default (never
+        // suggest a downgrade for a manually strengthened vault). Press 'u'.
+        if vault.needs_kdf_upgrade() {
+            "  ·  older KDF (u: upgrade)"
+        } else {
+            ""
         },
     );
     let list = List::new(items)
@@ -179,6 +186,74 @@ pub fn draw_unlock(f: &mut Frame, app: &App, area: Rect) {
     };
     lines.push(Line::from(Span::styled(
         hint,
+        Style::default().fg(theme::FAINT),
+    )));
+
+    f.render_widget(Paragraph::new(Text::from(lines)).block(block), modal);
+}
+
+/// Master-password change / KDF-upgrade modal (#44). Mirrors [`draw_unlock`]:
+/// masked, foreign-cursor-safe fields and `theme` colors only. `ChangePassword`
+/// shows current/new/confirm; `UpgradeKdf` shows only the current-password field.
+pub fn draw_rekey(f: &mut Frame, app: &App, area: Rect) {
+    use crate::app::RekeyMode;
+    let r = &app.vault_rekey;
+    let (title, height) = match r.mode {
+        RekeyMode::ChangePassword => ("Change master password", 13),
+        RekeyMode::UpgradeKdf => ("Upgrade vault KDF", 9),
+    };
+    let modal = centered(60, height, area);
+    f.render_widget(Clear, modal);
+    let block = modal_block(title, false);
+
+    let label = |s: &str, focused: bool| {
+        Span::styled(
+            format!("{s:<12}"),
+            if focused {
+                Style::default()
+                    .fg(theme::ACCENT)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme::DIM)
+            },
+        )
+    };
+
+    let mut lines = vec![Line::from("")];
+    lines.push(Line::from(Span::styled(
+        match r.mode {
+            RekeyMode::ChangePassword => "  Re-encrypt the vault under a new master password.",
+            RekeyMode::UpgradeKdf => "  Re-derive with current KDF defaults (same password).",
+        },
+        Style::default().fg(theme::FAINT),
+    )));
+    lines.push(Line::from(""));
+
+    lines.push(Line::from({
+        let mut s = vec![label("Current", r.field == 0)];
+        s.extend(masked_input(&r.current, r.cursor, r.field == 0).spans);
+        s
+    }));
+    if r.mode == RekeyMode::ChangePassword {
+        lines.push(Line::from(""));
+        lines.push(Line::from({
+            let mut s = vec![label("New", r.field == 1)];
+            s.extend(masked_input(&r.new, r.cursor, r.field == 1).spans);
+            s
+        }));
+        lines.push(Line::from(""));
+        lines.push(Line::from({
+            let mut s = vec![label("Confirm", r.field == 2)];
+            s.extend(masked_input(&r.confirm, r.cursor, r.field == 2).spans);
+            s
+        }));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        match r.mode {
+            RekeyMode::ChangePassword => "  Tab move · Enter change · Esc cancel",
+            RekeyMode::UpgradeKdf => "  Enter upgrade · Esc cancel",
+        },
         Style::default().fg(theme::FAINT),
     )));
 
