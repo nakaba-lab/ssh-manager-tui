@@ -351,6 +351,87 @@ pub fn set_extras(block: &mut HostBlock, extras: &[(String, String)]) {
     }
 }
 
+/// Surgically reconcile the host's `# sshm:` metadata directives (#45) — tags
+/// and description — living in the block's owned preceding comments (`pre`).
+///
+/// Mirrors `set_single`/`set_multi`'s discipline: a directive whose *parsed*
+/// value is unchanged is left byte-for-byte intact (so a hand-written,
+/// non-canonical directive round-trips), and every non-`sshm:` comment line in
+/// `pre` is never touched. Only when a value actually changes is its directive
+/// line rewritten canonically; emptying a value removes its line; a fresh value
+/// is appended at the end of `pre`, directly above the header.
+pub fn set_pre(block: &mut HostBlock, tags: &[String], description: Option<&str>) {
+    let indent = block.header.indent.clone();
+
+    let tags_desired: Option<String> = (!tags.is_empty()).then(|| tags.join(","));
+    reconcile_directive(block, &indent, "tags", tags_desired.as_deref(), |rest| {
+        super::model::parse_sshm_tags(rest).as_slice() == tags
+    });
+
+    let desc_desired: Option<String> = description
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+        .map(str::to_string);
+    reconcile_directive(block, &indent, "desc", desc_desired.as_deref(), |rest| {
+        rest.trim() == desc_desired.as_deref().unwrap_or("")
+    });
+}
+
+/// Shared core for [`set_pre`]: reconcile the first `# sshm:<key>` line in `pre`
+/// toward `desired` (canonical remainder, or `None` to remove all), leaving it
+/// byte-identical when `unchanged` reports the parsed value already matches.
+fn reconcile_directive(
+    block: &mut HostBlock,
+    indent: &str,
+    key: &str,
+    desired: Option<&str>,
+    unchanged: impl Fn(&str) -> bool,
+) {
+    let existing: Vec<usize> = block
+        .pre
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| super::model::sshm_directive(&r.text, key).map(|_| i))
+        .collect();
+
+    // Strict only-rewrite-on-change: when the block's current (first-wins)
+    // directive value already equals `desired`, touch nothing. Duplicates,
+    // hand-written valueless directives (`# sshm:tags`), and non-canonical
+    // formatting then round-trip byte-for-byte across an unrelated edit.
+    let already_current = match existing.first() {
+        Some(&first) => {
+            let rest = super::model::sshm_directive(&block.pre[first].text, key).unwrap_or("");
+            unchanged(rest)
+        }
+        None => desired.is_none(),
+    };
+    if already_current {
+        return;
+    }
+
+    match desired {
+        // Value transitioned to absent: remove every owned directive line.
+        None => {
+            for &i in existing.iter().rev() {
+                block.pre.remove(i);
+            }
+        }
+        // Value actually changed: rewrite the first line canonically, and only
+        // now collapse any shadowed duplicates of the same directive.
+        Some(val) => match existing.first() {
+            Some(&first) => {
+                block.pre[first].text = format!("{indent}# sshm:{key} {val}");
+                for &i in existing[1..].iter().rev() {
+                    block.pre.remove(i);
+                }
+            }
+            None => block
+                .pre
+                .push(RawLine::new(format!("{indent}# sshm:{key} {val}"))),
+        },
+    }
+}
+
 /// Replace the header patterns, preserving the header's indent and separator.
 pub fn set_patterns(block: &mut HostBlock, patterns: &[String]) {
     block.patterns = patterns.to_vec();

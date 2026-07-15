@@ -2,7 +2,7 @@
 title: ui 領域 設計
 area: ui
 status: active
-relatedIssues: [43, 44]
+relatedIssues: [43, 44, 45]
 updated: 2026-07-15
 ---
 
@@ -30,6 +30,21 @@ updated: 2026-07-15
 - **実効設定インスペクタ（`Screen::Inspect`・#43）**: ホスト一覧で `i` を押すと、選択ホストの `ssh -G` 実効設定を**フルスクリーンのベース画面**（`known_hosts` と同じ流儀＝`app.screen = Screen::Inspect` を直接設定・Esc で List へ戻る。モーダルオーバーレイではない）で表示する。`resolve.rs::resolve_full` の順序付き key/value を `/` の部分一致フィルタ（`kh_filtered` と同じ大小無視の substring）と j/k・g/G スクロールで閲覧する（v1 は閲覧専用＝値コピー等は対象外）。
   - **開く前の安全ゲート（fail-safe）**: `i` 押下時、`inspect_block_reason(app.config.render())` が理由を返す（`has_match_exec` または `has_include` が真）なら `ssh -G` を実行せず sticky エラートーストで退避する。前者は `ssh -G` が `Match exec` の述語を実行してしまうため、後者は `has_match_exec` がメインファイルの render しか走査せず Include 先の `Match exec` を見逃す（#43 リスク#1）ため。**Include 検出は `has_match_exec` と同じ widen-only 正規化（クオート splice 除去・`=`→空白・コメント除外・インデント非依存）の text scan で行う**（パーサの `include_count()` は素の**トップレベル** Include しか数えず、`ssh -G` が honor する**ブロック内ネスト**・**クオート装飾**の Include を取りこぼすため＝これらを塞ぐ）。`ssh -G` がタイムアウト/非ゼロ/ssh 不在で失敗したときも sticky トーストを出し、インスペクタは開かない（半端な画面を出さない）。解決は開く瞬間に 1 回だけ走らせ（500ms 上限・UI スレッドは tick ごとにブロックしない設計を崩さない）、結果を App に載せてから描画する（`diff` プレビューと同じ「一度計算して載せる」流儀）。
   - **表示の正直さ（#43 リスク#2）**: `ssh -G` はキーを小文字化し値を正規化しコンパイル時デフォルトも出すため、「書いた値」との単純比較で由来をハイライトすると誤分類する。由来ハイライトはせず、ヘッダで「`ssh -G` 正規化の**近似**」であることを明示する。
+- **ホストのタグ・説明（`# sshm:` コメント経由・#45）**: `~/.ssh/config` のホスト直上コメント（`# sshm:tags prod,db` / `# sshm:desc …`）で付与するメタデータ。データ層の設計は [config.md](./config.md)（`# sshm:` ディレクティブ）。UI 側は次の 4 箇所に閉じる（新 `Screen`・モーダルは増やさない）:
+  - **一覧のタグ表示（採択案＝インライン chips）**: `draw_list_pane`（`ui/list.rs`）の Alias セル（`Line::from(vec![…])`）に、エイリアス名の直後へタグを chip 風に並べる。**専用カラムは増やさない**（到達性列/HostName/User と幅を競合させないため）。色は `theme.rs` のアクセント（ハードコードしない）。`responsive_split` の縦積み（90 桁未満）では幅に応じてタグを省略/折返す。
+    ```
+    ┌─ Hosts ─────────────────────────────────────┐
+    │    Alias                HostName      User   │
+    │  ● web-prod #prod #db   10.0.0.1      me     │
+    │  ● db-replica #db       10.0.0.2      me     │
+    │  ○ staging #staging     10.0.1.9      me     │
+    └──────────────────────────────────────────────┘
+      ●=到達 / ○=未到達。タグはエイリアス直後にアクセント色の #chip。
+    ```
+  - **詳細ペインの説明**: `draw_detail_pane` に「Tags / Description」セクションを Connection の後へ追加（`if !tags.is_empty()` / desc ガード、既存 "Other"（extras）と同じ流儀）。**説明は一覧行ではなく詳細ペインに置く**（#45 決定）。
+  - **編集フォーム**: `FIELD_LABELS`・`form_idx`・`MULTI_FIELDS`（`app.rs`）に **EXTRAS の後ろへ** Tags・Description を追記する（末尾追加で `form_idx` 再採番を避ける）。**Tags = 単一行カンマ区切り（`multi: false`）**、**Description = 単一行（`multi: false`）**。`form_from_view`/`view_from_form` の両変換を更新。`ui/edit.rs` の `section_for` に "Metadata" セクションを追加（フィールドは汎用レンダラが位置で描くため追加描画コードは不要）。
+  - **フィルタ**: `refilter`（`app.rs`）のファジー・ハイスタック `"{patterns} {host_name} {user}"` に `tags.join(" ")` を足すだけ（**専用フィルタは設けず既存 `/` 検索に畳み込む**＝#45 決定）。known_hosts 側の substring フィルタ（`kh_filtered`）とは別系統（挙動を共有しない）。
+  - **ヘルプ**: 汎用フィールド操作キー（Tab/j/k/i/a/d）で足りるため Edit ヘルプは変更不要。List ヘルプにタグが検索対象である旨を 1 行足すのは任意。
 - **マスターパスワード変更・KDF 昇格モーダル（`Screen::VaultRekey`・#44）**: vault 一覧（`Screen::Vault`＝アンロック済みでのみ到達）から開くモーダルオーバーレイ。`VaultUnlock` パターンを踏襲する（フォーム状態は `Screen` に載せず `App::vault_rekey` に持ち、`Drop` で zeroize・`Debug` で redact）。
   - **導線 2 つ（KDF 昇格モデル B）**: 一覧で `m` → **Change master password**（current/new/confirm の 3 フィールド）。一覧で `u` → **Upgrade vault KDF**（current の 1 フィールド・**`needs_kdf_upgrade()` が真のときだけ有効**）。両者は同じ `Screen::VaultRekey` の 2 モード（`mode: RekeyMode { ChangePassword, UpgradeKdf }`）で、内部はどちらも `os::vault::rekey()` を呼ぶ（KDF 昇格は `new_pw == current`）。
   - **可視性ヒント**: `needs_kdf_upgrade()` が真のとき、vault 一覧タイトルに ` ·  older KDF (u: upgrade)` を出す（`theme.rs` の色を使う。ハードコードしない。エントリ 0 件の空 vault でも同じ導線を出す）。デフォルト以上の KDF では出さない。
