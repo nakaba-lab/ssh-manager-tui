@@ -696,17 +696,19 @@ fn connect_by_alias(
     let (host_has_match_exec, rc) = match cached_rc {
         Some(rc) => (false, Some(rc)),
         None => {
-            // Scan the whole effective config (main + Include'd files, #52), so a
-            // `Match exec` hiding in an included file can't slip past this gate.
-            let mex = app.effective_has_match_exec();
+            // Withhold resolve/autofill when the effective config (main + every
+            // Include'd file) carries a `Match exec` OR uses an include form we
+            // cannot fully scan (block-nested / quote-spliced / too deep) — fail
+            // safe (#52), since `ssh -G` would honor what we can't verify.
+            let unsafe_cfg = app.autofill_config_unsafe();
             // Feed the override's resolution flags (user/port/identity/proxy/-o)
             // to `ssh -G` so the resolved target, identity and TOFU key reflect
             // the *effective* connection, not the saved config.
             let opts = resolve_options(&ov);
-            let rc = (!mex)
+            let rc = (!unsafe_cfg)
                 .then(|| resolve_config_with_options(&opts, alias).ok())
                 .flatten();
-            (mex, rc)
+            (unsafe_cfg, rc)
         }
     };
     let resolved = rc.is_some();
@@ -2013,7 +2015,9 @@ fn sftp_arm_gate(app: &App, host: &HostView, alias: &str) -> Option<SftpArmGate>
         return None;
     }
     let candidacy = app.vault_secret_kinds(host)?;
-    if app.effective_has_match_exec() {
+    // Fail safe: a `Match exec` or an un-scannable include form (#52) means
+    // `ssh -G` could execute a predicate, so don't arm a secret here.
+    if app.autofill_config_unsafe() {
         return None;
     }
     let rc = resolve_config_with_options(&[], alias).ok()?;
@@ -5055,30 +5059,58 @@ mod tests {
     }
 
     #[test]
-    fn match_exec_in_included_file_is_detected() {
-        // #52 AC6: a `Match exec` hiding in an Include'd file is seen by the
-        // whole-config safety scan even though the main file has none.
+    fn autofill_unsafe_on_match_exec_in_included_file() {
+        // #52 AC6: a `Match exec` hiding in an Include'd file makes the autofill
+        // gate refuse, even though the main file has none.
         let (app, dir) = app_with_include(
             "Include danger.conf\n\nHost main-host\n    HostName 1.1.1.1\n",
             "danger.conf",
             "Match exec \"cmd\"\n    User bob\n",
         );
         assert!(
-            app.included_has_match_exec,
-            "an included Match exec must be detected by the whole-config scan"
+            app.autofill_config_unsafe(),
+            "an included Match exec must be caught by the whole-config safety scan"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn plain_included_file_does_not_trip_match_exec() {
-        // Negative: a plain included file does not set the Match-exec flag.
+    fn autofill_unsafe_on_block_nested_include() {
+        // #52 conservative fail-safe (security regression): a `Match exec` behind a
+        // block-nested Include (which `ssh -G` honors but expand does not follow)
+        // must NOT slip past the autofill gate — the un-scannable include form
+        // itself trips the fail-safe.
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("sshm-inc-bn-{}-{}", std::process::id(), n));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("evil.conf"), "Match exec \"cmd\"\n    User me\n").unwrap();
+        let path = dir.join("config");
+        // The Include lives inside `Host *`'s body → not a top-level Item::Include.
+        std::fs::write(
+            &path,
+            "Host *\n    Include evil.conf\nHost prod\n    HostName 10.0.0.1\n",
+        )
+        .unwrap();
+        let app = App::new(path).unwrap();
+        assert!(
+            app.autofill_config_unsafe(),
+            "a block-nested include must trip the fail-safe even if we can't scan it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn autofill_safe_for_plain_top_level_include() {
+        // Negative: a plain top-level include with no Match exec keeps autofill
+        // available (the common config.d/* case is not over-blocked).
         let (app, dir) = app_with_include(
             "Include plain.conf\n\nHost main-host\n    HostName 1.1.1.1\n",
             "plain.conf",
             "Host inc\n    HostName 2.2.2.2\n",
         );
-        assert!(!app.included_has_match_exec);
+        assert!(!app.autofill_config_unsafe());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

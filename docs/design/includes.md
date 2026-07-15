@@ -38,11 +38,11 @@ flowchart TB
   - **循環ガード**: 正規化パス（`canonicalize` best-effort・失敗時は正規化前パス）の **visited set** で同一ファイルの再訪を防ぐ。
   - **fail-soft**: 読めない included パス（存在しない・権限なし）はスキップして続行（起動を止めない）。OpenSSH も欠損 Include を致命とはしない。
   - 各 included ファイルは既存 `parser::parse` で独立の `SshConfig` にし、`host_views()` を投影（`HostView::from_block` は pathless なので origin は includes 層が別途持つ）。
-- **`App` 状態**: `config: SshConfig`（メイン・**不変**）＋ `included: Vec<IncludedHost>`（read-only 投影＝`{ origin: PathBuf, view: HostView, shadowed: bool }`）＋ `included_has_match_exec: bool`（rebuild 時に `Expansion.texts` を走査して算出）。`host_items: Vec<HostRef>` を新設し、既存の `host_items: Vec<usize>` を置換。
+- **`App` 状態**: `config: SshConfig`（メイン・**不変**）＋ `included: Vec<IncludedHost>`（read-only 投影＝`{ origin: PathBuf, view: HostView, shadowed: bool }`）。`host_items: Vec<HostRef>` を新設し、既存の `host_items: Vec<usize>` を置換。autofill 安全判定はキャッシュせず接続時に再展開する（下記）。
   - `HostRef`（**専用 enum・型で守る**）: `enum HostRef { Main(usize), Included(usize) }`。`Main(item_index)` は `config.items` の index、`Included(k)` は `App::included` の index。**write 経路（`apply_view`/`delete_host`）には `Main` しか渡せない型設計**（Issue の「タプルでなく専用構造体で型を守れ」を直接実装）。
 - **`App::rebuild_hosts()`**: メイン `config.host_views()` の HostView と `included` の HostView を **flat `hosts` に連結**し、`host_items` を `HostRef` で並行構築。**liveness/ソート/検索/一覧描画は既存どおり hosts-index（flat 位置）キーのまま変更不要**（included ホストも flat Vec に載るだけ）。
 - **編集/削除経路**: `open_edit`（`update.rs`）・delete キー・action menu の Delete が `host_items[h]` を読む箇所を `HostRef` 分岐に変える。`Included` は `Screen::Edit`/`ConfirmAction::DeleteHost` を開かず **sticky トースト**（例:「included host is read-only — edit the source file directly」）で退避。
-- **Match-exec 安全チェックの全ファイル化（`app.rs`/`update.rs`）**: `os/resolve.rs::has_match_exec` 自体は不変。代わりに `App::included_has_match_exec`（included 各ファイルのテキストを `has_match_exec` で走査した OR）を rebuild 時に算出し、`App::effective_has_match_exec()`（＝メイン render の `has_match_exec` OR `included_has_match_exec`）を新設。接続時 env-injection ゲートと SFTP arm ゲートがこれを呼び、included ファイルの `Match exec` を見逃さない。インスペクタ（#43）は既存どおり `has_include` で Include 有り時に退避するため変更不要（安全側で保持）。
+- **autofill 安全ゲートの保守的 fail-safe（`app.rs`/`update.rs`）**: `os/resolve.rs` は不変。`App::autofill_config_unsafe()` を新設し、接続時 env-injection ゲートと SFTP arm ゲートが**接続前に呼ぶたび再展開**して判定する（rebuild キャッシュを使わない＝外部ツールが included を書き換えても stale にならない）。判定は「メイン render に `Match exec`」OR「いずれかの included ファイル（lossy 読みで非 UTF-8 も走査）に `Match exec`」OR「`ssh -G` が honor するが expand が追えない include 形式＝`Expansion.blind_spot`」で**安全側に倒す**。`blind_spot` は expand が (a) ブロック内 conditional include (b) クオート splice `"Include"` (c) 深さ `MAX_DEPTH` 超、を検出したとき真。インスペクタ（#43）は既存どおり `has_include` で退避（変更不要）。
 - **`ui/list.rs`**: included 行のエイリアス直後に **origin をディム表示**（`⟨config.d/1p⟩` 風・`theme.rs` の色）、shadowed（重複・先勝ちで陰る）行を **`⊘`**。既存の空一覧バナー `include_note`（「hosts in included files are not shown」）は意味を失うので**撤去 or 文言更新**。
 
 ## データフロー・主要シーケンス
@@ -82,9 +82,9 @@ sequenceDiagram
 - **read-only 先行（2 段階・#52 の強い推奨）**: 「誤ファイルへの外科的書き込み」が最大の事故クラス。read-only 段では included への書き込みが**そもそも発生しない**ため事故クラス自体を回避する。編集対応は別 Issue（第 2 段）。
 - **メイン不変＋別 read-only リスト（論点 1 採択）**: 最も実績があり最もテストされた**単一ファイル writer 経路（`apply_view`/`delete_host`/`save`）を無変更**に保つ。included は独立 `SshConfig` を投影した別リストに載せるだけ。編集段 Issue で `App::config` を `Vec<SshConfig>` へ発展させ、そのとき write 経路のリスクを正面からレビューする（今回はその大改修を前倒ししない）。
 - **`HostRef` 専用 enum で型を守る**: bare タプル `(file, item)` を避け、`Included` バリアントを write 経路へ**型で渡せない**設計にする（Issue の明示要求）。持ち回り箇所（`Screen::Edit`/`ConfirmAction::DeleteHost`/`PendingSave::Apply`/`host_items` の全変換点）はコンパイラが洗い出す。
-- **glob クレート採択（論点 2）**: 主用途（`Include ~/.ssh/config.d/*`）を正しくカバー。自作は `[...]`/複数成分/OpenSSH 挙動との乖離リスクがあるため避ける。
+- **glob クレート採択（論点 2）**: 主用途（`Include ~/.ssh/config.d/*`）を正しくカバー。自作は `[...]`/複数成分/OpenSSH 挙動との乖離リスクがあるため避ける。（安全上の残存: Rust `glob` と OpenSSH `glob(3)` のマッチ集合が乖離し、ssh のみが読むファイルに `Match exec` があると autofill 走査が取りこぼしうる。攻撃者が `~/.ssh/config.d/` に書き込め、かつ glob 意味論が食い違う必要がある narrow な残存として受容＝security-reviewer 指摘。）
 - **インライン origin 表示（論点 3・既存 chip 流儀）**: フラットな**ファジーランク一覧**（`nucleo-matcher`）と hosts-index 位置キーの liveness を崩さないため、ファイル別グルーピングではなくエイリアス直後の**ディム origin** とする（ui.md #45 のタグ chip パターンと一貫）。
-- **Match-exec 安全チェックの全ファイル化**: `ssh -G` が honor する included の `Match exec` を接続/SFTP autofill ゲートが見逃さないよう、`App::effective_has_match_exec()`（メイン render ＋ included テキストの走査）で判定する（`os/resolve.rs` は不変）。ただし本 read-only は**トップレベル Include のみ追従**するため、`ssh -G` が honor しうる**ネスト/クオート splice Include** の残存 blind spot に対しては `has_include` ベースのインスペクタブロック（#43）を**保持**する（安全側）。
+- **autofill 安全ゲートは保守的 fail-safe（read-only の要）**: `ssh -G` が honor する `Match exec` は autofill 時に predicate を実行してしまうため、接続/SFTP autofill ゲートは**完全にスキャンできない include 形式（ブロック内 conditional・クオート splice・深さ超）があれば autofill を無効化**する（`autofill_config_unsafe` の `blind_spot`）。expand は listing 用にトップレベル Include のみ追従するが、**安全ゲートは追えない形式を「安全」と仮定せず fail-safe に倒す**（listing の網羅性と安全判定を分離＝security-reviewer 指摘への対応）。主流のトップレベル `config.d/*` は完全走査できるため autofill は維持され、exotic な config だけ手動パスワードにフォールバックする。ゲートは接続前に再展開して stale を避け、included テキストは lossy 走査で非 UTF-8 ファイルも見る。残る blind spot（同一ファイル内でトップレベル include と別のクオート include が混在する等の非現実的ケース）は over-block 側に倒れる（安全）。
 - **OpenSSH 先勝ち（first-wins）の表示**: 実接続は素の `ssh <alias>` で OpenSSH 自身が先勝ち解決するため、sshm 側の重複表示（`⊘`）は**情報提供**（挙動を変えない）。
 
 ## UI/画面設計（採択案＝インライン origin・ワイヤーフレーム）
@@ -114,10 +114,10 @@ sequenceDiagram
 - [x] Given 相対パス Include（`Include work/*.conf`）とチルダ（`~/…`）, When 展開, Then ~/.ssh 基準・home 展開で解決される
 - [x] Given 循環 Include（A→B→A）や深いネスト, When 展開, Then visited-set ＋ 深さ上限（8）で無限ループ/暴走しない
 - [x] Given 読めない included パス, When 展開, Then スキップして続行する（起動を止めない・fail-soft）
-- [x] Given included ファイルに `Match exec`, When 接続/SFTP autofill の安全ゲート判定, Then `effective_has_match_exec` が全ファイル走査で安全側に倒す
+- [x] Given included ファイルに `Match exec`（トップレベル・ブロック内・クオート splice・深さ超のいずれの include 経由でも）, When 接続/SFTP autofill の安全ゲート判定, Then `autofill_config_unsafe` が検出 or `blind_spot` fail-safe で autofill を無効化する
 - [x] Given included ホスト, When 保存/削除経路が呼ばれうる, Then included ファイルへは一切書き込まない（read-only 不変条件・テストで固定）
 - [x] Given Include が展開された, When 空一覧, Then `include_note` バナー文言を更新する
 
 ## 変更したファイル
 
-新規 `src/config/includes.rs`、`src/config/mod.rs`（`pub mod includes`）、`src/app.rs`（`HostRef`・`included`・`included_has_match_exec`・`rebuild_hosts`・`expand_includes`・`effective_has_match_exec`・`toast_included_readonly`）、`src/update.rs`（編集/削除/identity の HostRef 分岐・2 つの autofill ゲートを `effective_has_match_exec` に）、`src/ui/list.rs`（origin 表示・`⊘`・`include_note` 文言）、`Cargo.toml`/`Cargo.lock`（`glob`）。**`os/resolve.rs`・編集フォーム・writer・vault・askpass は不変**。
+新規 `src/config/includes.rs`（`expand`／`Expansion.blind_spot`／position-aware shadow／lossy 読み）、`src/config/mod.rs`（`pub mod includes`）、`src/app.rs`（`HostRef`・`included`・`rebuild_hosts`・`expand_includes`・`autofill_config_unsafe`・`toast_included_readonly`）、`src/update.rs`（編集/削除/identity の HostRef 分岐・2 つの autofill ゲートを `autofill_config_unsafe` に）、`src/ui/list.rs`（origin 表示・`⊘`・`include_note` 文言）、`Cargo.toml`/`Cargo.lock`（`glob`）。**`os/resolve.rs`・編集フォーム・writer・vault・askpass は不変**。

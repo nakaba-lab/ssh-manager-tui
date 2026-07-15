@@ -862,10 +862,6 @@ pub struct App {
     /// Read-only hosts expanded from `Include`d files (#52), forming the tail of
     /// `hosts`. Rebuilt by [`App::rebuild_hosts`]; never written back.
     pub included: Vec<crate::config::includes::IncludedHost>,
-    /// True when any `Include`d file carries a `Match exec` directive, so the
-    /// connect/SFTP autofill gates scan the whole effective config (main +
-    /// includes), not just the main file (#52). Precomputed at rebuild.
-    pub included_has_match_exec: bool,
 
     // --- S1 list ---
     pub focus: ListFocus,
@@ -1004,7 +1000,6 @@ impl App {
             hosts: Vec::new(),
             host_items: Vec::new(),
             included: Vec::new(),
-            included_has_match_exec: false,
             focus: ListFocus::Hosts,
             list_state: TableState::default(),
             detail_scroll: 0,
@@ -1090,9 +1085,7 @@ impl App {
         // Read-only expansion of `Include`d files (#52): re-expand so the list
         // reflects the current main file. Main hosts come first (editable), then
         // the read-only included hosts as the tail of `hosts`.
-        let (included, included_has_match_exec) = self.expand_includes();
-        self.included = included;
-        self.included_has_match_exec = included_has_match_exec;
+        self.included = self.expand_includes().hosts;
 
         let main_views = self.config.host_views();
         let total = main_views.len() + self.included.len();
@@ -1118,13 +1111,11 @@ impl App {
         self.clamp_selection();
     }
 
-    /// Expand the main config's `Include` directives into read-only hosts, and
-    /// report whether any included file carries a `Match exec` (#52). Relative
+    /// Expand the main config's `Include` directives (read-only, #52). Relative
     /// includes resolve against the main config's directory (OpenSSH's `~/.ssh`);
-    /// a missing home directory yields no expansion (fail-soft).
-    fn expand_includes(&self) -> (Vec<crate::config::includes::IncludedHost>, bool) {
-        // `home` only drives tilde expansion; relative includes resolve against the
-        // config's own directory, so a missing home must not skip expansion.
+    /// `home` only drives tilde expansion, so a missing home must not skip
+    /// expansion of relative/absolute includes.
+    fn expand_includes(&self) -> crate::config::includes::Expansion {
         let home = dirs::home_dir().unwrap_or_default();
         let base_dir = self
             .config
@@ -1132,21 +1123,27 @@ impl App {
             .parent()
             .map(std::path::Path::to_path_buf)
             .unwrap_or_else(|| home.join(".ssh"));
-        let expansion = crate::config::includes::expand(&self.config, &base_dir, &home);
-        let has_match_exec = expansion
-            .texts
-            .iter()
-            .any(|t| crate::os::resolve::has_match_exec(t));
-        (expansion.hosts, has_match_exec)
+        crate::config::includes::expand(&self.config, &base_dir, &home)
     }
 
-    /// Whether the *effective* config — the main file **and** every `Include`d
-    /// file (#52) — carries a `Match exec` directive. The connect/SFTP autofill
-    /// gates consult this so a predicate hiding in an included file can't slip
-    /// past a main-file-only scan; `included_has_match_exec` is precomputed at
-    /// [`App::rebuild_hosts`].
-    pub fn effective_has_match_exec(&self) -> bool {
-        crate::os::resolve::has_match_exec(&self.config.render()) || self.included_has_match_exec
+    /// Whether connect-time secret **autofill must be withheld** because the
+    /// effective config — the main file **and** every `Include`d file `ssh -G`
+    /// would read (#52) — either carries a `Match exec` (which `ssh -G` would
+    /// execute) or uses an include form we cannot fully scan (block-nested /
+    /// quote-spliced / past `MAX_DEPTH`). It **fails safe**: an un-scannable
+    /// include is treated as unsafe rather than assumed clean. Re-expands at call
+    /// time so an externally-modified include is re-scanned before each connect
+    /// (autofill is off the hot path, so the extra read is fine).
+    pub fn autofill_config_unsafe(&self) -> bool {
+        if crate::os::resolve::has_match_exec(&self.config.render()) {
+            return true;
+        }
+        let expansion = self.expand_includes();
+        expansion.blind_spot
+            || expansion
+                .texts
+                .iter()
+                .any(|t| crate::os::resolve::has_match_exec(t))
     }
 
     /// Sticky toast shown when an `Include`d host's edit/delete is refused — it is
