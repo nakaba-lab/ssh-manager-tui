@@ -837,6 +837,17 @@ fn friendly_sftp_error(msg: &str, auth_failure: bool) -> String {
     }
 }
 
+/// Source of a host in the flattened [`App::hosts`] list. A `Main` host lives in
+/// the editable main config (indexed into `config.items`); an `Included` host is
+/// a **read-only** projection from an `Include`d file (indexed into
+/// [`App::included`]). Only `Main` reaches the surgical writer, so the type makes
+/// an included host structurally uneditable (#52).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostRef {
+    Main(usize),
+    Included(usize),
+}
+
 pub struct App {
     pub should_quit: bool,
     pub screen: Screen,
@@ -845,8 +856,16 @@ pub struct App {
     // --- config domain ---
     pub config: SshConfig,
     pub hosts: Vec<HostView>,
-    /// `config.items` index for each entry in `hosts`.
-    pub host_items: Vec<usize>,
+    /// Source (main-config item index, or read-only include) for each `hosts`
+    /// entry. `hosts` lists main hosts first, then read-only included hosts.
+    pub host_items: Vec<HostRef>,
+    /// Read-only hosts expanded from `Include`d files (#52), forming the tail of
+    /// `hosts`. Rebuilt by [`App::rebuild_hosts`]; never written back.
+    pub included: Vec<crate::config::includes::IncludedHost>,
+    /// True when any `Include`d file carries a `Match exec` directive, so the
+    /// connect/SFTP autofill gates scan the whole effective config (main +
+    /// includes), not just the main file (#52). Precomputed at rebuild.
+    pub included_has_match_exec: bool,
 
     // --- S1 list ---
     pub focus: ListFocus,
@@ -984,6 +1003,8 @@ impl App {
             config,
             hosts: Vec::new(),
             host_items: Vec::new(),
+            included: Vec::new(),
+            included_has_match_exec: false,
             focus: ListFocus::Hosts,
             list_state: TableState::default(),
             detail_scroll: 0,
@@ -1066,9 +1087,28 @@ impl App {
     /// Liveness is keyed by host index, which can shift when hosts are added or
     /// removed, so clear it here; callers re-probe afterwards.
     pub fn rebuild_hosts(&mut self) {
-        let views = self.config.host_views();
-        self.host_items = views.iter().map(|(i, _)| *i).collect();
-        self.hosts = views.into_iter().map(|(_, v)| v).collect();
+        // Read-only expansion of `Include`d files (#52): re-expand so the list
+        // reflects the current main file. Main hosts come first (editable), then
+        // the read-only included hosts as the tail of `hosts`.
+        let (included, included_has_match_exec) = self.expand_includes();
+        self.included = included;
+        self.included_has_match_exec = included_has_match_exec;
+
+        let main_views = self.config.host_views();
+        let total = main_views.len() + self.included.len();
+        let mut hosts = Vec::with_capacity(total);
+        let mut host_items = Vec::with_capacity(total);
+        for (item_index, view) in main_views {
+            host_items.push(HostRef::Main(item_index));
+            hosts.push(view);
+        }
+        for (k, inc) in self.included.iter().enumerate() {
+            host_items.push(HostRef::Included(k));
+            hosts.push(inc.view.clone());
+        }
+        self.hosts = hosts;
+        self.host_items = host_items;
+
         self.liveness.clear();
         self.rtt.clear();
         // A host edit can change what a confirmed target resolves to, so the
@@ -1076,6 +1116,46 @@ impl App {
         self.confirmed_password_targets.clear();
         self.refilter();
         self.clamp_selection();
+    }
+
+    /// Expand the main config's `Include` directives into read-only hosts, and
+    /// report whether any included file carries a `Match exec` (#52). Relative
+    /// includes resolve against the main config's directory (OpenSSH's `~/.ssh`);
+    /// a missing home directory yields no expansion (fail-soft).
+    fn expand_includes(&self) -> (Vec<crate::config::includes::IncludedHost>, bool) {
+        // `home` only drives tilde expansion; relative includes resolve against the
+        // config's own directory, so a missing home must not skip expansion.
+        let home = dirs::home_dir().unwrap_or_default();
+        let base_dir = self
+            .config
+            .path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| home.join(".ssh"));
+        let expansion = crate::config::includes::expand(&self.config, &base_dir, &home);
+        let has_match_exec = expansion
+            .texts
+            .iter()
+            .any(|t| crate::os::resolve::has_match_exec(t));
+        (expansion.hosts, has_match_exec)
+    }
+
+    /// Whether the *effective* config — the main file **and** every `Include`d
+    /// file (#52) — carries a `Match exec` directive. The connect/SFTP autofill
+    /// gates consult this so a predicate hiding in an included file can't slip
+    /// past a main-file-only scan; `included_has_match_exec` is precomputed at
+    /// [`App::rebuild_hosts`].
+    pub fn effective_has_match_exec(&self) -> bool {
+        crate::os::resolve::has_match_exec(&self.config.render()) || self.included_has_match_exec
+    }
+
+    /// Sticky toast shown when an `Include`d host's edit/delete is refused — it is
+    /// read-only in sshm and its source file must be edited directly (#52).
+    pub fn toast_included_readonly(&mut self) {
+        self.toast(
+            "included host is read-only — edit its source file directly",
+            true,
+        );
     }
 
     /// The shared connect-time **candidacy** predicate: which secret kinds a host

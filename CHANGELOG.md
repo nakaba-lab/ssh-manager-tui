@@ -25,6 +25,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   真実の源泉のまま。タグは一覧でエイリアス右にチップ表示され、`/` 検索の対象にもなる（既存の
   ファジー検索に畳み込み）。編集フォームの Metadata 欄で編集でき、`# sshm:` 接頭辞の付かない
   第三者コメント（`# Managed by Ansible` 等）はバイト単位で保持され書き換えない（#45）。
+- `~/.ssh/config` の `Include` で分割された構成（1Password / Ansible 等が生成する `config.d/*`
+  など）のホストも一覧・閲覧できるようになった。included ファイルのホストは元ファイル名を添えて
+  表示され、閲覧専用（誤って別ファイルへ書き込まないよう、編集・削除は元ファイルのメインホストのみ）。
+  同名エイリアスの重複は OpenSSH の先勝ちを `⊘` で明示する。チルダ・相対パス・glob（`config.d/*`）を
+  OpenSSH 準拠で解決し、循環や深いネストも安全に打ち切る（#52）。
 
 ---
 
