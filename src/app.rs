@@ -1116,6 +1116,13 @@ impl App {
     /// `home` only drives tilde expansion, so a missing home must not skip
     /// expansion of relative/absolute includes.
     fn expand_includes(&self) -> crate::config::includes::Expansion {
+        self.expand_includes_of(&self.config)
+    }
+
+    /// [`App::expand_includes`] for an arbitrary document loaded from the same
+    /// path — used by the safety gate, which expands the config as it exists **on
+    /// disk** (what `ssh -G` reads) rather than the in-memory projection.
+    fn expand_includes_of(&self, cfg: &SshConfig) -> crate::config::includes::Expansion {
         let home = dirs::home_dir().unwrap_or_default();
         let base_dir = self
             .config
@@ -1123,7 +1130,7 @@ impl App {
             .parent()
             .map(std::path::Path::to_path_buf)
             .unwrap_or_else(|| home.join(".ssh"));
-        crate::config::includes::expand(&self.config, &base_dir, &home)
+        crate::config::includes::expand(cfg, &base_dir, &home)
     }
 
     /// Why running `ssh -G` on this config could **execute** a `Match exec`
@@ -1139,13 +1146,33 @@ impl App {
     /// rather than assumed clean. A plain, scannable `Include` is NOT a risk by
     /// itself, so the common `config.d/*` setup keeps autofill and the inspector.
     ///
-    /// Re-expands at call time so an externally-modified include is re-scanned
-    /// before each use (all three callers are off the hot path).
+    /// Everything is re-read at call time — the main file **and** its includes — so
+    /// an externally edited config is re-scanned before each use (all three callers
+    /// are off the hot path). What `ssh -G` reads is the file **on disk**, so that
+    /// is the document expanded here; the in-memory render is scanned too, purely
+    /// as a belt-and-braces over-block for unsaved edits.
+    ///
+    /// **Caveat**: `ssh -G` always reads `~/.ssh/config`, while this scans the
+    /// document sshm loaded. Under `--config <path>` (a manual-testing aid) those
+    /// differ, so the verdict describes the loaded file, not the one ssh will read.
     pub fn ssh_g_exec_risk(&self) -> Option<&'static str> {
-        if has_match_exec(&self.config.render()) {
+        let on_disk = std::fs::read(&self.config.path)
+            .ok()
+            .map(|b| String::from_utf8_lossy(&b).into_owned());
+        if has_match_exec(&self.config.render()) || on_disk.as_deref().is_some_and(has_match_exec) {
             return Some("host config uses `Match exec` — ssh -G would run it; skipped");
         }
-        let expansion = self.expand_includes();
+        // Expand from the on-disk document when it is readable: an `Include` added
+        // externally must be followed, since `ssh -G` would follow it.
+        let parsed;
+        let scan_target = match &on_disk {
+            Some(text) => {
+                parsed = crate::config::parser::parse(self.config.path.clone(), text);
+                &parsed
+            }
+            None => &self.config,
+        };
+        let expansion = self.expand_includes_of(scan_target);
         if expansion.texts.iter().any(|t| has_match_exec(t)) {
             return Some("an included file uses `Match exec` — ssh -G would run it; skipped");
         }

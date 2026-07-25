@@ -3,7 +3,7 @@ title: ui 領域 設計
 area: ui
 status: active
 relatedIssues: [43, 44, 45, 65]
-updated: 2026-07-15
+updated: 2026-07-25
 ---
 
 # ui 領域 設計（`src/ui/` — TUI 描画）

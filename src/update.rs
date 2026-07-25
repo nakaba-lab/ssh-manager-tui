@@ -5156,30 +5156,20 @@ mod tests {
     }
 
     #[test]
-    fn inspect_not_refused_for_benign_include() {
-        // #65: the inspector used to refuse on ANY `Include` (has_include). With the
-        // shared gate it only refuses on a real exec risk, so a clean `config.d/*`
-        // config gets past the gate. (ssh -G itself may still fail in a sandbox with
-        // no OpenSSH — that is a different, non-gate toast.)
-        let (mut app, dir) = app_with_include(
-            "Include plain.conf\n\nHost main-host\n    HostName 1.1.1.1\n",
-            "plain.conf",
-            "Host inc\n    HostName 2.2.2.2\n",
-        );
-        app.list_state.select(Some(0));
-        open_inspect(&mut app);
-        assert!(
-            !app.toast.text.contains("can't verify"),
-            "a benign include must not be refused by the gate, got: {:?}",
-            app.toast.text
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn inspect_refused_for_match_exec_in_included_file() {
-        // The inspector must still refuse when an INCLUDED file carries `Match exec`
+        // The inspector must refuse when an INCLUDED file carries `Match exec`
         // (previously covered only incidentally by the blanket has_include block).
+        //
+        // This also pins the WIRING: asserting the toast carries the gate's own
+        // reason distinguishes "the gate refused" from "the gate was skipped and
+        // `ssh -G` merely failed" — the latter also yields a sticky error toast, so
+        // a state-only assertion here would pass even with the gate removed.
+        //
+        // NOTE: the benign-include direction is deliberately NOT tested through
+        // `open_inspect`: passing the gate runs the real `ssh -G` against the
+        // developer's own `~/.ssh/config` (production never passes `-F`), which is
+        // environment-dependent and could execute their own `Match exec`. The gate
+        // itself is covered by `ssh_g_exec_risk_none_for_benign_include`.
         let (mut app, dir) = app_with_include(
             "Include danger.conf\n\nHost main-host\n    HostName 1.1.1.1\n",
             "danger.conf",
@@ -5193,6 +5183,11 @@ mod tests {
             "inspector must not open when ssh -G would run a predicate"
         );
         assert!(app.toast.is_error, "refusal is a sticky error toast");
+        assert!(
+            app.toast.text.contains("Match exec"),
+            "the refusal must come from the gate, got: {:?}",
+            app.toast.text
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
