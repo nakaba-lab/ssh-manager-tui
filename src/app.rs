@@ -1119,13 +1119,13 @@ impl App {
         self.expand_includes_of(&self.config)
     }
 
-    /// [`App::expand_includes`] for an arbitrary document loaded from the same
-    /// path — used by the safety gate, which expands the config as it exists **on
-    /// disk** (what `ssh -G` reads) rather than the in-memory projection.
+    /// [`App::expand_includes`] for an arbitrary document — used by the safety
+    /// gate, which expands each config as it exists **on disk** (what `ssh -G`
+    /// reads) rather than the in-memory projection. Relative includes resolve
+    /// against that document's own directory.
     fn expand_includes_of(&self, cfg: &SshConfig) -> crate::config::includes::Expansion {
         let home = dirs::home_dir().unwrap_or_default();
-        let base_dir = self
-            .config
+        let base_dir = cfg
             .path
             .parent()
             .map(std::path::Path::to_path_buf)
@@ -1146,38 +1146,53 @@ impl App {
     /// rather than assumed clean. A plain, scannable `Include` is NOT a risk by
     /// itself, so the common `config.d/*` setup keeps autofill and the inspector.
     ///
-    /// Everything is re-read at call time — the main file **and** its includes — so
-    /// an externally edited config is re-scanned before each use (all three callers
-    /// are off the hot path). What `ssh -G` reads is the file **on disk**, so that
-    /// is the document expanded here; the in-memory render is scanned too, purely
+    /// Everything is re-read at call time — each root config **and** its includes —
+    /// so an externally edited config is re-scanned before each use (all three
+    /// callers are off the hot path). What `ssh -G` reads is the file **on disk**,
+    /// so that is what gets expanded; the in-memory render is scanned too, purely
     /// as a belt-and-braces over-block for unsaved edits.
     ///
-    /// **Caveat**: `ssh -G` always reads `~/.ssh/config`, while this scans the
-    /// document sshm loaded. Under `--config <path>` (a manual-testing aid) those
-    /// differ, so the verdict describes the loaded file, not the one ssh will read.
+    /// Two roots are scanned: the document sshm loaded **and** the default
+    /// `~/.ssh/config` when `--config <path>` made those differ — production never
+    /// passes `-F`, so `ssh -G` reads the default one regardless of what sshm
+    /// loaded. The system-wide config (`/etc/ssh/ssh_config`) is deliberately out
+    /// of scope: it is root-owned, outside this threat model.
+    ///
+    /// Residual race: a config can be rewritten between this scan and `ssh -G`
+    /// starting. That is inherent to any out-of-process gate; this only narrows it.
     pub fn ssh_g_exec_risk(&self) -> Option<&'static str> {
-        let on_disk = std::fs::read(&self.config.path)
-            .ok()
-            .map(|b| String::from_utf8_lossy(&b).into_owned());
-        if has_match_exec(&self.config.render()) || on_disk.as_deref().is_some_and(has_match_exec) {
-            return Some("host config uses `Match exec` — ssh -G would run it; skipped");
+        use crate::config::includes::{ReadOutcome, read_config_text};
+        const MAIN: &str = "host config uses `Match exec` — ssh -G would run it; skipped";
+        const INCLUDED: &str = "an included file uses `Match exec` — ssh -G would run it; skipped";
+        const UNVERIFIABLE: &str =
+            "config uses an `Include` form we can't verify — skipped for safety";
+
+        // Unsaved in-memory edits: an over-block only, since ssh -G reads the disk.
+        if has_match_exec(&self.config.render()) {
+            return Some(MAIN);
         }
-        // Expand from the on-disk document when it is readable: an `Include` added
-        // externally must be followed, since `ssh -G` would follow it.
-        let parsed;
-        let scan_target = match &on_disk {
-            Some(text) => {
-                parsed = crate::config::parser::parse(self.config.path.clone(), text);
-                &parsed
+        let mut roots = vec![self.config.path.clone()];
+        if let Ok(default) = crate::config::default_config_path()
+            && default != self.config.path
+        {
+            roots.push(default);
+        }
+        for root in roots {
+            let text = match read_config_text(&root) {
+                ReadOutcome::Text(t) => t,
+                ReadOutcome::Missing => continue, // ssh cannot read it either
+                ReadOutcome::Unscannable => return Some(UNVERIFIABLE),
+            };
+            if has_match_exec(&text) {
+                return Some(MAIN);
             }
-            None => &self.config,
-        };
-        let expansion = self.expand_includes_of(scan_target);
-        if expansion.texts.iter().any(|t| has_match_exec(t)) {
-            return Some("an included file uses `Match exec` — ssh -G would run it; skipped");
-        }
-        if expansion.blind_spot {
-            return Some("config uses an `Include` form we can't verify — skipped for safety");
+            let expansion = self.expand_includes_of(&crate::config::parser::parse(root, &text));
+            if expansion.texts.iter().any(|t| has_match_exec(t)) {
+                return Some(INCLUDED);
+            }
+            if expansion.blind_spot {
+                return Some(UNVERIFIABLE);
+            }
         }
         None
     }
