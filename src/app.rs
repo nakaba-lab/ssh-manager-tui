@@ -21,7 +21,7 @@ use crate::os::history::History;
 use crate::os::keys::KeyInfo;
 use crate::os::known_hosts::{HostSpec, KnownHostEntry};
 use crate::os::liveness::{Liveness, LivenessProbe, ProbeTarget};
-use crate::os::resolve::ResolvedConfig;
+use crate::os::resolve::{ResolvedConfig, has_match_exec};
 use crate::os::sftp::{RemoteEntry, SftpEvent, SftpSession};
 use crate::os::vault::{MatchedKinds, SecretKind, Vault, match_vault_kinds};
 use crate::os::{self, keys, known_hosts};
@@ -1126,24 +1126,39 @@ impl App {
         crate::config::includes::expand(&self.config, &base_dir, &home)
     }
 
-    /// Whether connect-time secret **autofill must be withheld** because the
-    /// effective config — the main file **and** every `Include`d file `ssh -G`
-    /// would read (#52) — either carries a `Match exec` (which `ssh -G` would
-    /// execute) or uses an include form we cannot fully scan (block-nested /
-    /// quote-spliced / past `MAX_DEPTH`). It **fails safe**: an un-scannable
-    /// include is treated as unsafe rather than assumed clean. Re-expands at call
-    /// time so an externally-modified include is re-scanned before each connect
-    /// (autofill is off the hot path, so the extra read is fine).
-    pub fn autofill_config_unsafe(&self) -> bool {
-        if crate::os::resolve::has_match_exec(&self.config.render()) {
-            return true;
+    /// Why running `ssh -G` on this config could **execute** a `Match exec`
+    /// predicate, or `None` when it is safe to run (#65). The single gate shared by
+    /// every `ssh -G` caller — connect-time autofill, the SFTP arm, and the
+    /// effective-config inspector (#43) — so those paths can never disagree about
+    /// what counts as risky.
+    ///
+    /// Risky means: the main file carries a `Match exec`; **or** any `Include`d
+    /// file `ssh -G` would read carries one (#52); **or** the config uses an
+    /// include form we cannot follow (block-nested / quote-spliced / past
+    /// `MAX_DEPTH`), which **fails safe** — un-scannable is treated as unsafe
+    /// rather than assumed clean. A plain, scannable `Include` is NOT a risk by
+    /// itself, so the common `config.d/*` setup keeps autofill and the inspector.
+    ///
+    /// Re-expands at call time so an externally-modified include is re-scanned
+    /// before each use (all three callers are off the hot path).
+    pub fn ssh_g_exec_risk(&self) -> Option<&'static str> {
+        if has_match_exec(&self.config.render()) {
+            return Some("host config uses `Match exec` — ssh -G would run it; skipped");
         }
         let expansion = self.expand_includes();
-        expansion.blind_spot
-            || expansion
-                .texts
-                .iter()
-                .any(|t| crate::os::resolve::has_match_exec(t))
+        if expansion.texts.iter().any(|t| has_match_exec(t)) {
+            return Some("an included file uses `Match exec` — ssh -G would run it; skipped");
+        }
+        if expansion.blind_spot {
+            return Some("config uses an `Include` form we can't verify — skipped for safety");
+        }
+        None
+    }
+
+    /// Whether connect-time secret **autofill must be withheld** because `ssh -G`
+    /// could execute a predicate (see [`App::ssh_g_exec_risk`]).
+    pub fn autofill_config_unsafe(&self) -> bool {
+        self.ssh_g_exec_risk().is_some()
     }
 
     /// Sticky toast shown when an `Include`d host's edit/delete is refused — it is

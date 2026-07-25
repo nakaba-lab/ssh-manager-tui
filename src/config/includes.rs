@@ -559,6 +559,36 @@ mod tests {
     }
 
     #[test]
+    fn equals_separated_include_is_followed_not_a_blind_spot() {
+        // `Include=path` is a normal top-level include: ssh honors it and so do we,
+        // so it is scanned (hosts surface) rather than flagged un-scannable.
+        let dir = temp_dir(".inc-equals");
+        std::fs::write(dir.join("a.conf"), "Host eq\n    HostName 1.1.1.1\n").unwrap();
+        let main = parser::parse(dir.join("config"), "Include=a.conf\n");
+        let expansion = expand(&main, &dir, &dir);
+        assert!(
+            !expansion.blind_spot,
+            "an `=`-separated include is followable"
+        );
+        assert_eq!(expansion.hosts.len(), 1, "its hosts are surfaced");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn commented_include_is_not_an_include() {
+        // A commented-out `# Include` must neither be followed nor flagged.
+        let dir = temp_dir(".inc-commented");
+        let main = parser::parse(
+            dir.join("config"),
+            "# Include other.conf\nHost a\n    HostName 1.1.1.1\n",
+        );
+        let expansion = expand(&main, &dir, &dir);
+        assert!(!expansion.blind_spot);
+        assert!(expansion.hosts.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn no_blind_spot_for_clean_top_level_includes() {
         let dir = temp_dir(".inc-clean");
         std::fs::write(dir.join("a.conf"), "Host a\n    HostName 1.1.1.1\n").unwrap();

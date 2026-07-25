@@ -2,7 +2,7 @@
 title: ui 領域 設計
 area: ui
 status: active
-relatedIssues: [43, 44, 45]
+relatedIssues: [43, 44, 45, 65]
 updated: 2026-07-15
 ---
 
@@ -28,7 +28,7 @@ updated: 2026-07-15
 - **画面遷移**: `Screen` enum が駆動。モーダルは `App::prev_screen` + `open_overlay`/`close_overlay`。画面/モード追加時は `Screen`（app.rs）・dispatch（update.rs）・draw（ui/mod.rs）の 3 箇所を触る。
 - **主要画面**: ホスト一覧（検索・到達性列・詳細ペイン）／編集フォーム／保存前 diff ／vault ／SFTP ブラウザ（2 ペイン）／鍵マネージャ／known_hosts ／**実効設定インスペクタ（`ssh -G` ビュー・#43）**／ヘルプ。キーバインドの一覧は [README](../../README.md#keybindings) が真実源。
 - **実効設定インスペクタ（`Screen::Inspect`・#43）**: ホスト一覧で `i` を押すと、選択ホストの `ssh -G` 実効設定を**フルスクリーンのベース画面**（`known_hosts` と同じ流儀＝`app.screen = Screen::Inspect` を直接設定・Esc で List へ戻る。モーダルオーバーレイではない）で表示する。`resolve.rs::resolve_full` の順序付き key/value を `/` の部分一致フィルタ（`kh_filtered` と同じ大小無視の substring）と j/k・g/G スクロールで閲覧する（v1 は閲覧専用＝値コピー等は対象外）。
-  - **開く前の安全ゲート（fail-safe）**: `i` 押下時、`inspect_block_reason(app.config.render())` が理由を返す（`has_match_exec` または `has_include` が真）なら `ssh -G` を実行せず sticky エラートーストで退避する。前者は `ssh -G` が `Match exec` の述語を実行してしまうため、後者は `has_match_exec` がメインファイルの render しか走査せず Include 先の `Match exec` を見逃す（#43 リスク#1）ため。**Include 検出は `has_match_exec` と同じ widen-only 正規化（クオート splice 除去・`=`→空白・コメント除外・インデント非依存）の text scan で行う**（パーサの `include_count()` は素の**トップレベル** Include しか数えず、`ssh -G` が honor する**ブロック内ネスト**・**クオート装飾**の Include を取りこぼすため＝これらを塞ぐ）。`ssh -G` がタイムアウト/非ゼロ/ssh 不在で失敗したときも sticky トーストを出し、インスペクタは開かない（半端な画面を出さない）。解決は開く瞬間に 1 回だけ走らせ（500ms 上限・UI スレッドは tick ごとにブロックしない設計を崩さない）、結果を App に載せてから描画する（`diff` プレビューと同じ「一度計算して載せる」流儀）。
+  - **開く前の安全ゲート（fail-safe・#65 で 3 経路統一）**: `i` 押下時、共有ゲート **`App::ssh_g_exec_risk()`** が理由を返すなら `ssh -G` を実行せず sticky エラートーストで退避する。判定は接続 autofill・SFTP arm と**同一**（メイン render の `Match exec` → Include 先ファイルの `Match exec` → 追えない include 形式＝`blind_spot`。詳細は [includes.md](./includes.md)）。#43 当初の「`Include` があれば一律退避」（`inspect_block_reason` + `has_include`）は #52 の include 展開で included ファイルを実際に走査できるようになったため置換・削除した。**benign な `config.d/*` 構成ではインスペクタが開く**ようになり、実 `Match exec` や追えない include 形式（ブロック内ネスト・クオート装飾・深さ超）では従来どおり安全側に退避する。`ssh -G` がタイムアウト/非ゼロ/ssh 不在で失敗したときも sticky トーストを出し、インスペクタは開かない（半端な画面を出さない）。解決は開く瞬間に 1 回だけ走らせ（500ms 上限・UI スレッドは tick ごとにブロックしない設計を崩さない）、結果を App に載せてから描画する（`diff` プレビューと同じ「一度計算して載せる」流儀）。
   - **表示の正直さ（#43 リスク#2）**: `ssh -G` はキーを小文字化し値を正規化しコンパイル時デフォルトも出すため、「書いた値」との単純比較で由来をハイライトすると誤分類する。由来ハイライトはせず、ヘッダで「`ssh -G` 正規化の**近似**」であることを明示する。
 - **ホストのタグ・説明（`# sshm:` コメント経由・#45）**: `~/.ssh/config` のホスト直上コメント（`# sshm:tags prod,db` / `# sshm:desc …`）で付与するメタデータ。データ層の設計は [config.md](./config.md)（`# sshm:` ディレクティブ）。UI 側は次の 4 箇所に閉じる（新 `Screen`・モーダルは増やさない）:
   - **一覧のタグ表示（採択案＝インライン chips）**: `draw_list_pane`（`ui/list.rs`）の Alias セル（`Line::from(vec![…])`）に、エイリアス名の直後へタグを chip 風に並べる。**専用カラムは増やさない**（到達性列/HostName/User と幅を競合させないため）。色は `theme.rs` のアクセント（ハードコードしない）。`responsive_split` の縦積み（90 桁未満）では幅に応じてタグを省略/折返す。
