@@ -21,7 +21,7 @@ jobs:
   design-doc:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
       - name: Require docs/design update
@@ -59,7 +59,7 @@ jobs:
   requirements-doc-check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7.0.1
       - name: Check required sections
         run: |
           set -euo pipefail
@@ -81,7 +81,7 @@ jobs:
   ui-section-check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7.0.1
       - name: Require UI section in kind:ui design docs
         run: |
           python3 - <<'EOF'
@@ -113,7 +113,7 @@ jobs:
   data-model-section-check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7.0.1
       - name: Require data model section in kind:data design docs
         run: |
           python3 - <<'EOF'
@@ -152,7 +152,7 @@ jobs:
   docs-site-schema-check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
       - name: Detect docs-site / docs/design changes
