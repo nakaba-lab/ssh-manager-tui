@@ -862,6 +862,11 @@ pub struct App {
     /// Read-only hosts expanded from `Include`d files (#52), forming the tail of
     /// `hosts`. Rebuilt by [`App::rebuild_hosts`]; never written back.
     pub included: Vec<crate::config::includes::IncludedHost>,
+    /// The default `~/.ssh/config` — the file `ssh -G` reads no matter what
+    /// `--config` loaded — scanned as a second root by [`App::ssh_g_exec_risk`]
+    /// (#65). `None` when there is no home directory, and in tests, which must not
+    /// depend on the developer's real config.
+    pub default_config_root: Option<std::path::PathBuf>,
 
     // --- S1 list ---
     pub focus: ListFocus,
@@ -1000,6 +1005,7 @@ impl App {
             hosts: Vec::new(),
             host_items: Vec::new(),
             included: Vec::new(),
+            default_config_root: crate::config::default_config_path().ok(),
             focus: ListFocus::Hosts,
             list_state: TableState::default(),
             detail_scroll: 0,
@@ -1163,6 +1169,7 @@ impl App {
     pub fn ssh_g_exec_risk(&self) -> Option<&'static str> {
         use crate::config::includes::{ReadOutcome, read_config_text};
         const MAIN: &str = "host config uses `Match exec` — ssh -G would run it; skipped";
+        const DEFAULT_ROOT: &str = "~/.ssh/config uses `Match exec` — ssh -G would run it; skipped";
         const INCLUDED: &str = "an included file uses `Match exec` — ssh -G would run it; skipped";
         const UNVERIFIABLE: &str =
             "config uses an `Include` form we can't verify — skipped for safety";
@@ -1172,19 +1179,22 @@ impl App {
             return Some(MAIN);
         }
         let mut roots = vec![self.config.path.clone()];
-        if let Ok(default) = crate::config::default_config_path()
-            && default != self.config.path
+        if let Some(default) = &self.default_config_root
+            && *default != self.config.path
         {
-            roots.push(default);
+            roots.push(default.clone());
         }
-        for root in roots {
+        for (i, root) in roots.into_iter().enumerate() {
+            // Name the right file when the verdict comes from the default config a
+            // `--config` session never showed the user.
+            let main_reason = if i == 0 { MAIN } else { DEFAULT_ROOT };
             let text = match read_config_text(&root) {
                 ReadOutcome::Text(t) => t,
                 ReadOutcome::Missing => continue, // ssh cannot read it either
                 ReadOutcome::Unscannable => return Some(UNVERIFIABLE),
             };
             if has_match_exec(&text) {
-                return Some(MAIN);
+                return Some(main_reason);
             }
             let expansion = self.expand_includes_of(&crate::config::parser::parse(root, &text));
             if expansion.texts.iter().any(|t| has_match_exec(t)) {

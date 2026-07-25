@@ -4992,7 +4992,10 @@ mod tests {
             .unwrap()
             .write_all(config_body.as_bytes())
             .unwrap();
-        let app = App::new(path.clone()).expect("App::new over scratch config");
+        let mut app = App::new(path.clone()).expect("App::new over scratch config");
+        // Hermetic: the gate's second root would otherwise read the developer's
+        // real ~/.ssh/config (see `.claude/rules/tdd.md` — no external I/O).
+        app.default_config_root = None;
         (app, path)
     }
 
@@ -5011,7 +5014,8 @@ mod tests {
         std::fs::write(dir.join(include_name), include_body).unwrap();
         let path = dir.join("config");
         std::fs::write(&path, main_body).unwrap();
-        let app = App::new(path).expect("App::new over scratch config with include");
+        let mut app = App::new(path).expect("App::new over scratch config with include");
+        app.default_config_root = None; // hermetic — see `app_fixture_on_disk`
         (app, dir)
     }
 
@@ -5145,6 +5149,37 @@ mod tests {
             app.ssh_g_exec_risk().is_some(),
             "an include form ssh -G honors but we can't scan must fail safe"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ssh_g_exec_risk_scans_the_default_config_root() {
+        // #65: production `ssh -G` passes no `-F`, so it reads ~/.ssh/config even
+        // when `--config` loaded something else. The gate therefore scans BOTH
+        // roots — here the loaded fixture is clean but the default root is not.
+        // (A scratch path stands in for the default root so the test stays
+        // hermetic; `default_config_root` is the injection point.)
+        let (mut app, dir) = app_with_include(
+            "Include plain.conf\n\nHost main-host\n    HostName 1.1.1.1\n",
+            "plain.conf",
+            "Host inc\n    HostName 2.2.2.2\n",
+        );
+        assert!(
+            app.ssh_g_exec_risk().is_none(),
+            "loaded config alone is clean"
+        );
+
+        let other = dir.join("default-config");
+        std::fs::write(&other, "Match exec \"cmd\"\nHost x\n    HostName 3.3.3.3\n").unwrap();
+        app.default_config_root = Some(other);
+        assert!(
+            app.ssh_g_exec_risk().is_some(),
+            "a Match exec in the config ssh -G actually reads must be caught"
+        );
+
+        // A default root that does not exist is not a risk (ssh can't read it either).
+        app.default_config_root = Some(dir.join("nonexistent"));
+        assert!(app.ssh_g_exec_risk().is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

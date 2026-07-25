@@ -169,7 +169,11 @@ fn expand_paths(
 ///   `GLOB_NOESCAPE`), so `evil\.conf` reads `evil.conf`. On Windows `\` is the
 ///   path separator and must NOT be flagged, or every normal include would be;
 /// - `U+FFFD`, which only appears because an including file was decoded lossily —
-///   the real argument had bytes we cannot reproduce.
+///   the real argument had bytes we cannot reproduce;
+/// - character-class dialects the `glob` crate reads differently from `glob(3)`:
+///   `[^…]` (crate: `^` is a literal member; POSIX: negation) and `[[:alpha:]]`
+///   (crate: no POSIX classes). Both evaluate cleanly on each side while matching
+///   *different* files, so they must not be trusted as scanned.
 fn is_unresolvable_arg(arg: &str) -> bool {
     // `~` alone and `~/…` are the shapes resolve_include_arg handles.
     let unsupported_tilde = arg.starts_with('~') && arg != "~" && !arg.starts_with("~/");
@@ -177,6 +181,8 @@ fn is_unresolvable_arg(arg: &str) -> bool {
         || arg.contains('%')
         || arg.contains("${")
         || arg.contains('\u{fffd}')
+        || arg.contains("[^")
+        || arg.contains("[[:")
         || (cfg!(unix) && arg.contains('\\'))
 }
 
@@ -242,6 +248,7 @@ fn glob_matches(resolved: &Path, acc: &mut Expansion) -> Vec<PathBuf> {
 }
 
 /// What [`read_config_text`] could make of a path.
+#[derive(Debug)]
 pub enum ReadOutcome {
     /// The file's bytes, decoded lossily — `ssh`'s byte-oriented parser would
     /// honor an ASCII `Match exec` line even in a file with stray non-UTF-8 bytes.
@@ -775,6 +782,22 @@ mod tests {
         let main = parser::parse(dir.join("config"), "Include config.d/**\n");
         let expansion = expand(&main, &dir, &dir);
         assert_eq!(expansion.texts.len(), 2, "`**` must behave like `*`");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn blind_spot_on_divergent_character_classes() {
+        // The crate and `glob(3)` both evaluate these cleanly but match DIFFERENT
+        // files (`^` literal vs negation; no POSIX classes), so a "scanned nothing
+        // suspicious" verdict on them would be unfounded.
+        let dir = temp_dir(".inc-classes");
+        for arg in ["config.d/[^a]*.conf", "config.d/[[:alpha:]].conf"] {
+            let main = parser::parse(dir.join("config"), &format!("Include {arg}\n"));
+            assert!(
+                expand(&main, &dir, &dir).blind_spot,
+                "divergent class syntax {arg:?} must fail safe"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
