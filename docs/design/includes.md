@@ -2,8 +2,8 @@
 title: includes 領域 設計（Include 展開・read-only）
 area: includes
 status: active
-relatedIssues: [52, 65]
-updated: 2026-07-25
+relatedIssues: [52, 65, 73]
+updated: 2026-07-27
 ---
 
 # includes 領域 設計（`src/config/includes.rs` ほか）— #52 read-only 第 1 段
@@ -29,7 +29,8 @@ flowchart TB
     hostref -->|Included| refuse[編集/削除キーは<br/>read-only トーストで拒否]
     main --> scan[App::ssh_g_exec_risk<br/>has_match_exec を全ファイルに<br/>＋ blind_spot で fail-safe]
     incparse --> scan
-    scan --> gates[ssh -G 3 経路<br/>接続 autofill / SFTP arm / インスペクタ]
+    trust[autofill_client_trusted<br/>System32 クライアント信頼（#73）] --> gates
+    scan --> gates[ssh -G 3 経路<br/>接続 autofill / SFTP arm / インスペクタ<br/>① trust → ② exec-risk の 2 段]
 ```
 
 - **`src/config/includes.rs`（新規・ヘッドレス・ratatui 依存ゼロ）**: `expand(main: &SshConfig, base_dir: &Path, home: &Path) -> Expansion`（`Expansion { hosts: Vec<IncludedHost>, texts: Vec<String> }`）。`texts` は全ファイル走査（`Match exec`）用に、読んだ各 included ファイルの生テキストを保持する（ホスト 0 件のファイルも含む）。
@@ -87,6 +88,7 @@ sequenceDiagram
 - **インライン origin 表示（論点 3・既存 chip 流儀）**: フラットな**ファジーランク一覧**（`nucleo-matcher`）と hosts-index 位置キーの liveness を崩さないため、ファイル別グルーピングではなくエイリアス直後の**ディム origin** とする（ui.md #45 のタグ chip パターンと一貫）。
 - **autofill 安全ゲートは保守的 fail-safe（read-only の要）**: `ssh -G` が honor する `Match exec` は autofill 時に predicate を実行してしまうため、接続/SFTP autofill ゲートは**完全にスキャンできない include 形式（ブロック内 conditional・クオート splice・深さ超）があれば autofill を無効化**する（`autofill_config_unsafe` の `blind_spot`）。expand は listing 用にトップレベル Include のみ追従するが、**安全ゲートは追えない形式を「安全」と仮定せず fail-safe に倒す**（listing の網羅性と安全判定を分離＝security-reviewer 指摘への対応）。主流のトップレベル `config.d/*` は完全走査できるため autofill は維持され、exotic な config だけ手動パスワードにフォールバックする。ゲートは接続前に再展開して stale を避け、included テキストは lossy 走査で非 UTF-8 ファイルも見る。残る blind spot（同一ファイル内でトップレベル include と別のクオート include が混在する等の非現実的ケース）は over-block 側に倒れる（安全）。
 - **`ssh -G` ゲートの 3 経路統一（#65）**: 接続 autofill・SFTP arm・実効設定インスペクタ（#43）はいずれも `ssh -G` を実行し、`Match exec` があれば predicate を走らせる経路。#52 の精緻な走査を共有ヘルパー **`App::ssh_g_exec_risk() -> Option<&'static str>`**（安全なら `None`、危険なら理由文字列）に集約し、3 経路すべてがこれを通す。判定順は fail-safe に **① メイン render の `has_match_exec` → ② included ファイル（lossy 読み）の `has_match_exec` → ③ `blind_spot`**。`autofill_config_unsafe()` は `ssh_g_exec_risk().is_some()` の薄いラッパとして残し、接続/SFTP 側は真偽値で読める形を保つ。インスペクタの保守的な `has_include` 一律ブロックはこのゲートに置換し、superseded になった `os/resolve.rs::inspect_block_reason` / `has_include` は**削除**した（削除テストのうち `=`区切り・コメント行・include lookalike の偽陽性ガードは includes 層へ移設し、クオート splice・ブロック内ネストは既存の `blind_spot_on_*` テストが継続してカバーする）。ゲートは**メインファイルもディスクから読み直して**走査し（`ssh -G` が読むのはディスク上のファイル。in-memory render も union で走査＝未保存編集を過剰側に倒す）、外部ツールがメイン config に `Include` を足した場合もそれを追従する。**`--config <path>` 対応**: production の `ssh -G` は `-F` を渡さない＝常に `~/.ssh/config` を読むため、ゲートは**読み込んだ config と既定 `~/.ssh/config` の両方をルートとして走査**する（どちらかが危険なら退避）。システム全体の config（`/etc/ssh/ssh_config`）は root 所有で本脅威モデル外として走査しない。**残存レース**: 走査と `ssh -G` 起動の間に config を書き換えられる TOCTOU はプロセス外ゲートの原理的な限界（窓を狭めるだけ）。これで benign な `config.d/*` でも**インスペクタが開ける**ようになり（実 `Match exec` / 追えない include 形式では 3 経路とも安全に退避）、#65 が指摘した経路間の非対称（インスペクタだけ `has_include` ブロック）を解消した。
+- **クライアント信頼ゲートも 3 経路で統一（#73・案 A）**: #65 の統一は config 内容の走査（`ssh_g_exec_risk`）のみで、**どの `ssh` バイナリで `ssh -G` を走らせるか**の信頼判定（`autofill_client_trusted()`＝`binaries::tools().is_system32`）は接続 autofill・SFTP arm だけが通し、インスペクタ（`open_inspect`）は素通りだった。**根本原因**: 本ゲートの走査は `dirs::home_dir()`（Windows は profile ディレクトリ）基準だが、`[PATH ssh]` フォールバックの Git/MSYS `ssh` は **`%HOME%` を honor** するため、`HOME` がプロファイル外を指す環境では「走査した config」と「`ssh -G` が実際に読む config」が乖離し、未走査側の `Match exec` が実行されうる（走査前提の崩壊＝exec-risk ゲートでは原理的に防げない）。よってインスペクタも untrusted なら `ssh -G` を実行せず sticky トーストで退避し、**3 経路とも「① クライアント信頼 → ② exec-risk」の 2 段ゲート**に揃えた。trust は `ssh_g_exec_risk()` に混ぜず各経路の前段チェックとする（exec-risk の意味を config 内容に限定・接続経路の untrusted nudge との区別を維持）。unix は `is_system32` 常時 true でゲート no-op（Windows 限定のハードニング）。**将来の緩和材料**: `ssh -G` に `-F <走査した config>` を明示的に渡せば「読む config」を走査対象に固定でき、このゲートを緩められる可能性がある — ただし production の実接続は `-F` を渡さない設計（config が接続の真実源）のため、インスペクタだけ `-F` を渡すと実接続と表示が乖離しうる点が検討時の論点。
 - **OpenSSH 先勝ち（first-wins）の表示**: 実接続は素の `ssh <alias>` で OpenSSH 自身が先勝ち解決するため、sshm 側の重複表示（`⊘`）は**情報提供**（挙動を変えない）。
 
 ## UI/画面設計（採択案＝インライン origin・ワイヤーフレーム）
