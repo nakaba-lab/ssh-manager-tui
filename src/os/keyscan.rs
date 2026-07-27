@@ -199,15 +199,16 @@ pub fn classify_key(key: &ScannedKey, existing: &[KnownHostEntry]) -> PinClass {
     // Pins only: markers are not host-key pins (`is_host_known` excludes them
     // from the trust gate for the same reason).
     let pins = || existing.iter().filter(|e| e.marker.is_none());
-    // `AlreadyTrusted` must mean "the gate already considers this host pinned",
-    // so it counts only genuine per-host pins — a wildcard entry matches in
-    // OpenSSH but `is_host_known` rejects it, and calling that "already
-    // trusted" would leave the user with no way to create the exact pin the
-    // gate wants (#46 re-review). A wildcard entry with a DIFFERENT key still
-    // means `Changed`: OpenSSH would reject that key, so failing closed is right.
-    if pins().filter(|e| !e.is_pattern()).any(|e| same_key(&e)) {
+    // Classification counts only genuine per-host pins. A wildcard entry
+    // matches in OpenSSH but `is_host_known` rejects it, so treating one as a
+    // pin here would leave the user unable to create the exact pin the gate
+    // wants — either stuck on "already trusted" (same key) or on a false
+    // CHANGED alarm (different key), with no route forward either way
+    // (#46 final review).
+    let host_pins = || pins().filter(|e| !e.is_pattern());
+    if host_pins().any(|e| same_key(&e)) {
         PinClass::AlreadyTrusted
-    } else if pins().any(|e| e.key_type == key.key_type) {
+    } else if host_pins().any(|e| e.key_type == key.key_type) {
         PinClass::Changed
     } else {
         PinClass::New

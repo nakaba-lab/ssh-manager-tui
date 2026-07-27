@@ -188,6 +188,20 @@ pub struct ClassifiedKey {
     pub class: PinClass,
 }
 
+/// Why a scan result may not be pinned (#46). A scan authenticates nothing —
+/// `ssh-keyscan` never verifies the responder holds the private half — so
+/// pinnability is decided structurally, not from evidence in the result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinBlocked {
+    /// A key contradicts (`Changed`) or is revoked (`Revoked`).
+    Contradicted,
+    /// This host already has a genuine pin. Appending an unauthenticated key
+    /// beside it would silently defeat it: OpenSSH accepts a host key matching
+    /// ANY entry, and an in-path attacker can replay the public pinned key
+    /// while sidecarring its own.
+    AlreadyPinned,
+}
+
 /// Modal state for the host-key scan overlay (#46): spinner → results / error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeyScanModal {
@@ -196,14 +210,8 @@ pub enum KeyScanModal {
     /// The scan finished: all offered keys, each classified (#46 AC 4/5).
     Results {
         rows: Vec<ClassifiedKey>,
-        /// Key types this host has a genuine pin for that the scan did NOT
-        /// confirm. Non-empty means the channel failed to prove possession of
-        /// a key the user already trusts, so nothing from this scan may be
-        /// pinned: an attacker who simply withholds the pinned type produces
-        /// an all-`New` result, and appending it would add a second trusted
-        /// type that OpenSSH accepts with no HOST KEY CHANGED warning
-        /// (#46 re-review).
-        unconfirmed: Vec<String>,
+        /// Why nothing here may be pinned, or `None` when it may.
+        blocked: Option<PinBlocked>,
     },
     /// The scan failed (unreachable / timed out): sticky error text (AC6).
     Error(String),

@@ -11,7 +11,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Clear, Paragraph};
 
-use crate::app::{App, KeyScanModal};
+use crate::app::{App, KeyScanModal, PinBlocked};
 use crate::os::keyscan::PinClass;
 
 use super::theme;
@@ -47,16 +47,21 @@ fn modal_size(content_w: u16, content_h: u16, area: Rect) -> (u16, u16) {
     )
 }
 
-/// Drop `body` lines from the END until the whole block fits `rows`, so the
-/// trailing verification reminder (#46 AC8) is never the thing that scrolls
-/// off. The randomart blocks sit last precisely because they are the
-/// supplementary part: losing art is acceptable, losing the "verify this
-/// out-of-band" wording is not.
+/// Fit `body` + `tail` into `rows`, dropping `body` from the END first so the
+/// trailing verification reminder (#46 AC8) is never what scrolls off — the
+/// randomart is the supplementary part, the "verify out-of-band" wording is
+/// not. When even the tail does not fit, it is trimmed from the FRONT so the
+/// reminder (its last line) is the very last thing lost: returning more lines
+/// than `rows` would let `Paragraph` clip the bottom, which is exactly where
+/// the reminder sits (#46 final review).
 fn fit_body(
     mut body: Vec<Line<'static>>,
-    tail: Vec<Line<'static>>,
+    mut tail: Vec<Line<'static>>,
     rows: usize,
 ) -> Vec<Line<'static>> {
+    if tail.len() > rows {
+        tail.drain(..tail.len() - rows);
+    }
     let budget = rows.saturating_sub(tail.len());
     if body.len() > budget {
         body.truncate(budget);
@@ -75,8 +80,7 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
 
     let mut lines: Vec<Line> = vec![Line::from("")];
     let mut danger = false;
-    let mut poisoned = false;
-    let mut unconfirmed_types: Vec<String> = Vec::new();
+    let mut blocked_reason: Option<PinBlocked> = None;
     match &ks.modal {
         KeyScanModal::Scanning => {
             lines.push(Line::from(Span::styled(
@@ -91,14 +95,13 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(theme::DOWN),
             )));
         }
-        KeyScanModal::Results { rows, unconfirmed } => {
+        KeyScanModal::Results { rows, blocked } => {
             lines.push(Line::from(Span::styled(
                 format!("{} — {} key(s) found", ks.target, rows.len()),
                 text,
             )));
             lines.push(Line::from(""));
-            poisoned = !unconfirmed.is_empty() || rows.iter().any(|r| r.class.poisons_result());
-            unconfirmed_types = unconfirmed.clone();
+            blocked_reason = *blocked;
             for row in rows {
                 let danger_chip = Style::default()
                     .fg(theme::DOWN)
@@ -149,23 +152,25 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     // banner are both must-not-scroll-off content, so neither may sit in the
     // body where `fit_body` could cut it on a short terminal (#46 re-review).
     let mut tail = vec![Line::from("")];
-    if poisoned {
-        let reason = if unconfirmed_types.is_empty() {
-            "these keys contradict a pin you already trust".to_string()
-        } else {
-            format!(
-                "this host did not offer the {} key you already trust",
-                unconfirmed_types.join(", ")
-            )
+    if let Some(reason) = blocked_reason {
+        let (headline, detail) = match reason {
+            PinBlocked::Contradicted => (
+                "Pinning is DISABLED — these keys contradict a pin you already trust.",
+                "Nothing is overwritten here. Inspect Known hosts (H) before trusting this host.",
+            ),
+            PinBlocked::AlreadyPinned => (
+                "Pinning is DISABLED — this host is already pinned.",
+                "A scan cannot prove who answered it, so no key is added beside an existing pin.",
+            ),
         };
         tail.push(Line::from(Span::styled(
-            format!("Pinning is DISABLED — {reason}."),
+            headline,
             Style::default()
                 .fg(theme::DOWN)
                 .add_modifier(Modifier::BOLD),
         )));
         tail.push(Line::from(Span::styled(
-            "Nothing is overwritten here. Inspect Known hosts (H) before trusting this host.",
+            detail,
             Style::default().fg(theme::WARN),
         )));
     } else if matches!(ks.modal, KeyScanModal::Results { .. }) {

@@ -251,8 +251,17 @@ pub fn matching_known_entries(lookup_key: &str, files: &[String]) -> Vec<KnownHo
 /// prefix. Writing there creates a stray file OpenSSH never reads (#46
 /// re-review). Coalescing keys off the parent directory rather than the file
 /// itself, because the first-pin case is exactly when the file does not exist.
+///
+/// Returns `None` when the list resolves to no writable file — including the
+/// `none` sentinel, which OpenSSH documents as "read no user file" and `ssh -G`
+/// emits verbatim. Treating `none` as a filename would create a junk file in
+/// the process's CWD and report success for a pin OpenSSH never reads.
 pub fn primary_known_hosts_file(files: &[String]) -> Option<std::path::PathBuf> {
-    let expanded: Vec<String> = files.iter().map(|p| expand_known_hosts_path(p)).collect();
+    let expanded: Vec<String> = files
+        .iter()
+        .filter(|p| !is_none_sentinel(p))
+        .map(|p| expand_known_hosts_path(p))
+        .collect();
     coalesce_existing_paths(&expanded, |p| {
         let path = std::path::Path::new(p);
         path.exists()
@@ -265,11 +274,24 @@ pub fn primary_known_hosts_file(files: &[String]) -> Option<std::path::PathBuf> 
     .map(std::path::PathBuf::from)
 }
 
+/// OpenSSH's `none` sentinel for a known-hosts file list ("use no file").
+/// Compared literally, as OpenSSH does.
+fn is_none_sentinel(path: &str) -> bool {
+    path == "none"
+}
+
 /// Shared file-list normalization for the known-hosts readers: expand the
 /// Windows `__PROGRAMDATA__` token, then coalesce `ssh -G`'s unquoted,
 /// space-split list back into paths that exist.
 fn resolve_known_hosts_files(files: &[String]) -> Vec<String> {
-    let expanded: Vec<String> = files.iter().map(|p| expand_known_hosts_path(p)).collect();
+    let expanded: Vec<String> = files
+        .iter()
+        .filter(|p| !is_none_sentinel(p))
+        .map(|p| expand_known_hosts_path(p))
+        .collect();
+    // Readers coalesce on the file itself (a file that does not exist holds no
+    // entries anyway); the writer's variant keys off the parent directory
+    // instead, because it has to name a file that does not exist yet.
     coalesce_existing_paths(&expanded, |p| std::path::Path::new(p).exists())
 }
 

@@ -17,10 +17,10 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::app::{
     App, ClassifiedKey, ConfirmAction, ConnectMode, EditForm, FormMode, GenOrigin, KeyScanModal,
-    KeyScanUi, ListFocus, PasswordConfirmOrigin, PendingSave, PickOrigin, SFTP_FIELDS, Screen,
-    SftpBrowser, SftpDirection, SftpForm, SftpPane, VaultEntryForm, VaultUnlock, form_from_view,
-    form_idx, override_form_from_host, override_idx, overrides_from_form, read_local_dir,
-    view_from_form,
+    KeyScanUi, ListFocus, PasswordConfirmOrigin, PendingSave, PickOrigin, PinBlocked, SFTP_FIELDS,
+    Screen, SftpBrowser, SftpDirection, SftpForm, SftpPane, VaultEntryForm, VaultUnlock,
+    form_from_view, form_idx, override_form_from_host, override_idx, overrides_from_form,
+    read_local_dir, view_from_form,
 };
 use crate::config::SshConfig;
 use crate::config::diff;
@@ -568,38 +568,36 @@ fn keyscan_apply_event(
                     ClassifiedKey { key, class }
                 })
                 .collect();
-            let unconfirmed = unconfirmed_pin_types(&rows, existing);
-            KeyScanModal::Results { rows, unconfirmed }
+            let blocked = pin_block(&rows, existing);
+            KeyScanModal::Results { rows, blocked }
         }
         KeyscanEvent::Failed(msg) => KeyScanModal::Error(msg),
     }
 }
 
-/// Key types this host has a genuine (marker-free, non-wildcard) pin for that
-/// the scan did NOT return as `AlreadyTrusted`.
+/// Why this scan result may not be pinned, if it may not be.
 ///
-/// An honest server offers the host keys it holds, so a pinned type missing
-/// from the scan means the channel could not prove possession of a key the
-/// user already trusts. Pinning anything from such a scan is what defeats the
-/// existing pin: OpenSSH accepts a host key matching ANY known_hosts entry, so
-/// an attacker who simply *withholds* the pinned type — never triggering a
-/// `Changed` row — gets its own key of another type appended and is then taken
-/// silently on the next connect (#46 re-review).
-fn unconfirmed_pin_types(rows: &[ClassifiedKey], existing: &[KnownHostEntry]) -> Vec<String> {
-    let confirmed: Vec<&str> = rows
+/// **A scan authenticates nothing.** `ssh-keyscan` aborts the key exchange
+/// before signature verification, so it never proves the responder holds the
+/// private half — and a host key is public, so an in-path attacker can replay
+/// the genuine key and sidecar its own alongside it. No property of the scan
+/// result can distinguish that from an honest server (#46 final review, proven
+/// end-to-end against a responder holding no private key).
+///
+/// So the only sound rule is structural, not evidential: a host that ALREADY
+/// has a genuine pin gets nothing appended. OpenSSH accepts a host key matching
+/// ANY known_hosts entry, so appending an unauthenticated key next to a real
+/// pin silently defeats it — and OpenSSH itself refuses to auto-add a key when
+/// other types are already known. Pinning is for hosts with no pin yet, where
+/// this is plain TOFU and the out-of-band verification hint is the safeguard.
+fn pin_block(rows: &[ClassifiedKey], existing: &[KnownHostEntry]) -> Option<PinBlocked> {
+    if rows.iter().any(|r| r.class.poisons_result()) {
+        return Some(PinBlocked::Contradicted);
+    }
+    let has_pin = existing
         .iter()
-        .filter(|r| r.class == PinClass::AlreadyTrusted)
-        .map(|r| r.key.key_type.as_str())
-        .collect();
-    let mut missing: Vec<String> = existing
-        .iter()
-        .filter(|e| e.marker.is_none() && !e.is_pattern())
-        .map(|e| e.key_type.clone())
-        .filter(|t| !confirmed.contains(&t.as_str()))
-        .collect();
-    missing.sort();
-    missing.dedup();
-    missing
+        .any(|e| e.marker.is_none() && !e.is_pattern());
+    has_pin.then_some(PinBlocked::AlreadyPinned)
 }
 
 /// Pure key dispatch for the scan modal:
@@ -617,8 +615,11 @@ fn unconfirmed_pin_types(rows: &[ClassifiedKey], existing: &[KnownHostEntry]) ->
 fn keyscan_handle_key(state: &KeyScanModal, key: KeyCode, lookup_key: &str) -> KeyScanAction {
     match (state, key) {
         (_, KeyCode::Esc) => KeyScanAction::Close(Vec::new()),
-        (KeyScanModal::Results { rows, unconfirmed }, KeyCode::Char('y')) => {
-            if !unconfirmed.is_empty() || rows.iter().any(|r| r.class.poisons_result()) {
+        (KeyScanModal::Results { rows, blocked }, KeyCode::Char('y')) => {
+            // `blocked` is the decision (computed once, from the scan AND the
+            // existing pins); the row re-check is defence in depth for the one
+            // condition visible from the rows alone.
+            if blocked.is_some() || rows.iter().any(|r| r.class.poisons_result()) {
                 return KeyScanAction::Close(Vec::new());
             }
             let new_keys: Vec<ScannedKey> = rows
@@ -657,7 +658,14 @@ fn keyscan_lookup_key_gate(lookup_key: &str) -> Result<(), String> {
 /// using the default file (#46 review). Falls back to the default path only
 /// when `ssh -G` reported nothing.
 fn keyscan_pin_target(rc: &ResolvedConfig) -> Option<std::path::PathBuf> {
-    primary_known_hosts_file(&rc.user_known_hosts_files).or_else(known_hosts_path)
+    // Fall back to the default path ONLY when `ssh -G` reported no user file at
+    // all. A list that resolves to nothing (`UserKnownHostsFile none`) means ssh
+    // reads no user file for this host, so writing to the default would be a
+    // no-op that still reports success — refuse instead (#46 final review).
+    if rc.user_known_hosts_files.is_empty() {
+        return known_hosts_path();
+    }
+    primary_known_hosts_file(&rc.user_known_hosts_files)
 }
 
 /// Availability gate for the scan action (#46 AC7): a `ProxyJump`/
@@ -764,16 +772,15 @@ fn handle_keyscan(app: &mut App, key: KeyEvent) {
     // `y` on a result set that pins nothing must still say why, or the modal
     // just vanishes and the user cannot tell whether anything was written.
     if lines.is_empty() && key.code == KeyCode::Char('y') {
-        if let KeyScanModal::Results { rows, unconfirmed } = &ks.modal {
-            let msg = if !unconfirmed.is_empty() {
-                format!(
-                    "nothing pinned — this host did not offer the {} key you already trust",
-                    unconfirmed.join(", ")
-                )
-            } else if rows.iter().any(|r| r.class.poisons_result()) {
-                "nothing pinned — these keys contradict a pin you already trust".to_string()
-            } else {
-                "nothing to pin — every key this host offered is already trusted".to_string()
+        if let KeyScanModal::Results { blocked, .. } = &ks.modal {
+            let msg = match blocked {
+                Some(PinBlocked::Contradicted) => {
+                    "nothing pinned — these keys contradict a pin you already trust"
+                }
+                Some(PinBlocked::AlreadyPinned) => {
+                    "nothing pinned — this host is already pinned; remove it in Known hosts (H) to re-pin"
+                }
+                None => "nothing to pin — every key this host offered is already trusted",
             };
             app.toast(msg, true);
         }
@@ -784,13 +791,25 @@ fn handle_keyscan(app: &mut App, key: KeyEvent) {
         match append_entries(&target, &lines) {
             Ok(()) => {
                 app.reload_known_hosts();
-                // Verify through OpenSSH's own matcher that the pin actually
-                // took: writing to a file ssh does not read for this host is
-                // the one failure this feature keeps re-learning, and it looks
-                // exactly like success from here (#46 re-review).
-                let visible = matching_known_entries(&lookup_key, &files)
-                    .iter()
-                    .any(|e| e.marker.is_none() && !e.is_pattern());
+                // Verify through OpenSSH's own matcher that THE KEYS JUST
+                // WRITTEN are visible — not merely that some pin exists, which
+                // a pre-existing entry would satisfy regardless of where the
+                // write landed (#46 final review). Writing to a file ssh does
+                // not read for this host is the failure this feature keeps
+                // re-learning, and it looks exactly like success from here.
+                let seen = matching_known_entries(&lookup_key, &files);
+                let visible = lines.iter().all(|line| {
+                    let mut f = line.split_whitespace().skip(1);
+                    let (Some(key_type), Some(key_b64)) = (f.next(), f.next()) else {
+                        return false;
+                    };
+                    seen.iter().any(|e| {
+                        e.marker.is_none()
+                            && !e.is_pattern()
+                            && e.key_type == key_type
+                            && e.key_b64 == key_b64
+                    })
+                });
                 if visible {
                     app.toast(
                         format!("pinned {} host key(s) for {alias}", lines.len()),
@@ -5273,73 +5292,99 @@ mod tests {
         );
         // then — Results carries every key, classified (AC1 / AC4 / AC5)
         match next {
-            KeyScanModal::Results { rows, unconfirmed } => {
+            KeyScanModal::Results { rows, blocked } => {
                 assert_eq!(rows.len(), 3);
                 assert_eq!(rows[0].class, PinClass::AlreadyTrusted);
                 assert_eq!(rows[1].class, PinClass::Changed);
                 assert_eq!(rows[2].class, PinClass::New);
                 assert_eq!(rows[2].key, keys[2], "keys pass through unmodified");
-                // the ed25519 pin was confirmed; the ecdsa pin was NOT (the
-                // scan answered it with a different key), so it is reported
-                // unconfirmed as well as flagged `Changed` — both signals
-                // independently block pinning
-                assert_eq!(unconfirmed, vec!["ecdsa-sha2-nistp256".to_string()]);
+                // a contradicted key outranks "already pinned" in the reason
+                assert_eq!(blocked, Some(PinBlocked::Contradicted));
             }
             other => panic!("expected Results, got {other:?}"),
         }
     }
 
     #[test]
-    fn keyscan_apply_event_flags_a_pinned_type_the_scan_never_offered() {
-        // given — a genuine ed25519 pin, and an in-path attacker that answers
-        // with ONLY an rsa key so no row can ever be `Changed`
+    fn keyscan_appends_nothing_to_an_already_pinned_host() {
+        // given — a genuine ed25519 pin. An in-path attacker cannot be told
+        // apart from the real host by ANY property of a scan: `ssh-keyscan`
+        // aborts the KEX before signature verification, so it never proves the
+        // responder holds the private half — and the pinned key is public, so
+        // the attacker can simply replay it and sidecar its own key.
         let existing = kh_entries(&["db.example ssh-ed25519 AAAAGENUINE"]);
-        // when
-        let next = keyscan_apply_event(
-            KeyScanModal::Scanning,
-            KeyscanEvent::Keys(vec![scanned("ssh-rsa", "AAAAEVILRSA")]),
-            &existing,
-        );
-        // then — the row reads `New`, but the set is flagged: the channel never
-        // proved possession of the key the user already trusts (#46 re-review)
-        let KeyScanModal::Results { rows, unconfirmed } = &next else {
-            panic!("expected Results, got {next:?}");
-        };
-        assert_eq!(rows[0].class, PinClass::New);
-        assert_eq!(unconfirmed, &vec!["ssh-ed25519".to_string()]);
-        // and `y` therefore appends NOTHING — pinning the rsa key would add a
-        // second trusted type that OpenSSH accepts with no CHANGED warning
-        assert_eq!(
-            keyscan_handle_key(&next, KeyCode::Char('y'), "db.example"),
-            KeyScanAction::Close(vec![])
-        );
+        let attacks = [
+            // withhold the pinned type entirely (no row can be `Changed`)
+            vec![scanned("ssh-rsa", "AAAAEVILRSA")],
+            // replay the genuine public key, sidecar an attacker key
+            vec![
+                scanned("ssh-ed25519", "AAAAGENUINE"),
+                scanned("ssh-rsa", "AAAAEVILRSA"),
+            ],
+        ];
+        for keys in attacks {
+            // when
+            let next =
+                keyscan_apply_event(KeyScanModal::Scanning, KeyscanEvent::Keys(keys), &existing);
+            let KeyScanModal::Results { blocked, .. } = &next else {
+                panic!("expected Results, got {next:?}");
+            };
+            // then — pinning is refused structurally, not on evidence
+            assert_eq!(*blocked, Some(PinBlocked::AlreadyPinned));
+            // and `y` appends NOTHING: a second trusted type would be accepted
+            // by OpenSSH with no HOST KEY CHANGED warning
+            assert_eq!(
+                keyscan_handle_key(&next, KeyCode::Char('y'), "db.example"),
+                KeyScanAction::Close(vec![])
+            );
+        }
     }
 
     #[test]
-    fn keyscan_apply_event_ignores_wildcard_and_marker_entries_when_flagging() {
-        // given — only a wildcard entry and a @revoked line match this host;
-        // neither is a genuine per-host pin (`is_host_known` rejects both)
+    fn keyscan_still_pins_when_only_wildcard_or_marker_entries_match() {
+        // given — only a wildcard entry and a @revoked line match this host.
+        // Neither is a genuine per-host pin (`is_host_known` rejects both), so
+        // the host is effectively unpinned and must stay pinnable — otherwise
+        // the user can never create the exact pin the trust gate wants.
         let existing = kh_entries(&[
             "*.example ssh-ed25519 WILDKEY",
             "@revoked db.example ssh-rsa OLDEVIL",
         ]);
-        // when — the scan returns an unrelated new key
+        // when — the scan returns a key of an unrelated type
         let next = keyscan_apply_event(
             KeyScanModal::Scanning,
             KeyscanEvent::Keys(vec![scanned("ecdsa-sha2-nistp256", "FRESH")]),
             &existing,
         );
-        // then — nothing is "unconfirmed": there was no real pin to confirm, so
-        // the user can still create the exact pin the trust gate wants
-        let KeyScanModal::Results { rows, unconfirmed } = &next else {
+        // then
+        let KeyScanModal::Results { rows, blocked } = &next else {
             panic!("expected Results, got {next:?}");
         };
         assert_eq!(rows[0].class, PinClass::New);
-        assert!(unconfirmed.is_empty(), "got {unconfirmed:?}");
+        assert_eq!(*blocked, None);
         assert_eq!(
             keyscan_handle_key(&next, KeyCode::Char('y'), "db.example"),
             KeyScanAction::Close(vec!["db.example ecdsa-sha2-nistp256 FRESH".to_string()])
         );
+    }
+
+    #[test]
+    fn keyscan_wildcard_entry_never_masquerades_as_a_per_host_pin() {
+        // given — a wildcard entry holding the host's REAL key
+        let existing = kh_entries(&["*.example ssh-ed25519 REALKEY"]);
+        // when — the scan returns exactly that key
+        let next = keyscan_apply_event(
+            KeyScanModal::Scanning,
+            KeyscanEvent::Keys(vec![scanned("ssh-ed25519", "REALKEY")]),
+            &existing,
+        );
+        // then — `New`, not `AlreadyTrusted` and not a false CHANGED alarm: the
+        // gate does not accept wildcards, so the exact pin is still creatable
+        let KeyScanModal::Results { rows, blocked } = &next else {
+            panic!("expected Results, got {next:?}");
+        };
+        assert_eq!(rows[0].class, PinClass::New);
+        assert_eq!(*blocked, None);
     }
 
     #[test]
@@ -5372,7 +5417,7 @@ mod tests {
         ];
         let state = KeyScanModal::Results {
             rows: rows.clone(),
-            unconfirmed: vec![],
+            blocked: None,
         };
         // when — the user approves with `y`
         let action = keyscan_handle_key(&state, KeyCode::Char('y'), "[db.example]:2222");
@@ -5386,7 +5431,7 @@ mod tests {
         // given — results with nothing pinnable (everything already trusted)
         let no_new = KeyScanModal::Results {
             rows: rows[..1].to_vec(),
-            unconfirmed: vec![],
+            blocked: None,
         };
         // when / then — y closes WITHOUT touching known_hosts
         assert_eq!(
@@ -5400,7 +5445,7 @@ mod tests {
         // given — an in-path attacker answers with its own key of a type that
         // is already pinned (CHANGED) PLUS a key of an unpinned type (new)
         let poisoned = KeyScanModal::Results {
-            unconfirmed: vec![],
+            blocked: None,
             rows: vec![
                 ClassifiedKey {
                     key: scanned("ecdsa-sha2-nistp256", "EVILECDSA"),
@@ -5422,7 +5467,7 @@ mod tests {
 
         // given — the same shape with a @revoked match instead of CHANGED
         let revoked = KeyScanModal::Results {
-            unconfirmed: vec![],
+            blocked: None,
             rows: vec![
                 ClassifiedKey {
                     key: scanned("ssh-ed25519", "REVOKEDKEY"),
@@ -5447,7 +5492,7 @@ mod tests {
         let states = [
             KeyScanModal::Scanning,
             KeyScanModal::Results {
-                unconfirmed: vec![],
+                blocked: None,
                 rows: vec![ClassifiedKey {
                     key: scanned("ssh-ed25519", "BRANDNEW"),
                     class: PinClass::New,
