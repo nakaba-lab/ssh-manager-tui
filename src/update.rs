@@ -16,7 +16,7 @@ use ratatui::crossterm::terminal::{
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::app::{
-    App, ConfirmAction, ConnectMode, EditForm, FormMode, GenOrigin, ListFocus,
+    App, ConfirmAction, ConnectMode, EditForm, FormMode, GenOrigin, ListFocus, PassphraseSyncForm,
     PasswordConfirmOrigin, PendingSave, PickOrigin, SFTP_FIELDS, Screen, SftpBrowser,
     SftpDirection, SftpForm, SftpPane, VaultEntryForm, VaultUnlock, form_from_view, form_idx,
     override_form_from_host, override_idx, overrides_from_form, read_local_dir, view_from_form,
@@ -28,11 +28,15 @@ use crate::error::ConfigError;
 use crate::os::askpass::{
     AskpassListener, DeclineReason, Outcome, arm_connect, os_tokens, resolved_identity,
 };
+use crate::os::binaries::tools;
 use crate::os::connect::{
     ConnectOverrides, Protocol, command_line, connect_new_tab, describe_exit, describe_exit_code,
     resolve_options, run_inline,
 };
-use crate::os::keys::{generate_key, read_public_key};
+use crate::os::keys::{
+    GenPassphrase, change_passphrase_args, generate_key, generate_key_args, read_public_key,
+    stale_passphrase_hosts,
+};
 use crate::os::known_hosts::remove_entry;
 use crate::os::resolve::{
     ResolvedConfig, has_match_exec, is_host_known, resolve_config_with_options, tofu_lookup_key,
@@ -56,12 +60,19 @@ pub fn handle_key(app: &mut App, key: KeyEvent, terminal: &mut DefaultTerminal) 
         Screen::List => handle_list(app, key, terminal)?,
         Screen::Edit { editing } => handle_edit(app, key, editing)?,
         Screen::DiffPreview => handle_diff_preview(app, key),
-        Screen::KeyManager => handle_keys(app, key)?,
+        Screen::KeyManager => handle_keys(app, key, terminal)?,
         Screen::KnownHosts => handle_known_hosts(app, key),
         Screen::Help => handle_help(app, key),
         Screen::Confirm(action) => handle_confirm(app, key, action, terminal)?,
         Screen::ActionMenu(idx) => handle_action_menu(app, key, idx, terminal)?,
-        Screen::GenerateKey { origin } => handle_gen_wizard(app, key, origin),
+        Screen::GenerateKey { origin } => {
+            // Interactive generation must suspend the TUI, which needs the
+            // terminal — but `handle_gen_wizard` stays terminal-free so its
+            // unit tests run headless; it returns the pending run instead.
+            if let Some(pending) = handle_gen_wizard(app, key, origin) {
+                run_generate_interactive(app, pending, terminal)?;
+            }
+        }
         Screen::PickKey { origin } => handle_pick_key(app, key, origin),
         Screen::PickJump { origin } => handle_pick_jump(app, key, origin),
         Screen::ConnectOverride { host } => handle_connect_override(app, key, host, terminal)?,
@@ -70,6 +81,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent, terminal: &mut DefaultTerminal) 
         Screen::Vault => handle_vault(app, key),
         Screen::VaultUnlock => handle_vault_unlock(app, key),
         Screen::VaultEntry { editing } => handle_vault_entry(app, key, editing),
+        Screen::PassphraseSync => handle_passphrase_sync(app, key),
         Screen::PasswordConfirm { target, origin, .. } => {
             handle_password_confirm(app, key, target, origin, terminal)?
         }
@@ -1455,7 +1467,7 @@ fn commit_pending_save(app: &mut App) {
 // S3 — key manager
 // ---------------------------------------------------------------------------
 
-fn handle_keys(app: &mut App, key: KeyEvent) -> Result<()> {
+fn handle_keys(app: &mut App, key: KeyEvent, terminal: &mut DefaultTerminal) -> Result<()> {
     match key.code {
         KeyCode::Esc => app.screen = Screen::List,
         KeyCode::Char('?') => open_overlay(app, Screen::Help),
@@ -1469,6 +1481,7 @@ fn handle_keys(app: &mut App, key: KeyEvent) -> Result<()> {
                 origin: GenOrigin::KeyManager,
             };
         }
+        KeyCode::Char('p') => change_passphrase(app, terminal)?,
         KeyCode::Char('y') => copy_public_key(app),
         KeyCode::Char('s') => set_identity_for_host(app),
         KeyCode::Char('d') => {
@@ -1540,24 +1553,23 @@ fn tildify(path: &std::path::Path) -> String {
     path.display().to_string()
 }
 
-fn handle_gen_wizard(app: &mut App, key: KeyEvent, origin: GenOrigin) {
+fn handle_gen_wizard(app: &mut App, key: KeyEvent, origin: GenOrigin) -> Option<InteractiveGen> {
     let w = &mut app.gen_wizard;
     match key.code {
         KeyCode::Esc => {
             app.screen = gen_return_screen(&origin);
-            return;
+            return None;
         }
         KeyCode::Tab | KeyCode::Down => {
-            w.field = (w.field + 1) % 3;
-            return;
+            w.field = (w.field + 1) % 4;
+            return None;
         }
         KeyCode::BackTab | KeyCode::Up => {
-            w.field = (w.field + 2) % 3;
-            return;
+            w.field = (w.field + 3) % 4;
+            return None;
         }
         KeyCode::Enter => {
-            run_generate(app, origin);
-            return;
+            return run_generate(app, origin);
         }
         _ => {}
     }
@@ -1584,8 +1596,20 @@ fn handle_gen_wizard(app: &mut App, key: KeyEvent, origin: GenOrigin) {
         }
         1 => edit_wizard_field(&mut w.filename, &mut w.filename_cursor, key),
         2 => edit_wizard_field(&mut w.comment, &mut w.comment_cursor, key),
+        3 => {
+            if matches!(
+                key.code,
+                KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right
+            ) {
+                w.passphrase = match w.passphrase {
+                    GenPassphrase::NoPassphrase => GenPassphrase::Interactive,
+                    GenPassphrase::Interactive => GenPassphrase::NoPassphrase,
+                };
+            }
+        }
         _ => {}
     }
+    None
 }
 
 fn edit_wizard_field(s: &mut String, cursor: &mut usize, key: KeyEvent) {
@@ -1599,6 +1623,26 @@ fn edit_wizard_field(s: &mut String, cursor: &mut usize, key: KeyEvent) {
         KeyCode::Char(c) => insert_char(s, cursor, c),
         _ => {}
     }
+}
+
+/// Precondition check for the change-passphrase (`p`) action on the key
+/// manager screen (Issue #47). Pure — inspects the current selection only:
+/// nothing selected or a `.pub`-only entry is an `Err` with a toast-ready
+/// message; a selected entry with a private key yields its private path.
+fn passphrase_change_target(app: &App) -> Result<std::path::PathBuf, &'static str> {
+    let Some(k) = app.keys_state.selected().and_then(|i| app.keys.get(i)) else {
+        return Err("select a key to change its passphrase");
+    };
+    if !k.has_private {
+        return Err("no private key file for this entry");
+    }
+    Ok(k.private_path())
+}
+
+/// Success toast after `ssh-keygen -p` (Issue #47). Must mention that the pair
+/// status can show "unverified" for the now-encrypted key (not an error).
+fn passphrase_success_toast() -> &'static str {
+    "passphrase updated — an encrypted key shows pair: unverified (not an error)"
 }
 
 /// Screen the generate-key wizard returns to when cancelled.
@@ -1619,36 +1663,294 @@ fn add_identity_row(app: &mut App, path: &str) {
     app.form.focused = form_idx::IDENTITY;
 }
 
-fn run_generate(app: &mut App, origin: GenOrigin) {
+/// A validated interactive key generation waiting for the terminal: the wizard
+/// handler is terminal-free (headless-testable), so the dispatch layer runs it.
+/// It carries everything the run needs, so the runner never re-reads the wizard
+/// state. `filename` is the name the user typed (what the toast reports); `out`
+/// is that name resolved under `~/.ssh`.
+struct InteractiveGen {
+    out: std::path::PathBuf,
+    filename: String,
+    args: Vec<std::ffi::OsString>,
+    origin: GenOrigin,
+}
+
+fn run_generate(app: &mut App, origin: GenOrigin) -> Option<InteractiveGen> {
     let w = app.gen_wizard.clone();
     let filename = w.filename.trim();
     if filename.is_empty() {
         app.toast("filename is required", true);
-        return;
+        return None;
     }
     let Some(dir) = ssh_dir() else {
         app.toast("cannot resolve ~/.ssh", true);
-        return;
+        return None;
     };
     let out = dir.join(filename);
-    match generate_key(w.key_type, &out, w.comment.trim()) {
-        Ok(()) => {
-            app.reload_keys();
-            match origin {
-                GenOrigin::KeyManager => {
-                    app.screen = Screen::KeyManager;
-                    app.toast(format!("generated {filename}"), false);
-                }
-                GenOrigin::EditForm { editing } => {
-                    let id_path = tildify(&out);
-                    add_identity_row(app, &id_path);
-                    app.screen = Screen::Edit { editing };
-                    app.toast(format!("generated {filename} → IdentityFile"), false);
-                }
-            }
+    if w.passphrase == GenPassphrase::Interactive {
+        // Mirror generate_key's refuse-to-clobber guard: an existing file would
+        // otherwise make the interactive ssh-keygen prompt "Overwrite (y/n)?".
+        if out.exists() {
+            app.toast(format!("{} already exists", out.display()), true);
+            return None;
         }
+        let args = generate_key_args(
+            w.key_type,
+            &out,
+            w.comment.trim(),
+            GenPassphrase::Interactive,
+        );
+        return Some(InteractiveGen {
+            out,
+            filename: filename.to_string(),
+            args,
+            origin,
+        });
+    }
+    match generate_key(w.key_type, &out, w.comment.trim()) {
+        Ok(()) => finish_generate(app, &origin, &out, filename),
         Err(e) => app.toast(format!("{e}"), true),
     }
+    None
+}
+
+/// Shared success tail of both generation paths: refresh the key list, return
+/// to the origin screen, and (from the edit form) wire the new key in.
+fn finish_generate(app: &mut App, origin: &GenOrigin, out: &std::path::Path, filename: &str) {
+    app.reload_keys();
+    match origin {
+        GenOrigin::KeyManager => {
+            app.screen = Screen::KeyManager;
+            app.toast(format!("generated {filename}"), false);
+        }
+        GenOrigin::EditForm { editing } => {
+            let id_path = tildify(out);
+            add_identity_row(app, &id_path);
+            app.screen = Screen::Edit { editing: *editing };
+            app.toast(format!("generated {filename} → IdentityFile"), false);
+        }
+    }
+}
+
+/// Run an interactive (passphrase-prompting) key generation inline.
+fn run_generate_interactive(
+    app: &mut App,
+    pending: InteractiveGen,
+    terminal: &mut DefaultTerminal,
+) -> Result<()> {
+    // ssh-keygen won't create missing parent dirs — mirror generate_key.
+    if let Some(parent) = pending.out.parent()
+        && !parent.exists()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        app.toast(format!("{e}"), true);
+        return Ok(());
+    }
+    if run_ssh_keygen_inline(app, terminal, &pending.args)? {
+        finish_generate(app, &pending.origin, &pending.out, &pending.filename);
+    }
+    Ok(())
+}
+
+/// Run `ssh-keygen` with the TUI suspended so it owns the console for its own
+/// passphrase prompts, then restore. Returns whether it exited successfully;
+/// a non-zero exit or a launch failure is toasted here (and reported `false`),
+/// so callers only have to describe the success path.
+fn run_ssh_keygen_inline(
+    app: &mut App,
+    terminal: &mut DefaultTerminal,
+    args: &[std::ffi::OsString],
+) -> Result<bool> {
+    suspend_tui(terminal)?;
+    let status = run_inline(&tools().ssh_keygen, args, &[]);
+    restore_tui(terminal)?;
+    // Sitting at ssh-keygen's passphrase prompts (TUI suspended, no keypresses)
+    // must not make the next on_tick spuriously idle-auto-lock the vault (#14) —
+    // which the passphrase-sync flow is about to need. Same re-stamp the inline
+    // connect / SFTP transfer paths do.
+    app.last_activity = Instant::now();
+    match status {
+        Ok(s) if s.success() => Ok(true),
+        Ok(s) => {
+            let (msg, is_err) = describe_exit("ssh-keygen", &s)
+                .unwrap_or_else(|| ("ssh-keygen failed".to_string(), true));
+            app.toast(msg, is_err);
+            Ok(false)
+        }
+        Err(e) => {
+            app.toast(format!("ssh-keygen: {e}"), true);
+            Ok(false)
+        }
+    }
+}
+
+/// The `p` action on the key manager (Issue #47): run `ssh-keygen -p` inline to
+/// add/change the selected key's passphrase (ssh-keygen prompts for the current
+/// and new passphrase itself — sshm never sees them), then offer to sync stored
+/// vault `Passphrase` entries that reference the changed key (they now hold the
+/// old passphrase, so connect-time auto-fill would fail confusingly).
+fn change_passphrase(app: &mut App, terminal: &mut DefaultTerminal) -> Result<()> {
+    let path = match passphrase_change_target(app) {
+        Ok(p) => p,
+        Err(msg) => {
+            app.toast(msg, true);
+            return Ok(());
+        }
+    };
+    if !run_ssh_keygen_inline(app, terminal, &change_passphrase_args(&path))? {
+        return Ok(());
+    }
+    // Success: the key file changed on disk — re-derive pair status (an
+    // encrypted key legitimately reads Unverified now; see ui::keys::pair_hint).
+    app.reload_keys();
+    app.toast(passphrase_success_toast(), false);
+    offer_passphrase_sync(app, path);
+    Ok(())
+}
+
+/// After a successful passphrase change, look for stale vault `Passphrase`
+/// entries. Unlocked vault: open the bulk-update modal when any match. Locked
+/// vault: offer to unlock first (Esc skips), resumed by `submit_vault_unlock`.
+fn offer_passphrase_sync(app: &mut App, key_path: std::path::PathBuf) {
+    if app.vault.is_some() {
+        let stale = stale_hosts_for_key(app, &key_path);
+        if !stale.is_empty() {
+            open_passphrase_sync(app, stale);
+        }
+    } else if app.has_vault_file {
+        // Entries are unreadable while locked, so we can't even tell whether
+        // any are stale — route through the unlock prompt with a resume marker.
+        app.passphrase_sync_pending = Some(key_path);
+        // A vault file exists, so this is an unlock (not a create) prompt — which
+        // is exactly `VaultUnlock::default()`.
+        app.vault_unlock = VaultUnlock::default();
+        open_overlay(app, Screen::VaultUnlock);
+    }
+}
+
+/// Host aliases whose stored vault passphrase went stale when `key_path`'s
+/// passphrase changed. Empty when the vault is locked or `~` can't be resolved —
+/// in both cases there is nothing readable to check.
+fn stale_hosts_for_key(app: &App, key_path: &std::path::Path) -> Vec<String> {
+    match (dirs::home_dir(), &app.vault) {
+        (Some(home), Some(v)) => stale_passphrase_hosts(key_path, &home, &app.hosts, v),
+        _ => Vec::new(),
+    }
+}
+
+fn open_passphrase_sync(app: &mut App, hosts: Vec<String>) {
+    // Struct-update (`..Default::default()`) can't move out of a Drop type.
+    app.passphrase_sync = PassphraseSyncForm {
+        hosts,
+        secret: String::new(),
+        cursor: 0,
+    };
+    open_overlay(app, Screen::PassphraseSync);
+}
+
+/// Bulk vault-passphrase update modal: one typed passphrase, upserted into the
+/// `Passphrase` entry of every affected host. Esc skips (entries stay stale).
+fn handle_passphrase_sync(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => {
+            // Replacing the form drops the old one, whose Drop scrubs the secret.
+            app.passphrase_sync = PassphraseSyncForm::default();
+            close_overlay(app);
+        }
+        KeyCode::Enter => submit_passphrase_sync(app),
+        // Edits go through the zeroizing variants so a typed passphrase never
+        // leaves an un-scrubbed copy on the heap (as on the vault entry form).
+        KeyCode::Backspace => {
+            let f = &mut app.passphrase_sync;
+            backspace_secret(&mut f.secret, &mut f.cursor);
+        }
+        KeyCode::Char(c) => {
+            let f = &mut app.passphrase_sync;
+            insert_char_secret(&mut f.secret, &mut f.cursor, c);
+        }
+        _ => {}
+    }
+}
+
+/// The bulk sync's pre-save guard, mirroring the single-entry path
+/// (`save_vault_entry`): an empty secret means "nothing typed yet", and one the
+/// connect-time askpass channel cannot deliver (newline/CR, or over OpenSSH's
+/// 1023-byte read cap) must be rejected BEFORE it is written — a bulk write is
+/// exactly where storing an undeliverable value does the most damage. Returns
+/// the toast to show, or `None` to proceed. Pure so the guard is unit-tested;
+/// dropping it would otherwise pass the whole suite silently (the same reason
+/// `consent_should_be_recorded` is a separate function).
+fn passphrase_sync_rejection(secret: &str) -> Option<String> {
+    if secret.is_empty() {
+        return Some("enter the new passphrase (Esc to skip)".to_string());
+    }
+    vault::reject_unservable_secret(secret)
+        .err()
+        .map(|e| e.to_string())
+}
+
+fn submit_passphrase_sync(app: &mut App) {
+    if let Some(msg) = passphrase_sync_rejection(&app.passphrase_sync.secret) {
+        app.toast(msg, true);
+        return;
+    }
+    let Some(path) = vault::default_path() else {
+        app.toast("cannot resolve ~/.ssh", true);
+        return;
+    };
+    // An idle auto-lock may have fired while the modal was open: a locked vault
+    // updates nothing (same boundary as `consent_should_be_recorded`).
+    if app.vault.is_none() {
+        app.passphrase_sync = PassphraseSyncForm::default();
+        close_overlay(app);
+        app.toast(
+            "vault is locked — stored passphrases were not updated",
+            true,
+        );
+        return;
+    }
+    let hosts = app.passphrase_sync.hosts.clone();
+    // Copy the typed passphrase into a `Secret` (scrubbed on drop) rather than a
+    // bare String, so the per-entry copies never accumulate in the clear.
+    let secret: Secret = app.passphrase_sync.secret.as_str().into();
+    let mut updated = 0usize;
+    let mut failure = None;
+    // Scoped so the vault borrow ends before the toasts below take `app` again.
+    if let Some(v) = app.vault.as_mut() {
+        for host in &hosts {
+            let Some(idx) = v
+                .entries
+                .iter()
+                .position(|e| e.kind == SecretKind::Passphrase && e.host == *host)
+            else {
+                continue; // entry vanished since detection (e.g. deleted) — skip
+            };
+            let entry = VaultEntry {
+                host: host.clone(),
+                kind: SecretKind::Passphrase,
+                secret: secret.clone(),
+                note: v.entries[idx].note.clone(),
+            };
+            if let Err(e) = v.upsert_and_save(Some(idx), entry, &path) {
+                failure = Some(e);
+                break;
+            }
+            updated += 1;
+        }
+    }
+    if let Some(e) = failure {
+        // Keep the modal open so the typed passphrase isn't lost on a transient
+        // save failure; already-saved entries stay updated (upsert_and_save
+        // rolls back only the failing entry).
+        app.toast(format!("{e}"), true);
+        return;
+    }
+    app.passphrase_sync = PassphraseSyncForm::default();
+    close_overlay(app);
+    app.toast(
+        format!("vault passphrase updated for {updated} host(s)"),
+        false,
+    );
 }
 
 /// The form screen a key/host picker returns to, per its [`PickOrigin`].
@@ -3139,6 +3441,9 @@ fn handle_vault_unlock(app: &mut App, key: KeyEvent) {
     let creating = app.vault_unlock.creating;
     match key.code {
         KeyCode::Esc => {
+            // Also skip any pending passphrase-sync resume (Issue #47): declining
+            // to unlock means the stale-entry check is consciously skipped.
+            app.passphrase_sync_pending = None;
             app.vault_unlock = VaultUnlock::default();
             close_overlay(app);
         }
@@ -3207,6 +3512,23 @@ fn submit_vault_unlock(app: &mut App) {
             app.vault_state.select((n > 0).then_some(0));
             // Replacing the struct drops the old one, whose Drop scrubs the password.
             app.vault_unlock = VaultUnlock::default();
+            // A pending passphrase sync (Issue #47) resumes on the key manager
+            // instead of landing on the vault screen: re-run the stale check now
+            // that the entries are readable.
+            if let Some(key_path) = app.passphrase_sync_pending.take() {
+                app.prev_screen = None;
+                app.screen = Screen::KeyManager;
+                let stale = stale_hosts_for_key(app, &key_path);
+                if stale.is_empty() {
+                    app.toast(
+                        "vault unlocked — no stored passphrases reference this key",
+                        false,
+                    );
+                } else {
+                    open_passphrase_sync(app, stale);
+                }
+                return;
+            }
             app.prev_screen = None;
             app.screen = Screen::Vault;
             // On unlock, nudge discoverability: stored passphrases auto-fill on the
@@ -4905,5 +5227,136 @@ mod tests {
             "the un-written host must not linger in the in-memory config"
         );
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // --- Issue #47: gen wizard passphrase field + change-passphrase (`p`) ---
+
+    fn plain_key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// handle_gen_wizard — Tab を 4 回押すと field が 0→1→2→3→0 と巡回する
+    #[test]
+    fn handle_gen_wizard_cycles_four_fields() {
+        // given
+        let mut app = app_fixture("Host h\n  HostName h\n");
+        app.screen = Screen::GenerateKey {
+            origin: GenOrigin::KeyManager,
+        };
+        assert_eq!(app.gen_wizard.field, 0);
+
+        // when / then: type → filename → comment → passphrase → type
+        for expected in [1usize, 2, 3, 0] {
+            handle_gen_wizard(&mut app, plain_key(KeyCode::Tab), GenOrigin::KeyManager);
+            assert_eq!(app.gen_wizard.field, expected);
+        }
+    }
+
+    /// handle_gen_wizard — field=3 の Left/Right が passphrase をトグルする
+    #[test]
+    fn handle_gen_wizard_toggles_passphrase_on_field3() {
+        use crate::os::keys::GenPassphrase;
+
+        // given
+        let mut app = app_fixture("Host h\n  HostName h\n");
+        app.screen = Screen::GenerateKey {
+            origin: GenOrigin::KeyManager,
+        };
+        app.gen_wizard.field = 3;
+        assert_eq!(app.gen_wizard.passphrase, GenPassphrase::NoPassphrase);
+
+        // when
+        handle_gen_wizard(&mut app, plain_key(KeyCode::Right), GenOrigin::KeyManager);
+
+        // then
+        assert_eq!(app.gen_wizard.passphrase, GenPassphrase::Interactive);
+
+        // when: 逆方向で元に戻る
+        handle_gen_wizard(&mut app, plain_key(KeyCode::Left), GenOrigin::KeyManager);
+
+        // then
+        assert_eq!(app.gen_wizard.passphrase, GenPassphrase::NoPassphrase);
+    }
+
+    /// passphrase_change_target — 未選択/秘密鍵なしは Err・秘密鍵ありは Ok(パス)
+    #[test]
+    fn passphrase_change_target_rejects_missing_private_key() {
+        use crate::os::keys::{KeyInfo, PairStatus};
+
+        fn key_info(path: &str, has_private: bool) -> KeyInfo {
+            KeyInfo {
+                path: std::path::PathBuf::from(path),
+                pub_path: None,
+                bits: 256,
+                fingerprint: "SHA256:abc".into(),
+                comment: String::new(),
+                key_type: "ED25519".into(),
+                has_private,
+                pair: PairStatus::NotApplicable,
+            }
+        }
+
+        // given: 鍵一覧はあるが未選択
+        let mut app = app_fixture("Host h\n  HostName h\n");
+        app.keys = vec![key_info("/home/u/.ssh/id_a", true)];
+        app.keys_state.select(None);
+        // when / then
+        assert!(passphrase_change_target(&app).is_err());
+
+        // given: 選択エントリに秘密鍵が無い（.pub のみ）
+        app.keys = vec![key_info("/home/u/.ssh/orphan", false)];
+        app.keys_state.select(Some(0));
+        // when / then
+        assert!(passphrase_change_target(&app).is_err());
+
+        // given: 秘密鍵あり
+        app.keys = vec![key_info("/home/u/.ssh/id_a", true)];
+        app.keys_state.select(Some(0));
+        // when
+        let got = passphrase_change_target(&app);
+        // then
+        assert_eq!(got, Ok(std::path::PathBuf::from("/home/u/.ssh/id_a")));
+    }
+
+    /// passphrase_success_toast — 成功トーストが "unverified" 表示の理由を説明する
+    #[test]
+    fn passphrase_success_toast_mentions_unverified() {
+        // given / when
+        let msg = passphrase_success_toast();
+
+        // then
+        assert!(
+            msg.contains("unverified"),
+            "toast must warn the pair status may now show unverified: {msg}"
+        );
+    }
+
+    /// passphrase_sync_rejection — 一括保存も単体保存と同じ「配送できない秘密」規律で拒否する
+    #[test]
+    fn passphrase_sync_rejection_matches_single_entry_rules() {
+        // given: (秘密, 拒否されるべきか)
+        let at_cap = "x".repeat(1023);
+        let over_cap = "x".repeat(1024);
+        let cases: Vec<(&str, bool)> = vec![
+            ("", true),                 // 未入力
+            ("good-passphrase", false), // 正常
+            ("two\nlines", true),       // 改行は askpass チャネルで配送できない
+            ("cr\rret", true),          // CR も同様
+            (at_cap.as_str(), false),   // OpenSSH の 1023 バイト上限ちょうど
+            (over_cap.as_str(), true),  // 超過は無言に切り詰められる
+        ];
+
+        for (secret, expect_rejected) in cases {
+            // when
+            let rejected = passphrase_sync_rejection(secret);
+
+            // then
+            assert_eq!(
+                rejected.is_some(),
+                expect_rejected,
+                "secret (len {}) rejection mismatch: {rejected:?}",
+                secret.len()
+            );
+        }
     }
 }

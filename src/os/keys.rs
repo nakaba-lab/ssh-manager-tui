@@ -6,11 +6,14 @@
 //! KEY-----`); the body is never read. Listing uses `ssh-keygen -l -f <file>`.
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::io::{self, BufRead, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use super::binaries::{ssh_dir, tools};
+use crate::config::model::HostView;
+use crate::os::vault::{SecretKind, Vault};
 
 /// How many directory levels to descend when discovering keys. The root
 /// (`~/.ssh`) is level 0, so the deepest files found live `MAX_DEPTH - 1`
@@ -355,22 +358,14 @@ pub fn generate_key(key_type: KeyType, out_path: &Path, comment: &str) -> io::Re
         std::fs::create_dir_all(parent)?;
     }
 
-    let mut cmd = Command::new(&tools().ssh_keygen);
-    cmd.arg("-t");
-    match key_type {
-        KeyType::Ed25519 => {
-            cmd.arg("ed25519");
-        }
-        KeyType::Rsa4096 => {
-            cmd.arg("rsa").arg("-b").arg("4096");
-        }
-    }
-    cmd.arg("-f").arg(out_path);
-    cmd.arg("-C").arg(comment);
-    cmd.arg("-N").arg("");
-    cmd.arg("-q");
-
-    let out = cmd.output()?;
+    let out = Command::new(&tools().ssh_keygen)
+        .args(generate_key_args(
+            key_type,
+            out_path,
+            comment,
+            GenPassphrase::NoPassphrase,
+        ))
+        .output()?;
     if out.status.success() {
         Ok(())
     } else {
@@ -379,6 +374,87 @@ pub fn generate_key(key_type: KeyType, out_path: &Path, comment: &str) -> io::Re
             String::from_utf8_lossy(&out.stderr).trim()
         )))
     }
+}
+
+/// Passphrase mode for key generation (Issue #47).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenPassphrase {
+    NoPassphrase,
+    Interactive,
+}
+
+/// Pure arg builder for `ssh-keygen -p` (passphrase add/change). See CLAUDE.md layering.
+/// The current/new passphrases are prompted by ssh-keygen itself — never passed
+/// as arguments, so no secret ever appears on a command line.
+pub fn change_passphrase_args(private_key: &Path) -> Vec<OsString> {
+    vec!["-p".into(), "-f".into(), private_key.as_os_str().to_owned()]
+}
+
+/// Pure arg builder for key generation; `generate_key` and the interactive path share it.
+/// `NoPassphrase` keeps the captured non-interactive shape (`-N "" -q`);
+/// `Interactive` omits both so ssh-keygen prompts on the inherited console.
+pub fn generate_key_args(
+    key_type: KeyType,
+    out_path: &Path,
+    comment: &str,
+    passphrase: GenPassphrase,
+) -> Vec<OsString> {
+    let mut args: Vec<OsString> = match key_type {
+        KeyType::Ed25519 => vec!["-t".into(), "ed25519".into()],
+        KeyType::Rsa4096 => vec!["-t".into(), "rsa".into(), "-b".into(), "4096".into()],
+    };
+    args.extend([
+        "-f".into(),
+        out_path.as_os_str().to_owned(),
+        "-C".into(),
+        comment.into(),
+    ]);
+    if passphrase == GenPassphrase::NoPassphrase {
+        args.extend(["-N".into(), "".into(), "-q".into()]);
+    }
+    args
+}
+
+/// Expand a leading `~/` against `home`; anything else is taken verbatim.
+fn expand_tilde(raw: &str, home: &Path) -> PathBuf {
+    match raw.strip_prefix("~/") {
+        Some(rest) => home.join(rest),
+        None => PathBuf::from(raw),
+    }
+}
+
+/// Aliases of hosts whose IdentityFile (with a leading `~/` expanded against
+/// `home`) equals `key_path`. Pure.
+pub fn hosts_using_key(key_path: &Path, home: &Path, hosts: &[HostView]) -> Vec<String> {
+    hosts
+        .iter()
+        .filter(|h| {
+            h.identity_files
+                .iter()
+                .any(|id| expand_tilde(id, home) == key_path)
+        })
+        .map(|h| h.alias().to_string())
+        .collect()
+}
+
+/// `hosts_using_key` ∩ hosts that have a vault `Passphrase` entry. Pure.
+/// Exact-alias matching mirrors `vault::match_vault_kinds` (glob patterns never
+/// match a vault entry, so they can't produce stale candidates either).
+pub fn stale_passphrase_hosts(
+    key_path: &Path,
+    home: &Path,
+    hosts: &[HostView],
+    vault: &Vault,
+) -> Vec<String> {
+    hosts_using_key(key_path, home, hosts)
+        .into_iter()
+        .filter(|alias| {
+            vault
+                .entries
+                .iter()
+                .any(|e| e.kind == SecretKind::Passphrase && e.host == *alias)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -615,6 +691,190 @@ mod tests {
         );
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- Issue #47: passphrase add/change (`ssh-keygen -p`) + vault pairing ---
+
+    use crate::config::model::HostView;
+    use crate::os::vault::{SecretKind, Vault, VaultEntry};
+    use std::ffi::OsString;
+
+    fn os_args(args: &[&str]) -> Vec<OsString> {
+        args.iter().map(OsString::from).collect()
+    }
+
+    fn host_view(alias: &str, identity_files: &[&str]) -> HostView {
+        HostView {
+            patterns: vec![alias.to_string()],
+            identity_files: identity_files.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// change_passphrase_args — 秘密鍵パスから `-p -f <path>` を組み立てる
+    #[test]
+    fn change_passphrase_args_builds_p_f_path() {
+        // given
+        let key = Path::new("/home/u/.ssh/id_ed25519");
+
+        // when
+        let args = change_passphrase_args(key);
+
+        // then
+        assert_eq!(args, os_args(&["-p", "-f", "/home/u/.ssh/id_ed25519"]));
+    }
+
+    /// generate_key_args — NoPassphrase の ed25519 は `-N ""` と `-q` を含む
+    #[test]
+    fn generate_key_args_no_passphrase_ed25519_includes_n_empty_and_q() {
+        // given
+        let out = Path::new("/tmp/k/id_ed25519");
+
+        // when
+        let args = generate_key_args(
+            KeyType::Ed25519,
+            out,
+            "me@host",
+            GenPassphrase::NoPassphrase,
+        );
+
+        // then
+        assert_eq!(
+            args,
+            os_args(&[
+                "-t",
+                "ed25519",
+                "-f",
+                "/tmp/k/id_ed25519",
+                "-C",
+                "me@host",
+                "-N",
+                "",
+                "-q",
+            ])
+        );
+    }
+
+    /// generate_key_args — NoPassphrase の rsa4096 は `-b 4096` も含む
+    #[test]
+    fn generate_key_args_no_passphrase_rsa4096_includes_b_4096() {
+        // given
+        let out = Path::new("/tmp/k/id_rsa");
+
+        // when
+        let args = generate_key_args(
+            KeyType::Rsa4096,
+            out,
+            "me@host",
+            GenPassphrase::NoPassphrase,
+        );
+
+        // then
+        assert_eq!(
+            args,
+            os_args(&[
+                "-t",
+                "rsa",
+                "-b",
+                "4096",
+                "-f",
+                "/tmp/k/id_rsa",
+                "-C",
+                "me@host",
+                "-N",
+                "",
+                "-q",
+            ])
+        );
+    }
+
+    /// generate_key_args — Interactive では `-N`/`-q` を発行しない（ssh-keygen に対話させる）
+    #[test]
+    fn generate_key_args_interactive_omits_n_and_q() {
+        // given
+        let out = Path::new("/tmp/k/id_ed25519");
+
+        // when
+        let args = generate_key_args(KeyType::Ed25519, out, "me@host", GenPassphrase::Interactive);
+
+        // then
+        assert!(
+            !args.contains(&OsString::from("-N")),
+            "must omit -N: {args:?}"
+        );
+        assert!(
+            !args.contains(&OsString::from("-q")),
+            "must omit -q: {args:?}"
+        );
+        assert!(args.contains(&OsString::from("-t")));
+        assert!(args.contains(&OsString::from("-f")));
+        assert!(args.contains(&OsString::from("-C")));
+    }
+
+    /// hosts_using_key — `~/` 展開と絶対パスの IdentityFile が key_path に一致する
+    #[test]
+    fn hosts_using_key_matches_tilde_and_absolute_identity() {
+        // given: (alias, identity_files, マッチ期待)
+        let home = Path::new("/home/u");
+        let key = Path::new("/home/u/.ssh/id_a");
+        let cases: &[(&str, &[&str], bool)] = &[
+            ("tilde", &["~/.ssh/id_a"], true),
+            ("absolute", &["/home/u/.ssh/id_a"], true),
+            ("other-key", &["~/.ssh/id_b"], false),
+            ("no-identity", &[], false),
+        ];
+        let hosts: Vec<HostView> = cases
+            .iter()
+            .map(|(alias, ids, _)| host_view(alias, ids))
+            .collect();
+
+        // when
+        let matched = hosts_using_key(key, home, &hosts);
+
+        // then
+        for (alias, _, expect) in cases {
+            assert_eq!(
+                matched.iter().any(|m| m == alias),
+                *expect,
+                "alias {alias} (matched: {matched:?})"
+            );
+        }
+    }
+
+    /// stale_passphrase_hosts — 鍵一致かつ vault に Passphrase がある host だけを返す
+    #[test]
+    fn stale_passphrase_hosts_requires_both_key_match_and_vault_entry() {
+        // given
+        let home = Path::new("/home/u");
+        let key = Path::new("/home/u/.ssh/id_a");
+        let hosts = vec![
+            host_view("with-pass", &["~/.ssh/id_a"]), // 鍵一致 + Passphrase → 含む
+            host_view("pw-only", &["~/.ssh/id_a"]),   // 鍵一致 + Password のみ → 含まない
+            host_view("other-key", &["~/.ssh/id_b"]), // 鍵不一致 + Passphrase → 含まない
+        ];
+        let entry = |host: &str, kind| VaultEntry {
+            host: host.into(),
+            kind,
+            secret: "s".into(),
+            note: String::new(),
+        };
+        let mut vault = Vault::create("pw").unwrap();
+        vault.upsert(None, entry("with-pass", SecretKind::Passphrase));
+        vault.upsert(None, entry("pw-only", SecretKind::Password));
+        vault.upsert(None, entry("other-key", SecretKind::Passphrase));
+
+        // when
+        let stale = stale_passphrase_hosts(key, home, &hosts, &vault);
+
+        // then
+        assert_eq!(stale, vec!["with-pass".to_string()]);
+
+        // given: 何も無い
+        let empty_vault = Vault::create("pw").unwrap();
+        // when
+        let stale = stale_passphrase_hosts(key, home, &[], &empty_vault);
+        // then
+        assert!(stale.is_empty());
     }
 
     #[cfg(unix)]

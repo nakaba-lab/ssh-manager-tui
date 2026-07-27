@@ -59,6 +59,7 @@ fn base_screen(app: &App) -> Screen {
         | Screen::ConnectOverride { .. }
         | Screen::SftpTransfer
         | Screen::DiffPreview
+        | Screen::PassphraseSync
         | Screen::PasswordConfirm { .. } => app.prev_screen.clone().unwrap_or(Screen::List),
         Screen::PickKey { origin } | Screen::PickJump { origin } => match origin {
             PickOrigin::Edit { editing } => Screen::Edit { editing: *editing },
@@ -117,6 +118,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Screen::SftpTransfer => sftp::draw_transfer(f, app, body_a),
         Screen::VaultUnlock => vault::draw_unlock(f, app, body_a),
         Screen::VaultEntry { .. } => vault::draw_entry(f, app, body_a),
+        Screen::PassphraseSync => keys::draw_passphrase_sync(f, app, body_a),
         Screen::PasswordConfirm { target, kinds, .. } => {
             vault::draw_password_confirm(f, target, *kinds, body_a)
         }
@@ -287,6 +289,7 @@ fn draw_footer(f: &mut Frame, app: &App, base: &Screen, area: Rect) {
         (Screen::KeyManager, _) => widgets::footer_hints(&[
             ("j/k", "move"),
             ("g", "generate"),
+            ("p", "passphrase"),
             ("y", "copy pub"),
             ("s", "set-id"),
             ("d", "delete"),

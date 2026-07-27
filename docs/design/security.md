@@ -51,13 +51,14 @@ flowchart TD
 - salt/nonce/KDF パラメータは平文だが **associated data** に束縛（改竄ヘッダはタグ検証で落ちる）。KDF パラメータは復号前に**範囲チェック**（DoS・弱体化を防ぐ）。
 - マスターパスワードは永続化しない（誤りは AEAD タグ失敗）。秘密は `Zeroize`（drop 時スクラブ・`Debug` redact）。アイドル 15 分で自動ロック。
 
-## パスフレーズ変更と vault の同期（#47・draft）
+## パスフレーズ変更と vault の同期（#47）
 
-`ssh-keygen -p` によるパスフレーズ追加・変更が成功すると、vault の該当 `Passphrase` エントリは陳腐化する（放置すると接続時オートフィルが旧パスフレーズを出して失敗する）。同期フロー:
+`ssh-keygen -p` によるパスフレーズ追加・変更が成功すると、vault の該当 `Passphrase` エントリは陳腐化する（放置すると接続時オートフィルが旧パスフレーズを出して失敗する）。同期フロー（実装は `update.rs` の `offer_passphrase_sync`／`submit_passphrase_sync`）:
 
-1. **検出**: 変更した鍵のパス（tilde 正規化で比較）を IdentityFile に持つホストを `HostView` 射影から逆引きし、vault の `Passphrase` エントリ（`host` × `kind`）と突合する。`ssh -G` の全ホスト実行はしない（spawn 数過多・起動遅延を避け、config 射影で決定的に逆引きする）。
-2. **一括更新**: 一致があれば一括更新モーダルで新パスフレーズを **1 回**入力（`Secret`/`Zeroizing`・`Debug` redact）し、該当全ホストのエントリへ upsert・`upsert_and_save`。vault ロック中は `VaultUnlock` を先行させる（いずれもスキップ可＝更新は強制しない）。
-3. **限界（受容済み）**: sshm は ssh-keygen の対話を捕捉しないため、モーダル入力値が ssh-keygen に渡した値と一致する保証はない（typo リスク）。誤入力時はオートフィル失敗として顕在化する＝従来（陳腐化放置）と同じ失敗モードであり悪化はしない。
+1. **検出**（`keys::stale_passphrase_hosts`・純粋）: 変更した鍵のパス（先頭 `~/` を home で展開して比較）を IdentityFile に持つホストを `HostView` 射影から逆引きし、vault の `Passphrase` エントリと**エイリアス完全一致**で突合する（`match_vault_kinds` と同じ照合規則＝glob パターンは vault エントリに一致しないので陳腐化候補にもならない）。`ssh -G` の全ホスト実行はしない（spawn 数過多・起動遅延を避け、config 射影で決定的に逆引きする）。
+2. **ロック中は検出前にアンロックへ迂回**: ロック中はエントリを読めず陳腐化の有無すら判定できないため、`App::passphrase_sync_pending` に鍵パスを置いて `VaultUnlock` を開き、アンロック成功後に検出をやり直す。Esc（アンロック拒否）は再開マーカーを破棄して黙って終わる＝同期は強制しない。
+3. **一括更新**: 一致があれば一括更新モーダル（`Screen::PassphraseSync`）で新パスフレーズを **1 回**入力し、該当全ホストのエントリへ `upsert_and_save`。入力は `PassphraseSyncForm`（Drop でスクラブ・`Debug` redact）に保持し、各エントリへは `Secret` のクローンとして渡す（平文 String を撒かない）。モーダル表示中にアイドル自動ロックが挟まった場合は**何も更新せず**警告して閉じる（`consent_should_be_recorded` と同じロック境界）。
+4. **限界（受容済み）**: sshm は ssh-keygen の対話を捕捉しないため、モーダル入力値が ssh-keygen に渡した値と一致する保証はない（typo リスク）。誤入力時はオートフィル失敗として顕在化する＝従来（陳腐化放置）と同じ失敗モードであり悪化はしない。
 
 ## 主要な設計判断（現行の理由）
 

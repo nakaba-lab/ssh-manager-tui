@@ -31,37 +31,42 @@ updated: 2026-07-27
 - **レスポンシブ**: `responsive_split` が `WIDE_MIN_WIDTH`（90 桁）以上で横並び・未満で縦積み。フッターは 80 桁以内で描ける（`footers_fit_80_cols` テスト）。
 - **配色/コントラスト**: `theme.rs` の Tokyo Night パレットに集約。
 
-### 鍵パスフレーズの追加・変更（#47・draft）
+### 鍵パスフレーズの追加・変更（#47）
 
-鍵マネージャに `p`（passphrase 追加/変更）を追加する。TUI を退避して `ssh-keygen -p` を対話実行し、成功後に vault の陳腐化 Passphrase エントリを検出したら一括更新モーダルへ繋ぐ:
+鍵マネージャの `p`（passphrase 追加/変更）は、TUI を退避して `ssh-keygen -p` を対話実行し（現在/新パスフレーズは OpenSSH 自身が聴取）、成功後に vault の陳腐化 Passphrase エントリの一括更新モーダル（`Screen::PassphraseSync`）へ繋ぐ。**vault がロック中はエントリを読めない＝陳腐化の有無すら判定できない**ため、検出を試みる前にアンロックへ迂回し、アンロック成功後に判定をやり直す（`App::passphrase_sync_pending` が再開マーカー）:
 
 ```mermaid
 flowchart TD
     KM[KeyManager] -->|p ＝秘密鍵あり| RUN["TUI 退避 → ssh-keygen -p -f 鍵 を対話実行 → TUI 復帰"]
     KM -->|p ＝.pub のみ/未選択| W[警告トースト（no-op）]
     RUN -->|失敗| E[sticky エラートースト]
-    RUN -->|成功・該当 vault エントリなし| OK[成功トースト]
-    RUN -->|成功・陳腐化エントリ検出| VU{vault アンロック済み?}
-    VU -->|いいえ| UL["VaultUnlock モーダル（スキップ可）"]
-    UL --> BM
-    VU -->|はい| BM["一括更新モーダル: 新パスフレーズを 1 回入力"]
-    BM -->|Enter| UP[該当全ホストの Passphrase エントリを upsert・保存 → 成功トースト]
-    BM -->|Esc（スキップ）| OK
+    RUN -->|成功| OK["成功トースト（unverified 表示の説明つき）"]
+    OK --> VU{vault の状態}
+    VU -->|vault ファイルなし| END[終了]
+    VU -->|ロック中| UL["VaultUnlock モーダル（Esc でスキップ＝再開マーカーを破棄）"]
+    UL -->|アンロック成功| DET
+    VU -->|アンロック済み| DET{陳腐化エントリを検出}
+    DET -->|なし| END
+    DET -->|あり| BM["一括更新モーダル: 新パスフレーズを 1 回入力（マスク表示）"]
+    BM -->|Enter| UP[該当全ホストの Passphrase エントリを upsert・保存 → 件数トースト]
+    BM -->|Esc（スキップ）| END
 ```
 
-生成ウィザードは 4 つ目のフィールドとして「Passphrase: none / interactive」トグルを追加する（採択ワイヤーフレーム）:
+生成ウィザードは 4 つ目のフィールドとして「Passphrase」トグル（Type と同じラジオ表現）を持つ:
 
 ```
-┌─ Generate key ──────────────────┐
-│ Type:       [ed25519] rsa ecdsa │
-│ Filename:   id_ed25519          │
-│ Comment:    you@host            │
-│ Passphrase: [none] interactive  │  ← 追加
-│  Enter: generate   Esc: cancel  │
-└─────────────────────────────────┘
+┌─ Generate key ─────────────────────────────┐
+│ Type:       (•) ed25519    ( ) rsa-4096    │
+│ Filename:   id_ed25519                     │
+│ Comment:    you@host                       │
+│ Passphrase: (•) none       ( ) interactive │  ← #47 で追加
+│  Tab/↑↓ move · Space toggle · Enter · Esc  │
+└────────────────────────────────────────────┘
 ```
 
-保護直後の鍵は詳細ペインの PairStatus が Matched→Unverified に変わる（見かけの回帰）。手当ては二段: ①詳細ペインの Unverified 説明を「暗号化鍵はパスフレーズ無しでは検証できない（エラーではない）」旨に拡張（恒久）、②パスフレーズ変更の成功トーストに「表示が unverified になるが正常」の一言を含める（文脈）。
+`interactive` を選ぶと `-N ""`/`-q` を発行せず TUI を退避して実行し、ssh-keygen 自身がパスフレーズを聴取する（sshm は値を持たない）。
+
+保護直後の鍵は詳細ペインの PairStatus が Matched→Unverified に変わる（見かけの回帰）。手当ては二段: ①詳細ペインの Unverified 説明を「パスフレーズ無しでは検証できない（エラーではない）」に拡張（恒久）、②パスフレーズ変更の成功トーストにも同じ趣旨を含める（文脈）。
 
 ## 主要な設計判断（現行の理由）
 
