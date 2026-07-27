@@ -75,6 +75,8 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
 
     let mut lines: Vec<Line> = vec![Line::from("")];
     let mut danger = false;
+    let mut poisoned = false;
+    let mut unconfirmed_types: Vec<String> = Vec::new();
     match &ks.modal {
         KeyScanModal::Scanning => {
             lines.push(Line::from(Span::styled(
@@ -89,13 +91,14 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(theme::DOWN),
             )));
         }
-        KeyScanModal::Results(rows) => {
+        KeyScanModal::Results { rows, unconfirmed } => {
             lines.push(Line::from(Span::styled(
                 format!("{} — {} key(s) found", ks.target, rows.len()),
                 text,
             )));
             lines.push(Line::from(""));
-            let poisoned = rows.iter().any(|r| r.class.poisons_result());
+            poisoned = !unconfirmed.is_empty() || rows.iter().any(|r| r.class.poisons_result());
+            unconfirmed_types = unconfirmed.clone();
             for row in rows {
                 let danger_chip = Style::default()
                     .fg(theme::DOWN)
@@ -111,19 +114,6 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
                     Span::styled(format!("{} ", row.key.fingerprint), text),
                     Span::styled(chip, chip_style),
                 ]));
-            }
-            if poisoned {
-                lines.push(Line::from(""));
-                // Nothing at all is pinnable here, not just the flagged row:
-                // a contradicted pin makes the whole result set suspect.
-                lines.push(Line::from(Span::styled(
-                    "Pinning is DISABLED for this result — these keys contradict a pin you already trust.",
-                    Style::default().fg(theme::DOWN).add_modifier(Modifier::BOLD),
-                )));
-                lines.push(Line::from(Span::styled(
-                    "Nothing is overwritten here. Inspect Known hosts (H) before trusting this host.",
-                    Style::default().fg(theme::WARN),
-                )));
             }
             // Randomart blocks, side by side (ART_COLS per band).
             for band in rows.chunks(ART_COLS) {
@@ -155,14 +145,41 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
             }
         }
     }
-    // The verification reminder is pinned to the tail and never trimmed (AC8).
-    let tail = vec![
-        Line::from(""),
-        Line::from(Span::styled(
-            verify_hint(),
+    // The tail is never trimmed: the AC8 reminder and the "pinning is disabled"
+    // banner are both must-not-scroll-off content, so neither may sit in the
+    // body where `fit_body` could cut it on a short terminal (#46 re-review).
+    let mut tail = vec![Line::from("")];
+    if poisoned {
+        let reason = if unconfirmed_types.is_empty() {
+            "these keys contradict a pin you already trust".to_string()
+        } else {
+            format!(
+                "this host did not offer the {} key you already trust",
+                unconfirmed_types.join(", ")
+            )
+        };
+        tail.push(Line::from(Span::styled(
+            format!("Pinning is DISABLED — {reason}."),
+            Style::default()
+                .fg(theme::DOWN)
+                .add_modifier(Modifier::BOLD),
+        )));
+        tail.push(Line::from(Span::styled(
+            "Nothing is overwritten here. Inspect Known hosts (H) before trusting this host.",
             Style::default().fg(theme::WARN),
-        )),
-    ];
+        )));
+    } else if matches!(ks.modal, KeyScanModal::Results { .. }) {
+        // The pin target is variable (the host's effective UserKnownHostsFile),
+        // so name it rather than leaving the user to guess where `y` writes.
+        tail.push(Line::from(Span::styled(
+            format!("Pins are written to {}", ks.pin_target.display()),
+            dim,
+        )));
+    }
+    tail.push(Line::from(Span::styled(
+        verify_hint(),
+        Style::default().fg(theme::WARN),
+    )));
 
     let content_w = lines
         .iter()

@@ -41,6 +41,20 @@ pub struct KnownHostEntry {
     pub raw: String,
 }
 
+impl KnownHostEntry {
+    /// True when the host field is a PATTERN (wildcard / negation) rather than
+    /// a single host. `ssh-keygen -F` reports these as matches, but they are
+    /// not per-host pins: `is_host_known` excludes them from the trust gate, so
+    /// anything reasoning about "does this host have a pin" must too. A hashed
+    /// entry is never a pattern (ssh-keygen leaves patterns in plaintext).
+    pub fn is_pattern(&self) -> bool {
+        match &self.host {
+            HostSpec::Hashed(_) => false,
+            HostSpec::Plain(h) => h.contains(['*', '?', '!']),
+        }
+    }
+}
+
 pub fn known_hosts_path() -> Option<PathBuf> {
     ssh_dir().map(|d| d.join("known_hosts"))
 }

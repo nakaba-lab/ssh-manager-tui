@@ -194,7 +194,17 @@ pub enum KeyScanModal {
     /// The worker is scanning; the UI shows a spinner and stays responsive.
     Scanning,
     /// The scan finished: all offered keys, each classified (#46 AC 4/5).
-    Results(Vec<ClassifiedKey>),
+    Results {
+        rows: Vec<ClassifiedKey>,
+        /// Key types this host has a genuine pin for that the scan did NOT
+        /// confirm. Non-empty means the channel failed to prove possession of
+        /// a key the user already trusts, so nothing from this scan may be
+        /// pinned: an attacker who simply withholds the pinned type produces
+        /// an all-`New` result, and appending it would add a second trusted
+        /// type that OpenSSH accepts with no HOST KEY CHANGED warning
+        /// (#46 re-review).
+        unconfirmed: Vec<String>,
+    },
     /// The scan failed (unreachable / timed out): sticky error text (AC6).
     Error(String),
 }
@@ -218,6 +228,9 @@ pub struct KeyScanUi {
     /// NOT a hardcoded `~/.ssh/known_hosts` (which would no-op for a custom
     /// `UserKnownHostsFile` while reporting success).
     pub pin_target: std::path::PathBuf,
+    /// The known_hosts files `ssh -G` reported for this host, kept so the pin
+    /// can be re-checked through OpenSSH's matcher after it is written.
+    pub files: Vec<String>,
 }
 
 /// Where a [`Screen::PasswordConfirm`] modal was opened from — determines what its

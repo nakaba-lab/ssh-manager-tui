@@ -10,7 +10,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use super::binaries::tools;
-use super::known_hosts::{HostSpec, KnownHostEntry, parse_line};
+use super::known_hosts::{KnownHostEntry, parse_line};
 
 /// The effective connection identity for an alias, parsed from `ssh -G`.
 /// `ssh -G` lowercases keys and leaves IdentityFile `~`/`%`-tokens UNexpanded.
@@ -231,12 +231,38 @@ pub fn tofu_lookup_key(rc: &ResolvedConfig) -> Option<String> {
 /// patterns and case-insensitive hostname comparison are all handled by the
 /// same matcher the connection will use, which hand-rolled token comparison
 /// gets wrong (#46 review). Callers classify on the returned `key_type` /
-/// `key_b64` / `marker`, never on the host field.
+/// `key_b64` / `marker`, never on the host field — the returned entries are
+/// UNFILTERED, so a caller that needs "is this a genuine pin" must apply the
+/// marker / [`KnownHostEntry::is_pattern`] checks itself (as [`is_host_known`]
+/// does).
 pub fn matching_known_entries(lookup_key: &str, files: &[String]) -> Vec<KnownHostEntry> {
     resolve_known_hosts_files(files)
         .iter()
         .flat_map(|file| entries_in_file(lookup_key, file))
         .collect()
+}
+
+/// The first known-hosts file `ssh -G` reported, as a real path — the file a
+/// new entry should be written to.
+///
+/// This cannot just take `files[0]`: `ssh -G` prints the list space-separated
+/// and UNQUOTED, so a path containing a space (the Windows default under
+/// `C:\Users\First Last\`) arrives pre-split and `files[0]` is a truncated
+/// prefix. Writing there creates a stray file OpenSSH never reads (#46
+/// re-review). Coalescing keys off the parent directory rather than the file
+/// itself, because the first-pin case is exactly when the file does not exist.
+pub fn primary_known_hosts_file(files: &[String]) -> Option<std::path::PathBuf> {
+    let expanded: Vec<String> = files.iter().map(|p| expand_known_hosts_path(p)).collect();
+    coalesce_existing_paths(&expanded, |p| {
+        let path = std::path::Path::new(p);
+        path.exists()
+            || path
+                .parent()
+                .is_some_and(|d| !d.as_os_str().is_empty() && d.is_dir())
+    })
+    .into_iter()
+    .next()
+    .map(std::path::PathBuf::from)
 }
 
 /// Shared file-list normalization for the known-hosts readers: expand the
@@ -344,16 +370,12 @@ fn known_in_file(lookup_key: &str, file: &str) -> bool {
     // line printed as `|1|…`) is a legitimate single-host pin and MUST count,
     // otherwise `HashKnownHosts yes` (the Debian/Ubuntu default) would silently
     // defeat the whole gate.
-    entries_in_file(lookup_key, file).iter().any(|e| {
-        e.marker.is_none()
-            && match &e.host {
-                // ssh-keygen never hashes wildcards/negations or markers (those
-                // survive in plaintext and are excluded above/here), so a
-                // marker-free hashed hit is always a genuine per-host pin.
-                HostSpec::Hashed(_) => true,
-                HostSpec::Plain(h) => !h.contains(['*', '?', '!']),
-            }
-    })
+    // ssh-keygen never hashes wildcards/negations or markers (those survive in
+    // plaintext), so a marker-free, non-pattern hit — hashed or plain — is
+    // always a genuine per-host pin.
+    entries_in_file(lookup_key, file)
+        .iter()
+        .any(|e| e.marker.is_none() && !e.is_pattern())
 }
 
 #[cfg(test)]
