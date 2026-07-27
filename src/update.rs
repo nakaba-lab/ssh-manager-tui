@@ -5229,7 +5229,10 @@ mod tests {
             "Match exec \"cmd\"\n    User bob\n",
         );
         app.list_state.select(Some(0));
-        open_inspect(&mut app);
+        // Trust is injected (#73) so the exec-risk verdict is what's under test on
+        // every host: `tools()` is process-global, and on a Windows box without
+        // System32 OpenSSH the trust gate would fire first and change the toast.
+        open_inspect_gated(&mut app, true);
         assert_ne!(
             app.screen,
             Screen::Inspect,
