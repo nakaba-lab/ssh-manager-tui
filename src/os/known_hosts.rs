@@ -5,7 +5,7 @@
 //! plaintext hostname we don't have for hashed lines.
 
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::binaries::ssh_dir;
 
@@ -153,6 +153,49 @@ pub fn remove_entry(line_no: usize, raw: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// Append entry lines to a known_hosts file (#46 host-key pinning).
+///
+/// Preservation contract (mirrors `remove_entry`'s newline handling):
+/// - the file's existing newline flavor is detected and reused (CRLF file →
+///   CRLF appends, LF file → LF appends);
+/// - a missing trailing newline on the existing content is repaired BEFORE
+///   appending (so the first appended entry never glues onto the last line);
+/// - a missing file is created (LF, trailing newline);
+/// - the write replaces the file atomically (no torn known_hosts on crash).
+pub fn append_entries(path: &Path, lines: &[String]) -> io::Result<()> {
+    let existing = match std::fs::read_to_string(path) {
+        Ok(c) => Some(c),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e),
+    };
+    let newline = match &existing {
+        Some(c) if c.contains("\r\n") => "\r\n",
+        _ => "\n",
+    };
+    let mut out = existing.unwrap_or_default();
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push_str(newline);
+    }
+    for line in lines {
+        out.push_str(line);
+        out.push_str(newline);
+    }
+
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("known_hosts");
+    let tmp = dir.join(format!(".{name}.tmp"));
+    std::fs::write(&tmp, out.as_bytes())?;
+    #[cfg(windows)]
+    if path.exists() {
+        let _ = std::fs::remove_file(path);
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,5 +240,83 @@ mod tests {
         assert!(parse_line("# a comment", 0).is_none());
         assert!(parse_line("   ", 0).is_none());
         assert!(parse_line("onlyhost", 0).is_none());
+    }
+
+    // -- append_entries (#46 AC2: CRLF / trailing-newline preservation) -----
+
+    /// Scratch file seeded with `content` (`None` = no file), unique per test.
+    fn append_fixture(name: &str, content: Option<&str>) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("sshm-append-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("known_hosts");
+        let _ = std::fs::remove_file(&path);
+        if let Some(c) = content {
+            std::fs::write(&path, c).unwrap();
+        }
+        path
+    }
+
+    fn cleanup(path: &Path) {
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn append_entries_lf_file_appends_with_lf() {
+        // given — an LF file with a trailing newline
+        let path = append_fixture("lf", Some("a ssh-ed25519 AAA\nb ssh-rsa BBB\n"));
+        // when
+        append_entries(&path, &["h ssh-ed25519 CCC".to_string()]).unwrap();
+        // then — appended with LF, existing bytes untouched, trailing \n kept
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "a ssh-ed25519 AAA\nb ssh-rsa BBB\nh ssh-ed25519 CCC\n"
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn append_entries_crlf_file_appends_with_crlf() {
+        // given — a CRLF file (Windows-managed known_hosts)
+        let path = append_fixture("crlf", Some("a ssh-ed25519 AAA\r\n"));
+        // when — two entries appended in one call
+        append_entries(
+            &path,
+            &["h ssh-ed25519 CCC".to_string(), "h ssh-rsa DDD".to_string()],
+        )
+        .unwrap();
+        // then — every appended line uses the file's CRLF flavor
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "a ssh-ed25519 AAA\r\nh ssh-ed25519 CCC\r\nh ssh-rsa DDD\r\n"
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn append_entries_repairs_missing_trailing_newline() {
+        // given — the existing content lacks a trailing newline
+        let path = append_fixture("notrail", Some("a ssh-ed25519 AAA"));
+        // when
+        append_entries(&path, &["h ssh-ed25519 CCC".to_string()]).unwrap();
+        // then — a newline is inserted first so the entries never merge
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "a ssh-ed25519 AAA\nh ssh-ed25519 CCC\n"
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn append_entries_creates_file_when_absent() {
+        // given — no known_hosts yet (fresh machine, first pin)
+        let path = append_fixture("create", None);
+        // when
+        append_entries(&path, &["h ssh-ed25519 CCC".to_string()]).unwrap();
+        // then — file created, LF, trailing newline
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "h ssh-ed25519 CCC\n"
+        );
+        cleanup(&path);
     }
 }

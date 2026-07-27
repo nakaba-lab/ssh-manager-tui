@@ -22,7 +22,7 @@ updated: 2026-07-27
 | `sftp.rs` | `ls -l` 一覧パース ＋ ライブ `SftpSession` browse ワーカー（短命 `sftp -b`・circuit-breaker） |
 | `keys.rs` | `~/.ssh` 再帰探索（最初のヘッダ行のみ sniff）・フィンガープリントで公開/秘密をペアリング |
 | `known_hosts.rs` | 解析・内容アドレスでの削除（`.old` バックアップ）・スキャン結果の追記 `append_entries`（CRLF/末尾改行を保存・原子的置換） |
-| `keyscan.rs`（#46 で新規） | `ssh-keyscan` によるホスト鍵の事前スキャン。専用ワーカー（thread＋`mpsc`・tick drain）で実行し、取得行を `secure_fs::temp_name` の一時ファイル経由で `ssh-keygen -lv -f` に渡してフィンガープリント＋randomart 化 |
+| `keyscan.rs`（#46） | `ssh-keyscan` によるホスト鍵の事前スキャン。`KeyscanSession`（thread＋`mpsc`・tick drain）で実行し、取得行を `secure_fs` の owner-private 一時ファイル経由で `ssh-keygen -lv -f` に渡してフィンガープリント＋randomart 化。純粋部（`keyscan_args`・`parse_keyscan_output`・`parse_keygen_lv_output`・`pinned_lines`・`classify_key`）はプロセス起動を伴わずテスト可能 |
 | `liveness.rs` | ワーカースレッドプールで TCP 到達性プローブ・`mpsc` 報告・`App::hosts` index キー |
 | `resolve.rs` | `ssh -G` による設定解決 |
 | `history.rs`・`prefs.rs` | 非秘密の平 JSON（接続履歴・オートフィル opt-in） |
@@ -37,20 +37,22 @@ updated: 2026-07-27
 
 ```mermaid
 sequenceDiagram
-    participant UI as update.rs（ActionMenu）
-    participant W as keyscan ワーカー（thread）
+    participant UI as update.rs（open_keyscan）
+    participant W as KeyscanSession ワーカー
     participant KS as ssh-keyscan
     participant KG as ssh-keygen -lv
     participant KH as known_hosts.rs
-    UI->>UI: resolve_config_with_options で host/port 解決（先頭ダッシュ拒否）
-    UI->>W: scan 要求（mpsc・モーダルは scanning 状態）
-    W->>KS: spawn（-p port・-T 秒・数秒バジェットの try_wait/kill ループ）
+    UI->>UI: keyscan_gate（プロキシ経由は拒否）→ resolve_config_with_options で host/port 解決
+    UI->>W: request(host, port)（モーダルは Scanning 状態）
+    W->>KS: spawn（-T 5・-p port。8 秒バジェットの try_wait/kill ループ）
     KS-->>W: 「host keytype base64」行
-    W->>KG: 一時ファイル（secure_fs::temp_name）経由でフィンガープリント+randomart
+    W->>KG: owner-private 一時ファイル経由でフィンガープリント+randomart
     KG-->>W: SHA256 + randomart ブロック
-    W-->>UI: tick drain でイベント回収（既存鍵と一致/不一致/新規を分類）
-    UI->>KH: [y] 承認時のみ append_entries（ホストトークンは tofu_lookup_key に書き換え）
+    W-->>UI: drain_keyscan（tick）→ keyscan_apply_event が New/AlreadyTrusted/Changed に分類
+    UI->>KH: [y] 承認時のみ append_entries（New のみ・ホストトークンは tofu_lookup_key に正規化）
 ```
+
+キーレスポンスは `keyscan_handle_key`（純粋）が決める: `y`＝`New` 鍵だけを追記して閉じる／`Esc`＝どの状態でも無追記で閉じる。`Changed`（HOST KEY CHANGED）は承認しても書き込まれない。
 
 ## 外部依存・インターフェース
 
@@ -62,5 +64,7 @@ sequenceDiagram
 - **config を接続の真実源に**: 保存済みは `ssh <alias>` で OpenSSH に config を読ませる（ProxyJump/forwards/IdentityFile が自動適用）。
 - **秘密鍵本体を読まない**: 鍵ペアリングは公開フィンガープリント照合のみ。暗号化 PEM は `Unverified`（エラーにしない）。
 - **liveness index キーの脆さ**: ホスト追加/削除で index がずれるため `rebuild_hosts()` が liveness マップをクリアし再プローブ。
-- **keyscan は専用ワーカー（#46）**: keyscan は数秒かかるため UI スレッドで実行しない。`SftpSession::request` 型（thread＋`mpsc`・tick drain・`is_finished` reap）を踏襲する。liveness プールはジョブ型・ホスト index キーが固定で不適合、同期実行は `draw()` をブロックするため不採用。
+- **keyscan は専用ワーカー（#46）**: keyscan は数秒かかるため UI スレッドで実行しない。`SftpSession::request` 型（thread＋`mpsc`・tick drain・`is_finished` reap）を踏襲する。liveness プールはジョブ型・ホスト index キーが固定で不適合、同期実行は `draw()` をブロックするため不採用。バジェットは二重（keyscan 自身の `-T 5` ＋ 8 秒の wall-clock kill）で、前者が通常経路・後者は wedge した子プロセスの backstop。
 - **ピン留めのホストトークンは `tofu_lookup_key` の出力に書き換え（#46）**: ゲート判定 `is_host_known`（`ssh-keygen -F`）と確実に一致させるため、keyscan の出力行のホスト部を `HostKeyAlias` 優先／非 22 番ポート `[host]:port` の検索キーに正規化して追記する。追記はプレーン形式（ハッシュ化しない）。
+- **分類の既存エントリはプレーンホストのみ（#46）**: ハッシュ化エントリ（`|1|…`）は照合できないため「無い」として扱う。最悪ケースはプレーン鍵の重複追記であり、警告の取りこぼしにはならない（`Changed` 判定はプレーン行に対しては従来どおり働く）。
+- **`append_entries` は `remove_entry` と同じ改行規律（#46）**: 既存ファイルの CRLF/LF を検出して踏襲し、末尾改行が無ければ追記前に補い、一時ファイル経由で原子的に差し替える。

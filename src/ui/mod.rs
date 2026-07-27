@@ -8,6 +8,7 @@ pub mod diff;
 pub mod edit;
 pub mod help;
 pub mod keys;
+pub mod keyscan;
 pub mod known_hosts;
 pub mod list;
 pub mod sftp;
@@ -59,7 +60,8 @@ fn base_screen(app: &App) -> Screen {
         | Screen::ConnectOverride { .. }
         | Screen::SftpTransfer
         | Screen::DiffPreview
-        | Screen::PasswordConfirm { .. } => app.prev_screen.clone().unwrap_or(Screen::List),
+        | Screen::PasswordConfirm { .. }
+        | Screen::KeyScan => app.prev_screen.clone().unwrap_or(Screen::List),
         Screen::PickKey { origin } | Screen::PickJump { origin } => match origin {
             PickOrigin::Edit { editing } => Screen::Edit { editing: *editing },
             // The override modal is itself an overlay over the list, so its
@@ -120,6 +122,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Screen::PasswordConfirm { target, kinds, .. } => {
             vault::draw_password_confirm(f, target, *kinds, body_a)
         }
+        Screen::KeyScan => keyscan::draw(f, app, body_a),
         _ => {}
     }
 
@@ -156,6 +159,8 @@ fn draw_title(f: &mut Frame, app: &App, base: &Screen, area: Rect) {
     // it), but the breadcrumb should name the modal, not show stale host counts.
     let (name, count) = if matches!(app.screen, Screen::ConnectOverride { .. }) {
         ("Connect override", String::new())
+    } else if matches!(app.screen, Screen::KeyScan) {
+        ("Scan host key", String::new())
     } else {
         (name, count)
     };
@@ -231,6 +236,12 @@ fn draw_footer(f: &mut Frame, app: &App, base: &Screen, area: Rect) {
             ("^S", "transfer"),
             ("Esc", "cancel"),
         ]);
+        f.render_widget(Paragraph::new(hints), area);
+        return;
+    }
+    // The scan modal resolves its base to the list; surface its own chords.
+    if matches!(app.screen, Screen::KeyScan) {
+        let hints = widgets::footer_hints(keyscan::keyscan_footer());
         f.render_widget(Paragraph::new(hints), area);
         return;
     }

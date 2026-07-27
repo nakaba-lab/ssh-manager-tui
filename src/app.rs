@@ -19,6 +19,7 @@ use crate::config::model::HostView;
 use crate::os::connect::{ConnectOverrides, Protocol};
 use crate::os::history::History;
 use crate::os::keys::KeyInfo;
+use crate::os::keyscan::{KeyscanSession, PinClass, ScannedKey};
 use crate::os::known_hosts::{HostSpec, KnownHostEntry};
 use crate::os::liveness::{Liveness, LivenessProbe, ProbeTarget};
 use crate::os::resolve::ResolvedConfig;
@@ -174,6 +175,46 @@ pub enum Screen {
         target: String,
         origin: PasswordConfirmOrigin,
     },
+    /// Host-key pre-scan modal (#46): `ssh-keyscan` fingerprints for one host,
+    /// pinned into known_hosts on approval. All state lives in [`App::keyscan`].
+    KeyScan,
+}
+
+/// One scanned key with its classification against the host's existing pins
+/// (#46 AC 4/5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassifiedKey {
+    pub key: ScannedKey,
+    pub class: PinClass,
+}
+
+/// Modal state for the host-key scan overlay (#46): spinner → results / error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyScanModal {
+    /// The worker is scanning; the UI shows a spinner and stays responsive.
+    Scanning,
+    /// The scan finished: all offered keys, each classified (#46 AC 4/5).
+    Results(Vec<ClassifiedKey>),
+    /// The scan failed (unreachable / timed out): sticky error text (AC6).
+    Error(String),
+}
+
+/// Live state of the host-key scan overlay (#46): the worker session, the
+/// modal state machine, and the scan target resolved once at open.
+pub struct KeyScanUi {
+    pub session: KeyscanSession,
+    pub modal: KeyScanModal,
+    /// Alias of the host being scanned (title / toast).
+    pub alias: String,
+    /// The TOFU lookup key the pins are recorded under (`tofu_lookup_key`
+    /// output), so `is_host_known` finds them on the next connect.
+    pub lookup_key: String,
+    /// The `host:port` target shown in the modal.
+    pub target: String,
+    /// Existing user-file entries for `lookup_key` (plain host tokens only;
+    /// hashed entries cannot be compared and count as absent), for
+    /// classification.
+    pub existing: Vec<KnownHostEntry>,
 }
 
 /// Where a [`Screen::PasswordConfirm`] modal was opened from — determines what its
@@ -813,6 +854,9 @@ pub struct App {
     // --- dual-pane SFTP browser (None when not browsing) ---
     pub sftp_browser: Option<SftpBrowser>,
 
+    // --- host-key scan modal (#46; None when closed) ---
+    pub keyscan: Option<KeyScanUi>,
+
     // --- S3 keys ---
     pub keys: Vec<KeyInfo>,
     pub keys_state: ListState,
@@ -916,6 +960,7 @@ impl App {
             override_form: OverrideForm::default(),
             sftp_form: SftpForm::default(),
             sftp_browser: None,
+            keyscan: None,
             keys,
             keys_state: ListState::default(),
             key_host_ctx: None,

@@ -16,10 +16,11 @@ use ratatui::crossterm::terminal::{
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::app::{
-    App, ConfirmAction, ConnectMode, EditForm, FormMode, GenOrigin, ListFocus,
-    PasswordConfirmOrigin, PendingSave, PickOrigin, SFTP_FIELDS, Screen, SftpBrowser,
-    SftpDirection, SftpForm, SftpPane, VaultEntryForm, VaultUnlock, form_from_view, form_idx,
-    override_form_from_host, override_idx, overrides_from_form, read_local_dir, view_from_form,
+    App, ClassifiedKey, ConfirmAction, ConnectMode, EditForm, FormMode, GenOrigin, KeyScanModal,
+    KeyScanUi, ListFocus, PasswordConfirmOrigin, PendingSave, PickOrigin, SFTP_FIELDS, Screen,
+    SftpBrowser, SftpDirection, SftpForm, SftpPane, VaultEntryForm, VaultUnlock, form_from_view,
+    form_idx, override_form_from_host, override_idx, overrides_from_form, read_local_dir,
+    view_from_form,
 };
 use crate::config::SshConfig;
 use crate::config::diff;
@@ -33,7 +34,12 @@ use crate::os::connect::{
     resolve_options, run_inline,
 };
 use crate::os::keys::{generate_key, read_public_key};
-use crate::os::known_hosts::remove_entry;
+use crate::os::keyscan::{
+    KeyscanEvent, KeyscanSession, PinClass, ScannedKey, classify_key, pinned_lines,
+};
+use crate::os::known_hosts::{
+    HostSpec, KnownHostEntry, append_entries, known_hosts_path, parse_known_hosts, remove_entry,
+};
 use crate::os::resolve::{
     ResolvedConfig, has_match_exec, is_host_known, resolve_config_with_options, tofu_lookup_key,
 };
@@ -73,6 +79,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent, terminal: &mut DefaultTerminal) 
         Screen::PasswordConfirm { target, origin, .. } => {
             handle_password_confirm(app, key, target, origin, terminal)?
         }
+        Screen::KeyScan => handle_keyscan(app, key),
     }
     Ok(())
 }
@@ -473,7 +480,7 @@ fn connect_plan(
         // unknown host even for a (local) passphrase: leave the first connect
         // un-armed so the user accepts the key on the TTY, then auto-fill on reconnect.
         return ConnectPlan::Normal(Some(format!(
-            "host key not yet trusted for {alias} — accept it at the prompt, then reconnect to auto-fill the stored secret"
+            "host key not yet trusted for {alias} — pin it via 'Scan host key' (o menu) or accept at the prompt, then reconnect to auto-fill"
         )));
     }
     if kinds.password && !password_confirmed {
@@ -524,6 +531,180 @@ enum PasswordChoice {
     Confirmed,
     /// The modal was declined — withhold the password; passphrase still arms.
     Withheld,
+}
+
+// ---------------------------------------------------------------------------
+// Host-key pre-scan modal (#46) — pure state machine + availability gate.
+// The modal state types live in `app.rs` (drawn by `ui/keyscan.rs`); the
+// mutation-free fold/dispatch logic lives here.
+// ---------------------------------------------------------------------------
+
+/// What a key press in the scan modal does. `Close(lines)` closes the modal
+/// and appends exactly `lines` to known_hosts — an empty vec means the file
+/// is not touched at all (cancel / nothing pinnable).
+#[derive(Debug, PartialEq, Eq)]
+enum KeyScanAction {
+    Stay,
+    Close(Vec<String>),
+}
+
+/// Pure fold of a worker event into the modal state: `Keys` classifies each
+/// scanned key against `existing` (the host's current known_hosts entries)
+/// and moves to `Results`; `Failed` moves to `Error`.
+fn keyscan_apply_event(
+    state: KeyScanModal,
+    event: KeyscanEvent,
+    existing: &[KnownHostEntry],
+) -> KeyScanModal {
+    // One request per open — a late event never downgrades a settled modal.
+    if !matches!(state, KeyScanModal::Scanning) {
+        return state;
+    }
+    match event {
+        KeyscanEvent::Keys(keys) => KeyScanModal::Results(
+            keys.into_iter()
+                .map(|key| {
+                    let class = classify_key(&key, existing);
+                    ClassifiedKey { key, class }
+                })
+                .collect(),
+        ),
+        KeyscanEvent::Failed(msg) => KeyScanModal::Error(msg),
+    }
+}
+
+/// Pure key dispatch for the scan modal:
+/// - `y` in `Results` → `Close` with the normalized entry lines of the `New`
+///   keys ONLY (`AlreadyTrusted` is never re-appended — AC4; `Changed` is a
+///   warning with NO overwrite path — AC5). No `New` keys → `Close(vec![])`.
+/// - `y` while `Scanning` → `Stay`; `y` in `Error` → `Close(vec![])`.
+/// - `Esc` in ANY state → `Close(vec![])` (known_hosts untouched — AC3).
+fn keyscan_handle_key(state: &KeyScanModal, key: KeyCode, lookup_key: &str) -> KeyScanAction {
+    match (state, key) {
+        (_, KeyCode::Esc) => KeyScanAction::Close(Vec::new()),
+        (KeyScanModal::Results(rows), KeyCode::Char('y')) => {
+            let new_keys: Vec<ScannedKey> = rows
+                .iter()
+                .filter(|r| r.class == PinClass::New)
+                .map(|r| r.key.clone())
+                .collect();
+            KeyScanAction::Close(pinned_lines(&new_keys, lookup_key))
+        }
+        (KeyScanModal::Error(_), KeyCode::Char('y')) => KeyScanAction::Close(Vec::new()),
+        _ => KeyScanAction::Stay,
+    }
+}
+
+/// Availability gate for the scan action (#46 AC7): a `ProxyJump`/
+/// `ProxyCommand` host cannot be meaningfully scanned from here (the direct
+/// TCP path is not the path ssh will take), so return the user-facing
+/// refusal reason instead of scanning.
+fn keyscan_gate(is_proxied: bool) -> Result<(), String> {
+    if is_proxied {
+        return Err(
+            "can't scan through ProxyJump/ProxyCommand — a direct scan would not see \
+             the host ssh actually reaches"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Open the host-key scan overlay (#46): gate proxied hosts, resolve the scan
+/// target on the bounded `ssh -G` runner, seed the existing pins for
+/// classification, and dispatch the scan to the worker session.
+fn open_keyscan(app: &mut App, host_idx: usize) {
+    let Some(host) = app.hosts.get(host_idx) else {
+        return;
+    };
+    if let Err(msg) = keyscan_gate(host.is_proxied()) {
+        app.toast(msg, true);
+        return;
+    }
+    let alias = host.alias().to_string();
+    let rc = match resolve_config_with_options(&[], &alias) {
+        Ok(rc) => rc,
+        Err(e) => {
+            app.toast(format!("could not resolve {alias}: {e}"), true);
+            return;
+        }
+    };
+    let Some(lookup_key) = tofu_lookup_key(&rc) else {
+        app.toast(format!("could not resolve a host name for {alias}"), true);
+        return;
+    };
+    let hostname = rc.hostname.clone().unwrap_or_else(|| alias.clone());
+    let port = rc.port.clone().unwrap_or_else(|| "22".to_string());
+    // Existing pins for this lookup key, for classification. Plain host tokens
+    // only — a hashed entry can't be compared here and counts as absent (the
+    // worst case is a duplicate plain pin, never a lost warning on a plain one).
+    let existing: Vec<KnownHostEntry> = parse_known_hosts()
+        .into_iter()
+        .filter(|e| match &e.host {
+            // A Plain token is a comma-separated host list.
+            HostSpec::Plain(hosts) => hosts.split(',').any(|token| token == lookup_key),
+            HostSpec::Hashed(_) => false,
+        })
+        .collect();
+    let mut session = KeyscanSession::open();
+    session.request(&hostname, &port);
+    let target = if port == "22" {
+        hostname
+    } else {
+        format!("{hostname}:{port}")
+    };
+    app.keyscan = Some(KeyScanUi {
+        session,
+        modal: KeyScanModal::Scanning,
+        alias,
+        lookup_key,
+        target,
+        existing,
+    });
+    open_overlay(app, Screen::KeyScan);
+}
+
+/// Key handling for the scan overlay: apply the pure dispatch, then perform
+/// the append (if any) and close. The worker session is dropped on close; an
+/// in-flight scan thread just exits when its send fails.
+fn handle_keyscan(app: &mut App, key: KeyEvent) {
+    let Some(ks) = app.keyscan.as_ref() else {
+        close_overlay(app);
+        return;
+    };
+    let KeyScanAction::Close(lines) = keyscan_handle_key(&ks.modal, key.code, &ks.lookup_key)
+    else {
+        return; // Stay: the modal swallows the key and keeps its state.
+    };
+    if !lines.is_empty() {
+        let alias = ks.alias.clone();
+        let appended = known_hosts_path()
+            .ok_or_else(|| std::io::Error::other("cannot resolve ~/.ssh"))
+            .and_then(|path| append_entries(&path, &lines));
+        match appended {
+            Ok(()) => {
+                app.reload_known_hosts();
+                app.toast(
+                    format!("pinned {} host key(s) for {alias}", lines.len()),
+                    false,
+                );
+            }
+            Err(e) => app.toast(format!("pinning failed: {e}"), true),
+        }
+    }
+    app.keyscan = None;
+    close_overlay(app);
+}
+
+/// Per-tick drain of the host-key scan worker (#46): fold completed events
+/// into the modal state. No-op while no scan overlay is open.
+pub fn drain_keyscan(app: &mut App) {
+    let Some(ks) = app.keyscan.as_mut() else {
+        return;
+    };
+    for event in ks.session.drain() {
+        ks.modal = keyscan_apply_event(ks.modal.clone(), event, &ks.existing);
+    }
 }
 
 /// `t` (new-tab) auto-fill stays OFF until the `wt.exe -w 0` env-inheritance spike
@@ -3567,6 +3748,7 @@ fn handle_action_menu(
                         action_idx::SFTP_TRANSFER => open_sftp_transfer(app, host_idx),
                         action_idx::CONNECT_OVERRIDES => open_connect_override(app, host_idx),
                         action_idx::COPY_COMMAND => copy_command(app),
+                        action_idx::SCAN_HOST_KEY => open_keyscan(app, host_idx),
                         action_idx::EDIT => open_edit(app),
                         _ => {}
                     }
@@ -4905,5 +5087,185 @@ mod tests {
             "the un-written host must not linger in the in-memory config"
         );
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // -----------------------------------------------------------------------
+    // Host-key pre-scan modal (#46)
+    // -----------------------------------------------------------------------
+
+    /// Fixture: a scanned key (presentation fields filled mechanically).
+    fn scanned(key_type: &str, key_b64: &str) -> ScannedKey {
+        ScannedKey {
+            key_type: key_type.to_string(),
+            key_b64: key_b64.to_string(),
+            fingerprint: format!("SHA256:fp-of-{key_b64}"),
+            bits: 256,
+            randomart: Vec::new(),
+        }
+    }
+
+    /// Fixture: parse known_hosts fixture lines into entries.
+    fn kh_entries(lines: &[&str]) -> Vec<KnownHostEntry> {
+        use crate::os::known_hosts::parse_line;
+        lines
+            .iter()
+            .enumerate()
+            .filter_map(|(i, l)| parse_line(l, i))
+            .collect()
+    }
+
+    #[test]
+    fn tofu_nudge_toast_mentions_scan_action() {
+        // given — a trusted client with a vault candidate but no TOFU pin
+        // (the exact gate combination that already yields the nudge toast)
+        let both = MatchedKinds {
+            password: true,
+            passphrase: true,
+        };
+        // when
+        let plan = connect_plan(Some(both), false, true, false, false, false, true, "web1");
+        // then — #46 wires a discoverable path out of the TOFU block: the
+        // nudge must now also point at the ActionMenu "Scan host key" action
+        match plan {
+            ConnectPlan::Normal(Some(msg)) => assert!(
+                msg.to_lowercase().contains("scan"),
+                "the not-yet-trusted nudge should mention the scan action, got: {msg}"
+            ),
+            other => panic!("expected Normal(Some(_)), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn keyscan_apply_event_classifies_results_against_existing_pins() {
+        // given — existing pins (ed25519 + ecdsa) and a 3-key scan result
+        let existing = kh_entries(&[
+            "db.example ssh-ed25519 OLDKEYAAA",
+            "db.example ecdsa-sha2-nistp256 OLDECDSA",
+        ]);
+        let keys = vec![
+            scanned("ssh-ed25519", "OLDKEYAAA"), // same type+b64 → trusted
+            scanned("ecdsa-sha2-nistp256", "EVILECDSA"), // same type, new b64 → CHANGED
+            scanned("ssh-rsa", "BRANDNEW"),      // unpinned type → new
+        ];
+        // when — the worker reports the scan into the Scanning modal
+        let next = keyscan_apply_event(
+            KeyScanModal::Scanning,
+            KeyscanEvent::Keys(keys.clone()),
+            &existing,
+        );
+        // then — Results carries every key, classified (AC1 / AC4 / AC5)
+        match next {
+            KeyScanModal::Results(rows) => {
+                assert_eq!(rows.len(), 3);
+                assert_eq!(rows[0].class, PinClass::AlreadyTrusted);
+                assert_eq!(rows[1].class, PinClass::Changed);
+                assert_eq!(rows[2].class, PinClass::New);
+                assert_eq!(rows[2].key, keys[2], "keys pass through unmodified");
+            }
+            other => panic!("expected Results, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn keyscan_apply_event_failure_becomes_error_state() {
+        // given — a scan in progress
+        // when — the worker reports an unreachable host / timeout (AC6)
+        let next = keyscan_apply_event(
+            KeyScanModal::Scanning,
+            KeyscanEvent::Failed("connection timed out".into()),
+            &[],
+        );
+        // then — the modal shows the error; no known_hosts write can follow
+        assert_eq!(next, KeyScanModal::Error("connection timed out".into()));
+    }
+
+    #[test]
+    fn keyscan_y_pins_only_new_keys_with_normalized_host_token() {
+        // given — results holding one of each class
+        let rows = vec![
+            ClassifiedKey {
+                key: scanned("ssh-ed25519", "OLDKEYAAA"),
+                class: PinClass::AlreadyTrusted,
+            },
+            ClassifiedKey {
+                key: scanned("ecdsa-sha2-nistp256", "EVILECDSA"),
+                class: PinClass::Changed,
+            },
+            ClassifiedKey {
+                key: scanned("ssh-rsa", "BRANDNEW"),
+                class: PinClass::New,
+            },
+        ];
+        let state = KeyScanModal::Results(rows.clone());
+        // when — the user approves with `y`
+        let action = keyscan_handle_key(&state, KeyCode::Char('y'), "[db.example]:2222");
+        // then — ONLY the New key is appended (AC4: no duplicate append;
+        // AC5: Changed is never written), host token = the TOFU lookup key (AC2)
+        assert_eq!(
+            action,
+            KeyScanAction::Close(vec!["[db.example]:2222 ssh-rsa BRANDNEW".to_string()])
+        );
+
+        // given — results with nothing pinnable (trusted + changed only)
+        let no_new = KeyScanModal::Results(rows[..2].to_vec());
+        // when / then — y closes WITHOUT touching known_hosts (no overwrite path)
+        assert_eq!(
+            keyscan_handle_key(&no_new, KeyCode::Char('y'), "[db.example]:2222"),
+            KeyScanAction::Close(vec![])
+        );
+    }
+
+    #[test]
+    fn keyscan_esc_closes_without_touching_known_hosts() {
+        // given — every modal state, including results WITH pinnable keys
+        let states = [
+            KeyScanModal::Scanning,
+            KeyScanModal::Results(vec![ClassifiedKey {
+                key: scanned("ssh-ed25519", "BRANDNEW"),
+                class: PinClass::New,
+            }]),
+            KeyScanModal::Error("boom".into()),
+        ];
+        for state in states {
+            // when — the user cancels with Esc
+            let action = keyscan_handle_key(&state, KeyCode::Esc, "db.example");
+            // then — close with an empty append set = known_hosts untouched (AC3)
+            assert_eq!(action, KeyScanAction::Close(vec![]), "state {state:?}");
+        }
+    }
+
+    #[test]
+    fn keyscan_y_outside_results_never_pins() {
+        // given — a scan still running
+        // when / then — y is ignored while Scanning (nothing to approve yet)
+        assert_eq!(
+            keyscan_handle_key(&KeyScanModal::Scanning, KeyCode::Char('y'), "h"),
+            KeyScanAction::Stay
+        );
+        // given — a failed scan (AC6)
+        // when / then — y merely dismisses; it must never append anything
+        assert_eq!(
+            keyscan_handle_key(
+                &KeyScanModal::Error("timed out".into()),
+                KeyCode::Char('y'),
+                "h"
+            ),
+            KeyScanAction::Close(vec![])
+        );
+    }
+
+    #[test]
+    fn keyscan_gate_blocks_proxied_hosts() {
+        // given / when — a directly-reachable host
+        // then — scanning is available
+        assert!(keyscan_gate(false).is_ok());
+
+        // given / when — a ProxyJump/ProxyCommand host (AC7)
+        let msg = keyscan_gate(true).unwrap_err();
+        // then — refused with a user-facing reason naming the proxy cause
+        assert!(
+            msg.to_lowercase().contains("proxy"),
+            "refusal should explain the proxied-host cause, got: {msg}"
+        );
     }
 }
