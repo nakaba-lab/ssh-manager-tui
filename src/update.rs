@@ -3047,17 +3047,35 @@ fn handle_known_hosts(app: &mut App, key: KeyEvent) {
 // #43 effective-config inspector (`ssh -G` view)
 // ---------------------------------------------------------------------------
 
-/// Open the effective-config inspector for the selected host. Refuses (sticky
-/// error toast) when `ssh -G` could execute a `Match exec` predicate — the shared
-/// gate [`App::ssh_g_exec_risk`] (#65), which scans the main file **and** every
-/// `Include`d file and fails safe on include forms it cannot follow. A plain,
-/// scannable `Include` no longer blocks the inspector on its own.
+/// Open the effective-config inspector for the selected host, behind the same
+/// two-stage gate as connect autofill / SFTP arm (#73): ① the client-trust gate
+/// ([`autofill_client_trusted`]) — an untrusted `[PATH ssh]` fallback is refused
+/// outright, because its `ssh -G` honors `%HOME%` and may read a config the
+/// exec-risk scan (rooted at `dirs::home_dir()`) never saw, so an unscanned
+/// `Match exec` could run; ② the shared exec-risk gate [`App::ssh_g_exec_risk`]
+/// (#65), which scans the main file **and** every `Include`d file and fails safe
+/// on include forms it cannot follow. A plain, scannable `Include` no longer
+/// blocks the inspector on its own. Both refusals are a sticky error toast.
 /// Otherwise runs `ssh -G` ONCE here (bounded 500ms), stashes the ordered
 /// key/value rows on `App`, and switches to the base `Screen::Inspect`. The
 /// resolve never runs per-draw. On `ssh -G` failure the screen is not entered.
 fn open_inspect(app: &mut App) {
+    open_inspect_gated(app, autofill_client_trusted());
+}
+
+/// [`open_inspect`] with the client trust injected — `tools()` is process-global
+/// (always trusted off-Windows), so tests exercise the untrusted branch by
+/// passing `false` here, mirroring how `connect_plan` receives the same bit.
+fn open_inspect_gated(app: &mut App, client_trusted: bool) {
     let Some(h) = app.selected_host() else { return };
     let alias = app.hosts[h].alias().to_string();
+    if !client_trusted {
+        app.toast(
+            "inspector off: untrusted ssh client ([PATH ssh]) — use System32 OpenSSH to enable",
+            true,
+        );
+        return;
+    }
     if let Some(reason) = app.ssh_g_exec_risk() {
         app.toast(reason, true);
         return;
@@ -5211,7 +5229,10 @@ mod tests {
             "Match exec \"cmd\"\n    User bob\n",
         );
         app.list_state.select(Some(0));
-        open_inspect(&mut app);
+        // Trust is injected (#73) so the exec-risk verdict is what's under test on
+        // every host: `tools()` is process-global, and on a Windows box without
+        // System32 OpenSSH the trust gate would fire first and change the toast.
+        open_inspect_gated(&mut app, true);
         assert_ne!(
             app.screen,
             Screen::Inspect,
@@ -5224,6 +5245,95 @@ mod tests {
             app.toast.text
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- #73: inspector client-trust gate (untrusted [PATH ssh] fallback) ---
+
+    #[test]
+    fn inspect_refused_for_untrusted_client() {
+        // #73: the inspector must refuse OUTRIGHT on an untrusted ssh client
+        // ([PATH ssh] fallback), before ever spawning `ssh -G` — same trust gate
+        // as connect autofill / SFTP arm. `tools()` is process-global (OnceLock,
+        // always trusted on Linux), so trust is injected as an argument.
+        //
+        // given: a benign config (no Match exec, no Include) with a selected host
+        let (mut app, path) = app_fixture_on_disk("Host a\n    HostName 1.1.1.1\n");
+        app.list_state.select(Some(0));
+        // when: the inspector is opened with an UNTRUSTED client
+        open_inspect_gated(&mut app, false);
+        // then: refused with a sticky error toast naming the untrusted client,
+        // and no resolved rows exist (proof `ssh -G` never ran)
+        assert_ne!(
+            app.screen,
+            Screen::Inspect,
+            "inspector must not open for an untrusted ssh client"
+        );
+        assert!(app.toast.is_error, "refusal is a sticky error toast");
+        assert!(
+            app.toast.text.contains("[PATH ssh]"),
+            "the refusal must name the untrusted client, got: {:?}",
+            app.toast.text
+        );
+        assert!(
+            app.inspect_rows.is_empty(),
+            "no rows may be stashed — ssh -G must not have run"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn inspect_trust_gate_precedes_exec_risk() {
+        // #73: gate ORDER — ① client trust runs BEFORE ② ssh_g_exec_risk. With an
+        // untrusted client AND a Match exec config, the toast must be the trust
+        // refusal, not the exec-risk one.
+        //
+        // given: a config carrying `Match exec` (would trip gate ②) and a selection
+        let (mut app, path) =
+            app_fixture_on_disk("Match exec \"cmd\"\nHost a\n    HostName 1.1.1.1\n");
+        app.list_state.select(Some(0));
+        // when: the inspector is opened with an UNTRUSTED client
+        open_inspect_gated(&mut app, false);
+        // then: refused, and the toast is the TRUST-side message (① fired first)
+        assert_ne!(app.screen, Screen::Inspect);
+        assert!(app.toast.is_error, "refusal is a sticky error toast");
+        assert!(
+            app.toast.text.contains("[PATH ssh]"),
+            "trust gate must fire first, got: {:?}",
+            app.toast.text
+        );
+        assert!(
+            !app.toast.text.contains("Match exec"),
+            "exec-risk gate must not be reached for an untrusted client, got: {:?}",
+            app.toast.text
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn inspect_trusted_client_reaches_exec_risk_gate() {
+        // #73: a TRUSTED client passes gate ① and reaches gate ② — pinned via a
+        // Match exec config so the run stays hermetic (no real `ssh -G`).
+        //
+        // NOTE: the benign+trusted direction is deliberately NOT tested through
+        // the open path for the same reason as
+        // `inspect_refused_for_match_exec_in_included_file`: passing both gates
+        // runs the real `ssh -G` against the developer's own `~/.ssh/config`.
+        //
+        // given: a config carrying `Match exec` and a selection
+        let (mut app, path) =
+            app_fixture_on_disk("Match exec \"cmd\"\nHost a\n    HostName 1.1.1.1\n");
+        app.list_state.select(Some(0));
+        // when: the inspector is opened with a TRUSTED client
+        open_inspect_gated(&mut app, true);
+        // then: still refused, but by the EXEC-RISK gate (② was reached)
+        assert_ne!(app.screen, Screen::Inspect);
+        assert!(app.toast.is_error, "refusal is a sticky error toast");
+        assert!(
+            app.toast.text.contains("Match exec"),
+            "a trusted client must fall through to the exec-risk gate, got: {:?}",
+            app.toast.text
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]

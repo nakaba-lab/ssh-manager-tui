@@ -33,6 +33,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   同名エイリアスの重複は OpenSSH の先勝ちを `⊘` で明示する。チルダ・相対パス・glob（`config.d/*`）を
   OpenSSH 準拠で解決し、循環や深いネストも安全に打ち切る（#52）。
 
+### Security
+
+- Windows で System32 OpenSSH が見つからず PATH の `ssh`（Git/MSYS 由来）にフォールバック
+  している場合、実効設定インスペクタ（`i`）を開かず安全のためスキップするようにした。未検証の
+  `ssh` は `%HOME%` を優先するため、sshm が安全確認した config とは別のファイルを `ssh -G` が
+  読み、未走査の `Match exec` を実行しうるため。これで接続時オートフィル・SFTP・インスペクタの
+  3 経路が同じクライアント信頼基準に揃った（#73）。
+
 ---
 
 > このファイルは v1.2.0 以降の変更を記録する。v1.0.0〜v1.2.0 のリリース履歴は

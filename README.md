@@ -181,6 +181,7 @@ sshm --help          print help and exit
 | `O` | connect with **ad-hoc overrides** (user / port / identity / jump …) |
 | `o` | open the per-host action menu |
 | `c` | copy the `ssh` command to the clipboard |
+| `i` | **inspect the effective config** (`ssh -G` resolution for the host) |
 | `e` / `a` | edit / add a host |
 | `d` | delete the host (with confirm) |
 | `r` / `R` | refresh liveness for all / the selected host |
