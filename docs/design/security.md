@@ -2,8 +2,8 @@
 title: security 領域 設計
 area: security
 status: draft
-relatedIssues: []
-updated: 2026-07-14
+relatedIssues: [47]
+updated: 2026-07-27
 ---
 
 # security 領域 設計（vault・askpass・信頼境界）
@@ -51,9 +51,18 @@ flowchart TD
 - salt/nonce/KDF パラメータは平文だが **associated data** に束縛（改竄ヘッダはタグ検証で落ちる）。KDF パラメータは復号前に**範囲チェック**（DoS・弱体化を防ぐ）。
 - マスターパスワードは永続化しない（誤りは AEAD タグ失敗）。秘密は `Zeroize`（drop 時スクラブ・`Debug` redact）。アイドル 15 分で自動ロック。
 
+## パスフレーズ変更と vault の同期（#47・draft）
+
+`ssh-keygen -p` によるパスフレーズ追加・変更が成功すると、vault の該当 `Passphrase` エントリは陳腐化する（放置すると接続時オートフィルが旧パスフレーズを出して失敗する）。同期フロー:
+
+1. **検出**: 変更した鍵のパス（tilde 正規化で比較）を IdentityFile に持つホストを `HostView` 射影から逆引きし、vault の `Passphrase` エントリ（`host` × `kind`）と突合する。`ssh -G` の全ホスト実行はしない（spawn 数過多・起動遅延を避け、config 射影で決定的に逆引きする）。
+2. **一括更新**: 一致があれば一括更新モーダルで新パスフレーズを **1 回**入力（`Secret`/`Zeroizing`・`Debug` redact）し、該当全ホストのエントリへ upsert・`upsert_and_save`。vault ロック中は `VaultUnlock` を先行させる（いずれもスキップ可＝更新は強制しない）。
+3. **限界（受容済み）**: sshm は ssh-keygen の対話を捕捉しないため、モーダル入力値が ssh-keygen に渡した値と一致する保証はない（typo リスク）。誤入力時はオートフィル失敗として顕在化する＝従来（陳腐化放置）と同じ失敗モードであり悪化はしない。
+
 ## 主要な設計判断（現行の理由）
 
 - **秘密を config から完全分離**: OpenSSH config に秘密の置き場が無く、平文は危険。独立ファイル `~/.ssh/sshm-vault.json`。
 - **listener/helper 分離**: 秘密を持つのは信頼された TUI 側 listener のみ。helper は中継のみ（秘密を持たない別プロセス）。
 - **System32 信頼ゲート**: spoof 可能な PATH/CWD ではなく `GetSystemDirectoryW` で System32 を解決して門番（過去のインシデント修正の帰結）。
 - **耐久・owner-private 書き込み**: `secure_fs`（O_EXCL 一時名・owner-only 権限・fsync・原子 rename）。
+- **陳腐化 vault エントリは一括更新フローで同期**（#47）: 「vault 画面へ誘導のみ」「警告トーストのみ」と比較し、1 回の入力で該当全ホストのオートフィルが即時復旧する UX と、Issue の「更新を促すフローまで含めるのが本体」への適合で一括更新案を採択（上記「パスフレーズ変更と vault の同期」節）。

@@ -2,8 +2,8 @@
 title: ui 領域 設計
 area: ui
 status: draft
-relatedIssues: []
-updated: 2026-07-14
+relatedIssues: [47]
+updated: 2026-07-27
 ---
 
 # ui 領域 設計（`src/ui/` — TUI 描画）
@@ -31,7 +31,41 @@ updated: 2026-07-14
 - **レスポンシブ**: `responsive_split` が `WIDE_MIN_WIDTH`（90 桁）以上で横並び・未満で縦積み。フッターは 80 桁以内で描ける（`footers_fit_80_cols` テスト）。
 - **配色/コントラスト**: `theme.rs` の Tokyo Night パレットに集約。
 
+### 鍵パスフレーズの追加・変更（#47・draft）
+
+鍵マネージャに `p`（passphrase 追加/変更）を追加する。TUI を退避して `ssh-keygen -p` を対話実行し、成功後に vault の陳腐化 Passphrase エントリを検出したら一括更新モーダルへ繋ぐ:
+
+```mermaid
+flowchart TD
+    KM[KeyManager] -->|p ＝秘密鍵あり| RUN["TUI 退避 → ssh-keygen -p -f 鍵 を対話実行 → TUI 復帰"]
+    KM -->|p ＝.pub のみ/未選択| W[警告トースト（no-op）]
+    RUN -->|失敗| E[sticky エラートースト]
+    RUN -->|成功・該当 vault エントリなし| OK[成功トースト]
+    RUN -->|成功・陳腐化エントリ検出| VU{vault アンロック済み?}
+    VU -->|いいえ| UL["VaultUnlock モーダル（スキップ可）"]
+    UL --> BM
+    VU -->|はい| BM["一括更新モーダル: 新パスフレーズを 1 回入力"]
+    BM -->|Enter| UP[該当全ホストの Passphrase エントリを upsert・保存 → 成功トースト]
+    BM -->|Esc（スキップ）| OK
+```
+
+生成ウィザードは 4 つ目のフィールドとして「Passphrase: none / interactive」トグルを追加する（採択ワイヤーフレーム）:
+
+```
+┌─ Generate key ──────────────────┐
+│ Type:       [ed25519] rsa ecdsa │
+│ Filename:   id_ed25519          │
+│ Comment:    you@host            │
+│ Passphrase: [none] interactive  │  ← 追加
+│  Enter: generate   Esc: cancel  │
+└─────────────────────────────────┘
+```
+
+保護直後の鍵は詳細ペインの PairStatus が Matched→Unverified に変わる（見かけの回帰）。手当ては二段: ①詳細ペインの Unverified 説明を「暗号化鍵はパスフレーズ無しでは検証できない（エラーではない）」旨に拡張（恒久）、②パスフレーズ変更の成功トーストに「表示が unverified になるが正常」の一言を含める（文脈）。
+
 ## 主要な設計判断（現行の理由）
 
 - **描画と mutation の分離**: `ui/` は状態を変えず、全 mutation を `update.rs`/`app.rs` に集約（Elm 風）。テスト・見通しのため。
 - **色の単一真実源**: 画面ごとの色ハードコードを禁止し `theme.rs` に集約（テーマ一貫性）。
+- **ウィザードのパスフレーズはトグルフィールド案を採択**（#47）: 「生成実行時に毎回確認モーダルを挟む」案と比較し、フォームの一貫性（既存 3 フィールドと同じ巡回操作）とパスフレーズ不要ユーザーにステップを増やさない点で優位のため。
+- **PairStatus の見かけ回帰は説明で吸収**（#47）: パスフレーズ無しで検証できないのは仕様（`derive_public_key` は `-P ""`）であり、状態を偽装せず説明文＋トーストで「エラーではない」ことを伝える。
