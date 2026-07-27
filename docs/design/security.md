@@ -2,8 +2,8 @@
 title: security 領域 設計
 area: security
 status: draft
-relatedIssues: []
-updated: 2026-07-14
+relatedIssues: [46]
+updated: 2026-07-27
 ---
 
 # security 領域 設計（vault・askpass・信頼境界）
@@ -44,6 +44,12 @@ flowchart TD
 |-----------|------------|------|
 | **ログインパスワード** | **2 層 consent（両方必須）**: ①永続 opt-in（`prefs.rs` の `password_autofill_enabled`）＋②per-target 同意（`update.rs` の `confirmed_password_targets` モーダル承認）。加えて override のユーザー変更ガード・OpenSSH<8.5 分離・`Match exec` degrade 等の password 固有ゲート | `prefs.rs` / `update.rs` / `askpass.rs` |
 | **鍵パスフレーズ** | **consent 非依存＝ローカル限定で常時有効**（`askpass.rs`「passphrase auto-fill is local-only and stays enabled」）。opt-in を見ず、identity 一致と per-path single-shot のみ判定 | `askpass.rs` の `decide()` Passphrase 分岐 |
+
+## ホスト鍵の事前ピン留め（keyscan・#46）と TOFU の正直さ
+
+- **ピン留めが `is_known` ゲートを満たす正規経路**: `connect_plan` の「host key not yet trusted」blanket ゲート（autofill の前提条件）は変更しない。keyscan によるピン留めで known_hosts にエントリが入ることでゲートが自然に通る（ゲート緩和ではなくデータ側の充足）。
+- **帯域外検証ではないことを偽らない**: keyscan は接続と同じ経路でのスキャンであり、MITM 下では同じ偽鍵を掴む。モーダルは常に「信頼できる情報源（サーバコンソール・プロバイダのドキュメント等）とフィンガープリントを照合せよ」と提示し、randomart＋SHA256 を照合材料として出す。TOFU を「確認済み」にすり替えない。
+- **HOST KEY CHANGED でワンキー上書きを提供しない**: スキャン結果が既存エントリと不一致の場合は警告表示のみ。削除は KnownHosts 画面の明示操作（`d`＋確認）に限定し、攻撃下での反射的な上書きを構造的に不可能にする。
 
 ## 暗号設計（vault）
 
