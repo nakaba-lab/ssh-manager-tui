@@ -36,8 +36,7 @@ use crate::os::connect::{
 use crate::os::keys::{generate_key, read_public_key};
 use crate::os::known_hosts::remove_entry;
 use crate::os::resolve::{
-    ResolvedConfig, inspect_block_reason, is_host_known, resolve_config_with_options, resolve_full,
-    tofu_lookup_key,
+    ResolvedConfig, is_host_known, resolve_config_with_options, resolve_full, tofu_lookup_key,
 };
 use crate::os::sftp::{SftpOp, SftpSession, remote_join, remote_parent, sftp_quote, stage_batch};
 use crate::os::ssh_dir;
@@ -3049,15 +3048,17 @@ fn handle_known_hosts(app: &mut App, key: KeyEvent) {
 // ---------------------------------------------------------------------------
 
 /// Open the effective-config inspector for the selected host. Refuses (sticky
-/// error toast) when `ssh -G` could execute a `Match exec` predicate — a
-/// `Match exec` in the main file, or ANY `Include` (see `inspect_block_reason`).
+/// error toast) when `ssh -G` could execute a `Match exec` predicate — the shared
+/// gate [`App::ssh_g_exec_risk`] (#65), which scans the main file **and** every
+/// `Include`d file and fails safe on include forms it cannot follow. A plain,
+/// scannable `Include` no longer blocks the inspector on its own.
 /// Otherwise runs `ssh -G` ONCE here (bounded 500ms), stashes the ordered
 /// key/value rows on `App`, and switches to the base `Screen::Inspect`. The
 /// resolve never runs per-draw. On `ssh -G` failure the screen is not entered.
 fn open_inspect(app: &mut App) {
     let Some(h) = app.selected_host() else { return };
     let alias = app.hosts[h].alias().to_string();
-    if let Some(reason) = inspect_block_reason(&app.config.render()) {
+    if let Some(reason) = app.ssh_g_exec_risk() {
         app.toast(reason, true);
         return;
     }
@@ -4991,7 +4992,10 @@ mod tests {
             .unwrap()
             .write_all(config_body.as_bytes())
             .unwrap();
-        let app = App::new(path.clone()).expect("App::new over scratch config");
+        let mut app = App::new(path.clone()).expect("App::new over scratch config");
+        // Hermetic: the gate's second root would otherwise read the developer's
+        // real ~/.ssh/config (see `.claude/rules/tdd.md` — no external I/O).
+        app.default_config_root = None;
         (app, path)
     }
 
@@ -5010,7 +5014,8 @@ mod tests {
         std::fs::write(dir.join(include_name), include_body).unwrap();
         let path = dir.join("config");
         std::fs::write(&path, main_body).unwrap();
-        let app = App::new(path).expect("App::new over scratch config with include");
+        let mut app = App::new(path).expect("App::new over scratch config with include");
+        app.default_config_root = None; // hermetic — see `app_fixture_on_disk`
         (app, dir)
     }
 
@@ -5097,6 +5102,126 @@ mod tests {
         assert!(
             app.autofill_config_unsafe(),
             "a block-nested include must trip the fail-safe even if we can't scan it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- #65: one shared `ssh -G` exec-risk gate for connect / SFTP / inspector ---
+
+    #[test]
+    fn ssh_g_exec_risk_none_for_benign_include() {
+        // #65 crux: a plain top-level include no longer counts as a risk. The gate
+        // scans the included files instead of refusing on sight, so the common
+        // `config.d/*` setup keeps both autofill AND the inspector available.
+        let (app, dir) = app_with_include(
+            "Include plain.conf\n\nHost main-host\n    HostName 1.1.1.1\n",
+            "plain.conf",
+            "Host inc\n    HostName 2.2.2.2\n",
+        );
+        assert!(
+            app.ssh_g_exec_risk().is_none(),
+            "a scannable, clean include is not an exec risk"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ssh_g_exec_risk_flags_match_exec_in_included_file() {
+        // A `Match exec` inside an included file is a risk for every ssh -G caller.
+        let (app, dir) = app_with_include(
+            "Include danger.conf\n\nHost main-host\n    HostName 1.1.1.1\n",
+            "danger.conf",
+            "Match exec \"cmd\"\n    User bob\n",
+        );
+        assert!(app.ssh_g_exec_risk().is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ssh_g_exec_risk_flags_unscannable_include() {
+        // A block-nested include can't be followed, so the gate fails safe.
+        let (app, dir) = app_with_include(
+            "Host gate\n    Include hidden.conf\n",
+            "hidden.conf",
+            "Host inc\n    HostName 2.2.2.2\n",
+        );
+        assert!(
+            app.ssh_g_exec_risk().is_some(),
+            "an include form ssh -G honors but we can't scan must fail safe"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ssh_g_exec_risk_scans_the_default_config_root() {
+        // #65: production `ssh -G` passes no `-F`, so it reads ~/.ssh/config even
+        // when `--config` loaded something else. The gate therefore scans BOTH
+        // roots — here the loaded fixture is clean but the default root is not.
+        // (A scratch path stands in for the default root so the test stays
+        // hermetic; `default_config_root` is the injection point.)
+        let (mut app, dir) = app_with_include(
+            "Include plain.conf\n\nHost main-host\n    HostName 1.1.1.1\n",
+            "plain.conf",
+            "Host inc\n    HostName 2.2.2.2\n",
+        );
+        assert!(
+            app.ssh_g_exec_risk().is_none(),
+            "loaded config alone is clean"
+        );
+
+        let other = dir.join("default-config");
+        std::fs::write(&other, "Match exec \"cmd\"\nHost x\n    HostName 3.3.3.3\n").unwrap();
+        app.default_config_root = Some(other);
+        assert!(
+            app.ssh_g_exec_risk().is_some(),
+            "a Match exec in the config ssh -G actually reads must be caught"
+        );
+
+        // A default root that does not exist is not a risk (ssh can't read it either).
+        app.default_config_root = Some(dir.join("nonexistent"));
+        assert!(app.ssh_g_exec_risk().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ssh_g_exec_risk_flags_main_match_exec() {
+        let (app, path) = app_fixture_on_disk("Match exec \"cmd\"\nHost a\n    HostName 1.1.1.1\n");
+        assert!(app.ssh_g_exec_risk().is_some());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn inspect_refused_for_match_exec_in_included_file() {
+        // The inspector must refuse when an INCLUDED file carries `Match exec`
+        // (previously covered only incidentally by the blanket has_include block).
+        //
+        // This also pins the WIRING: asserting the toast carries the gate's own
+        // reason distinguishes "the gate refused" from "the gate was skipped and
+        // `ssh -G` merely failed" — the latter also yields a sticky error toast, so
+        // a state-only assertion here would pass even with the gate removed.
+        //
+        // NOTE: the benign-include direction is deliberately NOT tested through
+        // `open_inspect`: passing the gate runs the real `ssh -G` against the
+        // developer's own `~/.ssh/config` (production never passes `-F`), which is
+        // environment-dependent and could execute their own `Match exec`. The gate
+        // itself is covered by `ssh_g_exec_risk_none_for_benign_include`.
+        let (mut app, dir) = app_with_include(
+            "Include danger.conf\n\nHost main-host\n    HostName 1.1.1.1\n",
+            "danger.conf",
+            "Match exec \"cmd\"\n    User bob\n",
+        );
+        app.list_state.select(Some(0));
+        open_inspect(&mut app);
+        assert_ne!(
+            app.screen,
+            Screen::Inspect,
+            "inspector must not open when ssh -G would run a predicate"
+        );
+        assert!(app.toast.is_error, "refusal is a sticky error toast");
+        assert!(
+            app.toast.text.contains("Match exec"),
+            "the refusal must come from the gate, got: {:?}",
+            app.toast.text
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

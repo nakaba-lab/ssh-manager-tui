@@ -2,8 +2,8 @@
 title: os 領域 設計
 area: os
 status: draft
-relatedIssues: [43]
-updated: 2026-07-14
+relatedIssues: [43, 52, 65]
+updated: 2026-07-25
 ---
 
 # os 領域 設計（`src/os/`）
@@ -43,4 +43,4 @@ updated: 2026-07-14
 - **秘密鍵本体を読まない**: 鍵ペアリングは公開フィンガープリント照合のみ。暗号化 PEM は `Unverified`（エラーにしない）。
 - **liveness index キーの脆さ**: ホスト追加/削除で index がずれるため `rebuild_hosts()` が liveness マップをクリアし再プローブ。
 - **`resolve_full` は型付き経路と生ダンプ取得を共有し、パースだけ分ける（#43）**: `run_ssh_g` の subprocess 実行部（500ms タイムアウト・stdin null・kill-on-timeout・`--` センチネル＋先頭ダッシュ拒否）を生ダンプ取得として括り出し、型付き `parse_ssh_g_output`（抽出サブセット）と `resolve_full` 用の全 key/value パース（順序保持）が同じダンプを読む。インスペクタは「書いた値」との由来比較をせず `ssh -G` の正規化出力をそのまま近似として見せる（キー小文字化・値正規化・コンパイル時デフォルト混入があるため、単純比較は誤分類する＝Issue #43 リスク#2）。ratatui 非依存を維持し、パース分割はヘッドレステスト可能。
-- **インスペクタの安全ゲートは text scan で判定する（#43 リスク#1）**: `inspect_block_reason` は `has_match_exec`（既存）と `has_include`（新規）で config テキストを走査し、`Match exec` または `Include` があれば `ssh -G` 実行を退避する。両者とも同じ widen-only 正規化（クオート splice 除去・`=`→空白・コメント除外・インデント非依存）を使い、パーサの `include_count()`（素のトップレベル Include のみ）では取りこぼす**ブロック内ネスト**・**クオート装飾**の Include も捕捉する。接続時の autofill 経路（`has_match_exec` のみで Include を見ない）より厳格＝閲覧専用の診断ビューは保守的に倒す。
+- **`ssh -G` 実行前の安全ゲートは app 層に集約（#43 → #52 → #65）**: `os/resolve.rs` が提供するのは `has_match_exec`（widen-only 正規化＝クオート splice 除去・`=`→空白・コメント除外・インデント非依存の text scan）**のみ**で、ゲートの判断そのものは `App::ssh_g_exec_risk()` が持つ。3 つの `ssh -G` 呼び出し経路（接続時 autofill・SFTP arm・実効設定インスペクタ）はすべてこの単一ゲートを通り、included ファイルまで走査したうえで退避を決める（判定順・`blind_spot` の定義は [includes.md](./includes.md) が正）。#43 当時の `inspect_block_reason` / `has_include`（`Include` があれば一律退避する text scan）は #52 で included ファイルを実際に読めるようになったため**削除済み**。

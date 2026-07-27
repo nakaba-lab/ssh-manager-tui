@@ -37,7 +37,9 @@ pub struct IncludedHost {
 /// relative path resolves against `base_dir` (the user config's `~/.ssh`), and
 /// an absolute path is returned verbatim.
 pub fn resolve_include_arg(arg: &str, base_dir: &Path, home: &Path) -> PathBuf {
-    // OpenSSH only expands a leading `~` (not `~user`, which sshm does not support).
+    // Only `~` and `~/…` are handled here. OpenSSH globs with `GLOB_TILDE`, so it
+    // ALSO expands `~user/…`; that shape is rejected upstream by
+    // [`is_unresolvable_arg`] rather than mis-resolved here.
     if arg == "~" {
         return home.to_path_buf();
     }
@@ -59,11 +61,18 @@ pub struct Expansion {
     /// Lossy raw text of every included file read — backs the whole-config
     /// `Match exec` safety scan (including files with no `Host` block).
     pub texts: Vec<String>,
-    /// True when the effective config uses an `Include` form that `ssh -G` honors
-    /// but this expander cannot follow — a block-nested / quote-spliced include,
-    /// or recursion past [`MAX_DEPTH`]. A caller gating a security-sensitive action
-    /// (autofill) must fail safe when this is set, since a `Match exec` could hide
-    /// in an un-scanned file.
+    /// True when some file `ssh -G` would read went **unscanned**: an `Include`
+    /// form this expander cannot follow (block-nested, quote-spliced, past
+    /// [`MAX_DEPTH`]), an argument shape it cannot resolve (see
+    /// [`is_unresolvable_arg`] — `%` tokens, `${ENV}`, `~user/…`, a unix
+    /// backslash, lossy `U+FFFD`), a glob pattern it cannot evaluate (see
+    /// [`glob_matches`]), or a path it could not stat/read — including a
+    /// non-regular file, which is never opened. A caller gating a
+    /// security-sensitive action (autofill, the inspector) must fail safe when
+    /// this is set, since a `Match exec` could hide in there.
+    ///
+    /// A missing path or a directory does NOT set it: `ssh` cannot read those
+    /// either, so nothing is actually left unscanned.
     pub blind_spot: bool,
 }
 
@@ -135,33 +144,152 @@ fn expand_paths(
         return;
     }
     for arg in paths {
+        // An argument shape we cannot faithfully resolve would send us to a
+        // different file than `ssh` opens — un-scannable, so fail safe.
+        if is_unresolvable_arg(arg) {
+            acc.blind_spot = true;
+            continue;
+        }
         let resolved = resolve_include_arg(arg, base_dir, home);
-        for file in glob_matches(&resolved) {
+        for file in glob_matches(&resolved, acc) {
             read_included_file(&file, base_dir, home, depth, seen, visited, acc);
         }
     }
 }
 
+/// True for `Include` argument shapes `ssh` expands but [`resolve_include_arg`]
+/// does not, so we would resolve to a different path (usually a nonexistent one)
+/// and silently scan less than `ssh` reads. OpenSSH percent-expands the argument
+/// and passes it to `glob(3)` with `GLOB_TILDE`, so all of these are live:
+///
+/// - percent tokens (`%d`, `%h`, …) and environment references (`${VAR}`);
+/// - `~user/…` — `GLOB_TILDE` expands another user's home, we would treat it as a
+///   relative path (this also covers the Windows-valid `~\path`);
+/// - on unix, a backslash — `glob(3)` unescapes `\x` to `x` (OpenSSH does not set
+///   `GLOB_NOESCAPE`), so `evil\.conf` reads `evil.conf`. On Windows `\` is the
+///   path separator and must NOT be flagged, or every normal include would be;
+/// - `U+FFFD`, which only appears because an including file was decoded lossily —
+///   the real argument had bytes we cannot reproduce;
+/// - character-class dialects the `glob` crate reads differently from `glob(3)`:
+///   `[^…]` (crate: `^` is a literal member; POSIX: negation) and `[[:alpha:]]`
+///   (crate: no POSIX classes). Both evaluate cleanly on each side while matching
+///   *different* files, so they must not be trusted as scanned.
+fn is_unresolvable_arg(arg: &str) -> bool {
+    // `~` alone and `~/…` are the shapes resolve_include_arg handles.
+    let unsupported_tilde = arg.starts_with('~') && arg != "~" && !arg.starts_with("~/");
+    unsupported_tilde
+        || arg.contains('%')
+        || arg.contains("${")
+        || arg.contains('\u{fffd}')
+        || arg.contains("[^")
+        || arg.contains("[[:")
+        || (cfg!(unix) && arg.contains('\\'))
+}
+
+/// Rewrite a pattern into the `glob(3)` dialect OpenSSH actually uses before
+/// handing it to the `glob` crate: POSIX has no `**`, where the crate gives it
+/// recursive component semantics. Left as-is, `config.d/**` matches **nothing**
+/// in the crate over a flat directory while `glob(3)` matches every entry — a
+/// silent "scanned nothing, looks clean". Collapsing runs of `*` restores POSIX
+/// meaning.
+fn to_posix_glob(pattern: &str) -> String {
+    let mut out = String::with_capacity(pattern.len());
+    let mut prev_star = false;
+    for c in pattern.chars() {
+        if c == '*' {
+            if !prev_star {
+                out.push(c);
+            }
+            prev_star = true;
+        } else {
+            out.push(c);
+            prev_star = false;
+        }
+    }
+    out
+}
+
 /// Expand a resolved include path into concrete files. A path containing glob
 /// metacharacters (`* ? [`) is globbed (existing matches, alphabetical); a
 /// literal path is returned as-is (existence is checked when it is read, so a
-/// missing literal include is skipped fail-soft). An invalid glob pattern yields
-/// nothing (fail-soft).
-fn glob_matches(resolved: &Path) -> Vec<PathBuf> {
+/// missing literal include is skipped fail-soft).
+///
+/// A pattern this crate **refuses to evaluate** sets `blind_spot`: `glob` rejects
+/// e.g. an unbalanced `[` as a pattern error, whereas the libc `glob(3)` that
+/// OpenSSH uses treats it as a literal character and happily matches files — so
+/// "we could not evaluate it" must never be confused with "it matched nothing".
+/// An entry that errors mid-traversal (e.g. EACCES on a directory) is likewise
+/// un-scannable and flags the blind spot. A pattern that evaluates cleanly and
+/// matches zero files is NOT a blind spot (`glob(3)` yields nothing there too).
+fn glob_matches(resolved: &Path, acc: &mut Expansion) -> Vec<PathBuf> {
     let s = resolved.to_string_lossy();
-    if s.contains(['*', '?', '[']) {
-        match glob::glob(&s) {
-            Ok(paths) => paths.filter_map(Result::ok).collect(),
-            Err(_) => Vec::new(),
+    if !s.contains(['*', '?', '[']) {
+        return vec![resolved.to_path_buf()];
+    }
+    // `glob(3)` semantics: no `**`, and a leading dot is never matched by a
+    // wildcard — matching hidden files would scan (and list hosts from) files
+    // `ssh` never reads.
+    let options = glob::MatchOptions {
+        require_literal_leading_dot: true,
+        ..glob::MatchOptions::new()
+    };
+    match glob::glob_with(&to_posix_glob(&s), options) {
+        Ok(paths) => paths
+            .filter_map(|r| {
+                r.inspect_err(|_| acc.blind_spot = true) // unreadable while walking
+                    .ok()
+            })
+            .collect(),
+        Err(_) => {
+            acc.blind_spot = true;
+            Vec::new()
         }
-    } else {
-        vec![resolved.to_path_buf()]
+    }
+}
+
+/// What [`read_config_text`] could make of a path.
+#[derive(Debug)]
+pub enum ReadOutcome {
+    /// The file's bytes, decoded lossily — `ssh`'s byte-oriented parser would
+    /// honor an ASCII `Match exec` line even in a file with stray non-UTF-8 bytes.
+    Text(String),
+    /// Nothing to scan and nothing missed: `ssh` cannot read it either (the path
+    /// does not exist, or it is a directory).
+    Missing,
+    /// We could not read it but `ssh` may still be able to — the caller must fail
+    /// safe. Includes non-regular files (FIFO / socket / device), which are
+    /// deliberately **never opened**: reading a FIFO would block forever.
+    Unscannable,
+}
+
+/// Read a config file for scanning without ever blocking on it. Stats the path
+/// first so a FIFO cannot wedge the caller, then reads it lossily.
+///
+/// The stat→read window is inherently racy (an attacker controlling the directory
+/// could swap a regular file for a FIFO in between); this narrows it to a race
+/// rather than a standing hazard.
+pub fn read_config_text(path: &Path) -> ReadOutcome {
+    match std::fs::metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ReadOutcome::Missing,
+        Err(_) => return ReadOutcome::Unscannable, // e.g. permission: ssh might read it
+        Ok(md) if md.is_dir() => return ReadOutcome::Missing, // ssh skips directories too
+        Ok(md) if !md.is_file() => return ReadOutcome::Unscannable, // do NOT open
+        Ok(_) => {}
+    }
+    match std::fs::read(path) {
+        Ok(bytes) => ReadOutcome::Text(String::from_utf8_lossy(&bytes).into_owned()),
+        Err(_) => ReadOutcome::Unscannable, // stat said regular, but we cannot read it
     }
 }
 
 /// Read and project one included file's hosts, recursing into its own includes.
-/// The canonical path guards cycles; an unreadable/missing file (or a directory
-/// matched by a glob) is skipped fail-soft.
+/// The canonical path guards cycles.
+///
+/// A missing path or a directory is skipped silently — `ssh` cannot read those
+/// either, so nothing is unscanned. Anything else we fail to read (a permission
+/// error, or a non-regular file such as a FIFO, which we deliberately do NOT open
+/// because that would block the UI thread forever) sets `blind_spot`: `ssh` may
+/// still read it, so we must not report "clean" for a file we never saw.
 fn read_included_file(
     file: &Path,
     base_dir: &Path,
@@ -178,13 +306,14 @@ fn read_included_file(
     if !visited.insert(key) {
         return;
     }
-    let Ok(bytes) = std::fs::read(file) else {
-        return; // fail-soft: missing / unreadable / a directory
+    let content = match read_config_text(file) {
+        ReadOutcome::Text(t) => t,
+        ReadOutcome::Missing => return,
+        ReadOutcome::Unscannable => {
+            acc.blind_spot = true;
+            return;
+        }
     };
-    // Lossy so a non-UTF-8 file still contributes its text to the Match-exec scan:
-    // ssh's byte-oriented parser would honor an ASCII `Match exec` line even in a
-    // file that carries a stray non-UTF-8 byte elsewhere.
-    let content = String::from_utf8_lossy(&bytes).into_owned();
     let cfg = parser::parse(file.to_path_buf(), &content);
     // Any include form we can't follow makes the safety scan incomplete.
     if has_unfollowed_include(&cfg) {
@@ -555,6 +684,200 @@ mod tests {
             !web.shadowed,
             "the included alias precedes the main host, so it wins"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn equals_separated_include_is_followed_not_a_blind_spot() {
+        // `Include=path` is a normal top-level include: ssh honors it and so do we,
+        // so it is scanned (hosts surface) rather than flagged un-scannable.
+        let dir = temp_dir(".inc-equals");
+        std::fs::write(dir.join("a.conf"), "Host eq\n    HostName 1.1.1.1\n").unwrap();
+        let main = parser::parse(dir.join("config"), "Include=a.conf\n");
+        let expansion = expand(&main, &dir, &dir);
+        assert!(
+            !expansion.blind_spot,
+            "an `=`-separated include is followable"
+        );
+        assert_eq!(expansion.hosts.len(), 1, "its hosts are surfaced");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn commented_include_is_not_an_include() {
+        // A commented-out `# Include` must neither be followed nor flagged.
+        let dir = temp_dir(".inc-commented");
+        let main = parser::parse(
+            dir.join("config"),
+            "# Include other.conf\nHost a\n    HostName 1.1.1.1\n",
+        );
+        let expansion = expand(&main, &dir, &dir);
+        assert!(!expansion.blind_spot);
+        assert!(expansion.hosts.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn blind_spot_on_unevaluatable_glob_pattern() {
+        // The `glob` crate rejects an unbalanced `[` as a pattern ERROR, while the
+        // libc `glob(3)` OpenSSH uses treats it as a literal character and matches
+        // files. "Could not evaluate" must never be read as "matched nothing", or a
+        // `Match exec` in the matched file would go unscanned.
+        let dir = temp_dir(".inc-badglob");
+        let sub = dir.join("conf[.d");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("evil.conf"), "Match exec \"cmd\"\n").unwrap();
+        let main = parser::parse(dir.join("config"), "Include conf[.d/*\n");
+        assert!(
+            expand(&main, &dir, &dir).blind_spot,
+            "a pattern we cannot evaluate must fail safe"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn blind_spot_on_unresolvable_include_arg() {
+        // Argument shapes ssh expands but we do not (percent tokens, ${ENV}, and
+        // the Windows-valid `~\path`) would send us to a different file than ssh
+        // opens — fail safe rather than scan the wrong path.
+        let dir = temp_dir(".inc-unresolvable");
+        for arg in ["%d/.ssh/x.conf", "${HOME}/x.conf", "~\\.ssh\\x.conf"] {
+            let main = parser::parse(dir.join("config"), &format!("Include {arg}\n"));
+            assert!(
+                expand(&main, &dir, &dir).blind_spot,
+                "unresolvable include arg {arg:?} must fail safe"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn blind_spot_on_backslash_escaped_include_arg() {
+        // `glob(3)` (no GLOB_NOESCAPE, which OpenSSH does not set) unescapes `\x`
+        // to `x`, so `evil\.conf` reads `evil.conf`. We take the literal branch and
+        // would stat a nonexistent path — silently "clean" — unless flagged.
+        let dir = temp_dir(".inc-backslash");
+        let cd = dir.join("config.d");
+        std::fs::create_dir_all(&cd).unwrap();
+        std::fs::write(cd.join("evil.conf"), "Match exec \"cmd\"\n").unwrap();
+        let main = parser::parse(dir.join("config"), "Include config.d/evil\\.conf\n");
+        assert!(
+            expand(&main, &dir, &dir).blind_spot,
+            "a backslash-escaped include arg must fail safe on unix"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn double_star_glob_matches_like_posix() {
+        // `glob(3)` has no `**` — it is just `*`. The glob crate's component-wise
+        // `**` matches NOTHING in a flat directory, which would silently scan no
+        // files at all while ssh reads them.
+        let dir = temp_dir(".inc-doublestar");
+        let cd = dir.join("config.d");
+        std::fs::create_dir_all(&cd).unwrap();
+        std::fs::write(cd.join("a.conf"), "Host a\n    HostName 1.1.1.1\n").unwrap();
+        std::fs::write(cd.join("b.conf"), "Match exec \"cmd\"\n").unwrap();
+        let main = parser::parse(dir.join("config"), "Include config.d/**\n");
+        let expansion = expand(&main, &dir, &dir);
+        assert_eq!(expansion.texts.len(), 2, "`**` must behave like `*`");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn blind_spot_on_divergent_character_classes() {
+        // The crate and `glob(3)` both evaluate these cleanly but match DIFFERENT
+        // files (`^` literal vs negation; no POSIX classes), so a "scanned nothing
+        // suspicious" verdict on them would be unfounded.
+        let dir = temp_dir(".inc-classes");
+        for arg in ["config.d/[^a]*.conf", "config.d/[[:alpha:]].conf"] {
+            let main = parser::parse(dir.join("config"), &format!("Include {arg}\n"));
+            assert!(
+                expand(&main, &dir, &dir).blind_spot,
+                "divergent class syntax {arg:?} must fail safe"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn blind_spot_on_tilde_user_include_arg() {
+        // OpenSSH passes GLOB_TILDE, so `~user/…` expands to that user's home; we
+        // would resolve it as a relative path and miss the file entirely.
+        let dir = temp_dir(".inc-tildeuser");
+        let main = parser::parse(dir.join("config"), "Include ~otheruser/.ssh/x.conf\n");
+        assert!(
+            expand(&main, &dir, &dir).blind_spot,
+            "`~user` is expanded by ssh but not by us — fail safe"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hidden_files_are_not_globbed() {
+        // `glob(3)` never matches a leading dot with a wildcard. Scanning one would
+        // list phantom hosts (and could refuse autofill) for a file ssh never reads.
+        let dir = temp_dir(".inc-hidden");
+        let cd = dir.join("config.d");
+        std::fs::create_dir_all(&cd).unwrap();
+        std::fs::write(
+            cd.join(".hidden.conf"),
+            "Host ghost\n    HostName 9.9.9.9\n",
+        )
+        .unwrap();
+        std::fs::write(cd.join("real.conf"), "Host real\n    HostName 1.1.1.1\n").unwrap();
+        let main = parser::parse(dir.join("config"), "Include config.d/*\n");
+        let expansion = expand(&main, &dir, &dir);
+        let aliases: Vec<_> = expansion
+            .hosts
+            .iter()
+            .map(|h| h.view.alias().to_string())
+            .collect();
+        assert_eq!(aliases, vec!["real".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn glob_matching_only_a_directory_is_not_a_blind_spot() {
+        // `ssh` cannot read a directory either, so skipping one leaves nothing
+        // unscanned — this must NOT over-block the common `config.d/*` setup.
+        let dir = temp_dir(".inc-globdir");
+        let cd = dir.join("config.d");
+        std::fs::create_dir_all(cd.join("subdir")).unwrap();
+        std::fs::write(cd.join("a.conf"), "Host a\n    HostName 1.1.1.1\n").unwrap();
+        let main = parser::parse(dir.join("config"), "Include config.d/*\n");
+        let expansion = expand(&main, &dir, &dir);
+        assert!(
+            !expansion.blind_spot,
+            "a matched directory is skipped cleanly"
+        );
+        assert_eq!(expansion.hosts.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_include_is_not_a_blind_spot() {
+        // A stale/absent include is invisible to ssh too, so it stays fail-soft.
+        let dir = temp_dir(".inc-missing");
+        let main = parser::parse(dir.join("config"), "Include gone.conf\n");
+        assert!(!expand(&main, &dir, &dir).blind_spot);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn include_lookalikes_are_not_treated_as_includes() {
+        // False-positive guard (kept from the deleted `has_include` tests): a host
+        // named "include-server" and an IdentityFile path containing "Include" are
+        // values, not directives — neither is followed nor flagged.
+        let dir = temp_dir(".inc-lookalike");
+        let main = parser::parse(
+            dir.join("config"),
+            "Host include-server\n    HostName 1.1.1.1\n    IdentityFile ~/Include/key\n",
+        );
+        let expansion = expand(&main, &dir, &dir);
+        assert!(!expansion.blind_spot);
+        assert!(expansion.hosts.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

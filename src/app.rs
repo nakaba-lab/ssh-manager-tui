@@ -21,7 +21,7 @@ use crate::os::history::History;
 use crate::os::keys::KeyInfo;
 use crate::os::known_hosts::{HostSpec, KnownHostEntry};
 use crate::os::liveness::{Liveness, LivenessProbe, ProbeTarget};
-use crate::os::resolve::ResolvedConfig;
+use crate::os::resolve::{ResolvedConfig, has_match_exec};
 use crate::os::sftp::{RemoteEntry, SftpEvent, SftpSession};
 use crate::os::vault::{MatchedKinds, SecretKind, Vault, match_vault_kinds};
 use crate::os::{self, keys, known_hosts};
@@ -862,6 +862,11 @@ pub struct App {
     /// Read-only hosts expanded from `Include`d files (#52), forming the tail of
     /// `hosts`. Rebuilt by [`App::rebuild_hosts`]; never written back.
     pub included: Vec<crate::config::includes::IncludedHost>,
+    /// The default `~/.ssh/config` — the file `ssh -G` reads no matter what
+    /// `--config` loaded — scanned as a second root by [`App::ssh_g_exec_risk`]
+    /// (#65). `None` when there is no home directory, and in tests, which must not
+    /// depend on the developer's real config.
+    pub default_config_root: Option<std::path::PathBuf>,
 
     // --- S1 list ---
     pub focus: ListFocus,
@@ -1000,6 +1005,7 @@ impl App {
             hosts: Vec::new(),
             host_items: Vec::new(),
             included: Vec::new(),
+            default_config_root: crate::config::default_config_path().ok(),
             focus: ListFocus::Hosts,
             list_state: TableState::default(),
             detail_scroll: 0,
@@ -1116,34 +1122,95 @@ impl App {
     /// `home` only drives tilde expansion, so a missing home must not skip
     /// expansion of relative/absolute includes.
     fn expand_includes(&self) -> crate::config::includes::Expansion {
+        self.expand_includes_of(&self.config)
+    }
+
+    /// [`App::expand_includes`] for an arbitrary document — used by the safety
+    /// gate, which expands each config as it exists **on disk** (what `ssh -G`
+    /// reads) rather than the in-memory projection. Relative includes resolve
+    /// against that document's own directory.
+    fn expand_includes_of(&self, cfg: &SshConfig) -> crate::config::includes::Expansion {
         let home = dirs::home_dir().unwrap_or_default();
-        let base_dir = self
-            .config
+        let base_dir = cfg
             .path
             .parent()
             .map(std::path::Path::to_path_buf)
             .unwrap_or_else(|| home.join(".ssh"));
-        crate::config::includes::expand(&self.config, &base_dir, &home)
+        crate::config::includes::expand(cfg, &base_dir, &home)
     }
 
-    /// Whether connect-time secret **autofill must be withheld** because the
-    /// effective config — the main file **and** every `Include`d file `ssh -G`
-    /// would read (#52) — either carries a `Match exec` (which `ssh -G` would
-    /// execute) or uses an include form we cannot fully scan (block-nested /
-    /// quote-spliced / past `MAX_DEPTH`). It **fails safe**: an un-scannable
-    /// include is treated as unsafe rather than assumed clean. Re-expands at call
-    /// time so an externally-modified include is re-scanned before each connect
-    /// (autofill is off the hot path, so the extra read is fine).
-    pub fn autofill_config_unsafe(&self) -> bool {
-        if crate::os::resolve::has_match_exec(&self.config.render()) {
-            return true;
+    /// Why running `ssh -G` on this config could **execute** a `Match exec`
+    /// predicate, or `None` when it is safe to run (#65). The single gate shared by
+    /// every `ssh -G` caller — connect-time autofill, the SFTP arm, and the
+    /// effective-config inspector (#43) — so those paths can never disagree about
+    /// what counts as risky.
+    ///
+    /// Risky means: the main file carries a `Match exec`; **or** any `Include`d
+    /// file `ssh -G` would read carries one (#52); **or** the config uses an
+    /// include form we cannot follow (block-nested / quote-spliced / past
+    /// `MAX_DEPTH`), which **fails safe** — un-scannable is treated as unsafe
+    /// rather than assumed clean. A plain, scannable `Include` is NOT a risk by
+    /// itself, so the common `config.d/*` setup keeps autofill and the inspector.
+    ///
+    /// Everything is re-read at call time — each root config **and** its includes —
+    /// so an externally edited config is re-scanned before each use (all three
+    /// callers are off the hot path). What `ssh -G` reads is the file **on disk**,
+    /// so that is what gets expanded; the in-memory render is scanned too, purely
+    /// as a belt-and-braces over-block for unsaved edits.
+    ///
+    /// Two roots are scanned: the document sshm loaded **and** the default
+    /// `~/.ssh/config` when `--config <path>` made those differ — production never
+    /// passes `-F`, so `ssh -G` reads the default one regardless of what sshm
+    /// loaded. The system-wide config (`/etc/ssh/ssh_config`) is deliberately out
+    /// of scope: it is root-owned, outside this threat model.
+    ///
+    /// Residual race: a config can be rewritten between this scan and `ssh -G`
+    /// starting. That is inherent to any out-of-process gate; this only narrows it.
+    pub fn ssh_g_exec_risk(&self) -> Option<&'static str> {
+        use crate::config::includes::{ReadOutcome, read_config_text};
+        const MAIN: &str = "host config uses `Match exec` — ssh -G would run it; skipped";
+        const DEFAULT_ROOT: &str = "~/.ssh/config uses `Match exec` — ssh -G would run it; skipped";
+        const INCLUDED: &str = "an included file uses `Match exec` — ssh -G would run it; skipped";
+        const UNVERIFIABLE: &str =
+            "config uses an `Include` form we can't verify — skipped for safety";
+
+        // Unsaved in-memory edits: an over-block only, since ssh -G reads the disk.
+        if has_match_exec(&self.config.render()) {
+            return Some(MAIN);
         }
-        let expansion = self.expand_includes();
-        expansion.blind_spot
-            || expansion
-                .texts
-                .iter()
-                .any(|t| crate::os::resolve::has_match_exec(t))
+        let mut roots = vec![self.config.path.clone()];
+        if let Some(default) = &self.default_config_root
+            && *default != self.config.path
+        {
+            roots.push(default.clone());
+        }
+        for (i, root) in roots.into_iter().enumerate() {
+            // Name the right file when the verdict comes from the default config a
+            // `--config` session never showed the user.
+            let main_reason = if i == 0 { MAIN } else { DEFAULT_ROOT };
+            let text = match read_config_text(&root) {
+                ReadOutcome::Text(t) => t,
+                ReadOutcome::Missing => continue, // ssh cannot read it either
+                ReadOutcome::Unscannable => return Some(UNVERIFIABLE),
+            };
+            if has_match_exec(&text) {
+                return Some(main_reason);
+            }
+            let expansion = self.expand_includes_of(&crate::config::parser::parse(root, &text));
+            if expansion.texts.iter().any(|t| has_match_exec(t)) {
+                return Some(INCLUDED);
+            }
+            if expansion.blind_spot {
+                return Some(UNVERIFIABLE);
+            }
+        }
+        None
+    }
+
+    /// Whether connect-time secret **autofill must be withheld** because `ssh -G`
+    /// could execute a predicate (see [`App::ssh_g_exec_risk`]).
+    pub fn autofill_config_unsafe(&self) -> bool {
+        self.ssh_g_exec_risk().is_some()
     }
 
     /// Sticky toast shown when an `Include`d host's edit/delete is refused — it is
