@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- ホスト鍵の事前スキャン＆ピン留め: アクションメニュー（`o`）の「Scan host key」で接続前に `ssh-keyscan` を実行し、フィンガープリント（SHA256）と randomart を確認したうえで `y` で `known_hosts` に追記できる。初回接続時の TOFU プロンプトが不要になり、保存済み秘密の自動入力ブロックも解消する。既存の鍵と一致する鍵は重複追記せず、**鍵が変わっていた場合（HOST KEY CHANGED）は警告のみで上書きは提供しない**（#46）
+- ホスト鍵の事前スキャン＆ピン留め: アクションメニュー（`o`）の「Scan host key」で接続前に `ssh-keyscan` を実行し、フィンガープリント（SHA256）と randomart を確認したうえで `y` で `known_hosts` に追記できる。初回接続時の TOFU プロンプトが不要になり、保存済み秘密の自動入力ブロックも解消する。既存の鍵と一致する鍵は重複追記しない。**取得した鍵が既存のピンと矛盾する場合（HOST KEY CHANGED）や取り消し済み（`@revoked`）の場合は、その結果セットからは一切ピン留めしない**（警告のみ・上書き手段は提供しない）。ピン留め先はそのホストに有効な `UserKnownHostsFile`（#46）
 
 ### Changed
 

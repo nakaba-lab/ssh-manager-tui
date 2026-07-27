@@ -33,6 +33,38 @@ pub fn verify_hint() -> &'static str {
 /// Randomart columns per row (each block is ~19 cols wide; 3 fit in 80).
 const ART_COLS: usize = 3;
 
+/// Preferred modal width when the content is narrower than this.
+const MIN_MODAL_WIDTH: u16 = 46;
+
+/// Modal size for `content` within `area`, never exceeding it. `centered`
+/// clamps the width down, but the height must be clamped here so the body can
+/// be trimmed to match (`u16::clamp` would panic outright on a terminal
+/// narrower than the preferred width — #46 review).
+fn modal_size(content_w: u16, content_h: u16, area: Rect) -> (u16, u16) {
+    (
+        content_w.max(MIN_MODAL_WIDTH).min(area.width),
+        content_h.min(area.height),
+    )
+}
+
+/// Drop `body` lines from the END until the whole block fits `rows`, so the
+/// trailing verification reminder (#46 AC8) is never the thing that scrolls
+/// off. The randomart blocks sit last precisely because they are the
+/// supplementary part: losing art is acceptable, losing the "verify this
+/// out-of-band" wording is not.
+fn fit_body(
+    mut body: Vec<Line<'static>>,
+    tail: Vec<Line<'static>>,
+    rows: usize,
+) -> Vec<Line<'static>> {
+    let budget = rows.saturating_sub(tail.len());
+    if body.len() > budget {
+        body.truncate(budget);
+    }
+    body.extend(tail);
+    body
+}
+
 pub fn draw(f: &mut Frame, app: &App, area: Rect) {
     let Some(ks) = app.keyscan.as_ref() else {
         return;
@@ -63,17 +95,16 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
                 text,
             )));
             lines.push(Line::from(""));
-            let changed = rows.iter().any(|r| r.class == PinClass::Changed);
+            let poisoned = rows.iter().any(|r| r.class.poisons_result());
             for row in rows {
+                let danger_chip = Style::default()
+                    .fg(theme::DOWN)
+                    .add_modifier(Modifier::BOLD);
                 let (chip, chip_style) = match row.class {
                     PinClass::New => ("[new]", Style::default().fg(theme::UP)),
                     PinClass::AlreadyTrusted => ("[already trusted]", dim),
-                    PinClass::Changed => (
-                        "[CHANGED]",
-                        Style::default()
-                            .fg(theme::DOWN)
-                            .add_modifier(Modifier::BOLD),
-                    ),
+                    PinClass::Changed => ("[CHANGED]", danger_chip),
+                    PinClass::Revoked => ("[REVOKED]", danger_chip),
                 };
                 lines.push(Line::from(vec![
                     Span::styled(format!("{:<20} ", row.key.key_type), text),
@@ -81,10 +112,16 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
                     Span::styled(chip, chip_style),
                 ]));
             }
-            if changed {
+            if poisoned {
                 lines.push(Line::from(""));
+                // Nothing at all is pinnable here, not just the flagged row:
+                // a contradicted pin makes the whole result set suspect.
                 lines.push(Line::from(Span::styled(
-                    "CHANGED keys are never overwritten here — inspect Known hosts (H) instead.",
+                    "Pinning is DISABLED for this result — these keys contradict a pin you already trust.",
+                    Style::default().fg(theme::DOWN).add_modifier(Modifier::BOLD),
+                )));
+                lines.push(Line::from(Span::styled(
+                    "Nothing is overwritten here. Inspect Known hosts (H) before trusting this host.",
                     Style::default().fg(theme::WARN),
                 )));
             }
@@ -118,18 +155,26 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
             }
         }
     }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        verify_hint(),
-        Style::default().fg(theme::WARN),
-    )));
+    // The verification reminder is pinned to the tail and never trimmed (AC8).
+    let tail = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            verify_hint(),
+            Style::default().fg(theme::WARN),
+        )),
+    ];
 
-    let content_w = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
-    let modal = centered(
-        (content_w + 4).clamp(46, area.width),
-        lines.len() as u16 + 2,
-        area,
-    );
+    let content_w = lines
+        .iter()
+        .chain(tail.iter())
+        .map(Line::width)
+        .max()
+        .unwrap_or(0) as u16;
+    let (width, height) = modal_size(content_w + 4, (lines.len() + tail.len()) as u16 + 2, area);
+    // Two rows go to the block's top/bottom border.
+    let lines = fit_body(lines, tail, height.saturating_sub(2) as usize);
+
+    let modal = centered(width, height, area);
     f.render_widget(Clear, modal);
     f.render_widget(
         Paragraph::new(Text::from(lines)).block(modal_block(&title, danger)),
@@ -163,6 +208,55 @@ mod tests {
             keys.contains(&"Esc"),
             "footer must offer Esc (cancel), got {keys:?}"
         );
+    }
+
+    #[test]
+    fn modal_size_never_exceeds_a_narrow_terminal() {
+        // given — a terminal narrower than the modal's preferred width, which a
+        // `u16::clamp(46, area.width)` would panic on (#46 review)
+        let area = Rect::new(0, 0, 40, 12);
+        // when — sizing content that wants to be wider than the terminal
+        let (w, h) = modal_size(80, 30, area);
+        // then — clamped down to what actually fits, no panic
+        assert_eq!((w, h), (40, 12));
+
+        // given / when — a terminal roomier than the content
+        let (w, h) = modal_size(20, 6, Rect::new(0, 0, 100, 40));
+        // then — floored at the preferred minimum width
+        assert_eq!((w, h), (MIN_MODAL_WIDTH, 6));
+    }
+
+    #[test]
+    fn fit_body_drops_randomart_before_the_verify_hint() {
+        // given — a body far taller than the modal (many randomart rows) and
+        // the AC8 reminder pinned to the tail
+        let body: Vec<Line<'static>> = (0..40).map(|i| Line::from(format!("art {i}"))).collect();
+        let tail = vec![Line::from(""), Line::from(verify_hint())];
+        // when — fitted into 10 rows
+        let fitted = fit_body(body, tail, 10);
+        // then — the reminder survives; the art is what got cut
+        assert_eq!(fitted.len(), 10);
+        assert_eq!(fitted.last().unwrap().to_string(), verify_hint());
+        assert!(
+            fitted
+                .iter()
+                .filter(|l| l.to_string().starts_with("art "))
+                .count()
+                < 40,
+            "randomart should be the part that is trimmed"
+        );
+    }
+
+    #[test]
+    fn fit_body_keeps_the_hint_even_with_no_room_for_the_body() {
+        // given — a modal so short only the tail can fit
+        let body = vec![Line::from("row")];
+        let tail = vec![Line::from(verify_hint())];
+        // when
+        let fitted = fit_body(body, tail, 1);
+        // then — the reminder is what is kept (AC8 is not optional)
+        assert_eq!(fitted.len(), 1);
+        assert_eq!(fitted[0].to_string(), verify_hint());
     }
 
     #[test]

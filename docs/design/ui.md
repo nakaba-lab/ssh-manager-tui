@@ -28,7 +28,8 @@ updated: 2026-07-27
 - **画面遷移**: `Screen` enum が駆動。モーダルは `App::prev_screen` + `open_overlay`/`close_overlay`。画面/モード追加時は `Screen`（app.rs）・dispatch（update.rs）・draw（ui/mod.rs）の 3 箇所を触る。
 - **主要画面**: ホスト一覧（検索・到達性列・詳細ペイン）／編集フォーム／保存前 diff ／vault ／SFTP ブラウザ（2 ペイン）／鍵マネージャ／known_hosts ／ヘルプ。キーバインドの一覧は [README](../../README.md#keybindings) が真実源。
 - **状態設計**: 空（0 件）・ローディング（到達性 `checking`）・エラー（`Toast`）・成功（自動失効 Toast）を各画面で扱う。
-- **ホスト鍵スキャンモーダル（#46・`Screen::KeyScan` オーバーレイ）**: 導線は ActionMenu の「Scan host key」（明示起動のみ。接続時の「host key not yet trusted」トーストに案内文言を追記するが接続フローには割り込まない＝案A）。状態は `KeyScanModal` の `Scanning`（`scanning <host> …`）→ `Results`（全鍵一括ピン）／`Error`（赤ボーダ表示）で、描画は `ui/keyscan.rs`・状態は `App::keyscan`（`KeyScanUi`）。各行に鍵種・SHA256・分類チップ（`[new]`／`[already trusted]`／`[CHANGED]`）を出し、randomart は 3 列ずつ並べる。`Changed` があるときは「ここでは上書きしない — Known hosts（`H`）で確認せよ」の警告を添える（上書き操作は置かない）。プロキシ経由ホストはモーダルを開かずトーストで拒否する。
+- **ホスト鍵スキャンモーダル（#46・`Screen::KeyScan` オーバーレイ）**: 導線は ActionMenu の「Scan host key」（明示起動のみ。接続時の「host key not yet trusted」トーストに案内文言を追記するが接続フローには割り込まない＝案A）。状態は `KeyScanModal` の `Scanning`（`scanning <host> …`）→ `Results`（全鍵一括ピン）／`Error`（赤ボーダ表示）で、描画は `ui/keyscan.rs`・状態は `App::keyscan`（`KeyScanUi`）。各行に鍵種・SHA256・分類チップ（`[new]`／`[already trusted]`／`[CHANGED]`／`[REVOKED]`）を出し、randomart は 3 列ずつ並べる。`Changed`／`Revoked` があるときは「**ピン留めは無効**（既存ピンと矛盾）— Known hosts（`H`）で確認せよ」を赤字で添える（上書き操作は置かない）。プロキシ経由ホストはモーダルを開かずトーストで拒否する。`y` が何も追記しなかった場合も理由を Toast で返す（無言で閉じない）。
+- **モーダルの寸法規律（#46）**: 幅は `modal_size` が端末幅まで切り下げる（`u16::clamp` は下限＞上限で panic するため使わない — 46 桁未満の端末で落ちた）。高さが足りないときは `fit_body` が **randomart から**削り、AC8 の検証文言（末尾固定）は決して切り落とさない。
 
   採択ワイヤーフレーム（案1: 全鍵一括ピン。案2 の鍵ごと選択式は、部分ピンだと鍵種ネゴ次第で TOFU が再発しうるため不採用）:
 

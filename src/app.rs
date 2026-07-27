@@ -211,10 +211,13 @@ pub struct KeyScanUi {
     pub lookup_key: String,
     /// The `host:port` target shown in the modal.
     pub target: String,
-    /// Existing user-file entries for `lookup_key` (plain host tokens only;
-    /// hashed entries cannot be compared and count as absent), for
-    /// classification.
+    /// The entries OpenSSH itself matches for `lookup_key` (via `ssh-keygen -F`
+    /// over the files `ssh -G` reported), used to classify the scan result.
     pub existing: Vec<KnownHostEntry>,
+    /// Where an approved pin is written: the host's effective known_hosts file,
+    /// NOT a hardcoded `~/.ssh/known_hosts` (which would no-op for a custom
+    /// `UserKnownHostsFile` while reporting success).
+    pub pin_target: std::path::PathBuf,
 }
 
 /// Where a [`Screen::PasswordConfirm`] modal was opened from — determines what its

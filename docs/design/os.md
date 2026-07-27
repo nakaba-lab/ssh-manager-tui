@@ -66,5 +66,6 @@ sequenceDiagram
 - **liveness index キーの脆さ**: ホスト追加/削除で index がずれるため `rebuild_hosts()` が liveness マップをクリアし再プローブ。
 - **keyscan は専用ワーカー（#46）**: keyscan は数秒かかるため UI スレッドで実行しない。`SftpSession::request` 型（thread＋`mpsc`・tick drain・`is_finished` reap）を踏襲する。liveness プールはジョブ型・ホスト index キーが固定で不適合、同期実行は `draw()` をブロックするため不採用。バジェットは二重（keyscan 自身の `-T 5` ＋ 8 秒の wall-clock kill）で、前者が通常経路・後者は wedge した子プロセスの backstop。
 - **ピン留めのホストトークンは `tofu_lookup_key` の出力に書き換え（#46）**: ゲート判定 `is_host_known`（`ssh-keygen -F`）と確実に一致させるため、keyscan の出力行のホスト部を `HostKeyAlias` 優先／非 22 番ポート `[host]:port` の検索キーに正規化して追記する。追記はプレーン形式（ハッシュ化しない）。
-- **分類の既存エントリはプレーンホストのみ（#46）**: ハッシュ化エントリ（`|1|…`）は照合できないため「無い」として扱う。最悪ケースはプレーン鍵の重複追記であり、警告の取りこぼしにはならない（`Changed` 判定はプレーン行に対しては従来どおり働く）。
-- **`append_entries` は `remove_entry` と同じ改行規律（#46）**: 既存ファイルの CRLF/LF を検出して踏襲し、末尾改行が無ければ追記前に補い、一時ファイル経由で原子的に差し替える。
+- **分類はホスト照合を OpenSSH に委ねる（#46）**: 既存ピンの取得は `matching_known_entries`（`ssh-keygen -F` を `ssh -G` が報告したファイル集合に対して実行）で行い、ホストトークンの自前比較はしない。**当初はプレーン行のみを自前照合していたが、これはハッシュ化エントリ（`HashKnownHosts yes`＝Debian/Ubuntu 既定）・カスタム `UserKnownHostsFile`・ワイルドカード・大小差をすべて取りこぼし、CHANGED 鍵を `[new]` と表示する fail-open だった**（実 OpenSSH で再現確認済み）。信頼ゲート `is_host_known` と同じ機構・同じファイル集合を使うことが正しさの条件。
+- **矛盾した結果は集合ごと汚染扱い（#46）**: いずれかの鍵が `Changed`／`Revoked` なら、同じスキャンの `New` 鍵も一切ピン留めしない（`PinClass::poisons_result`）。OpenSSH は known_hosts の**いずれかの**行に一致すれば接続を受理するため、別鍵種の攻撃者鍵を並べて追記させると正規のピンが警告なしに無力化される。
+- **`append_entries` は追記のみ（#46）**: 既存ファイルの CRLF/LF を踏襲し末尾改行を補ったうえで、`O_APPEND` で末尾だけに書く。全文書き換え（temp＋rename）は、読んだ直後のスナップショットを公開して他プロセスの追記を巻き戻すうえ、Windows では delete-before-rename の窓と宛先 ACL の消失を生むため採らない。

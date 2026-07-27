@@ -10,7 +10,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use super::binaries::tools;
-use super::known_hosts::{HostSpec, parse_line};
+use super::known_hosts::{HostSpec, KnownHostEntry, parse_line};
 
 /// The effective connection identity for an alias, parsed from `ssh -G`.
 /// `ssh -G` lowercases keys and leaves IdentityFile `~`/`%`-tokens UNexpanded.
@@ -225,6 +225,28 @@ pub fn tofu_lookup_key(rc: &ResolvedConfig) -> Option<String> {
 /// `ssh-keygen -F`, so hashed entries (`HashKnownHosts yes`, the Debian/Ubuntu
 /// default) match too. A `@revoked` / `@cert-authority` / wildcard / negation
 /// match does NOT count — auto-fill must only arm for a host the user pinned.
+/// Every `known_hosts` entry OpenSSH itself matches for `lookup_key` across
+/// `files`, markers included, via `ssh-keygen -F`. Delegating the match to
+/// OpenSSH is the point: hashed lines (`HashKnownHosts yes`), wildcard
+/// patterns and case-insensitive hostname comparison are all handled by the
+/// same matcher the connection will use, which hand-rolled token comparison
+/// gets wrong (#46 review). Callers classify on the returned `key_type` /
+/// `key_b64` / `marker`, never on the host field.
+pub fn matching_known_entries(lookup_key: &str, files: &[String]) -> Vec<KnownHostEntry> {
+    resolve_known_hosts_files(files)
+        .iter()
+        .flat_map(|file| entries_in_file(lookup_key, file))
+        .collect()
+}
+
+/// Shared file-list normalization for the known-hosts readers: expand the
+/// Windows `__PROGRAMDATA__` token, then coalesce `ssh -G`'s unquoted,
+/// space-split list back into paths that exist.
+fn resolve_known_hosts_files(files: &[String]) -> Vec<String> {
+    let expanded: Vec<String> = files.iter().map(|p| expand_known_hosts_path(p)).collect();
+    coalesce_existing_paths(&expanded, |p| std::path::Path::new(p).exists())
+}
+
 pub fn is_host_known(lookup_key: &str, files: &[String]) -> bool {
     // `ssh -G` prints the known-hosts file list with `~`/`%` already expanded but
     // UNQUOTED, and on Windows leaves the literal `__PROGRAMDATA__` token. Expand
@@ -236,8 +258,7 @@ pub fn is_host_known(lookup_key: &str, files: &[String]) -> bool {
     // it stat-misses and that file silently never contributes — a host pinned
     // only there won't arm. Rare; never wrongly arms. The default global file
     // (the `__PROGRAMDATA__` form) and all user files are handled.
-    let expanded: Vec<String> = files.iter().map(|p| expand_known_hosts_path(p)).collect();
-    coalesce_existing_paths(&expanded, |p| std::path::Path::new(p).exists())
+    resolve_known_hosts_files(files)
         .iter()
         .any(|file| known_in_file(lookup_key, file))
 }
@@ -290,7 +311,10 @@ fn coalesce_existing_paths(words: &[String], exists: impl Fn(&str) -> bool) -> V
     out
 }
 
-fn known_in_file(lookup_key: &str, file: &str) -> bool {
+/// The entries `ssh-keygen -F` reports for `lookup_key` in one file, parsed but
+/// unfiltered (markers and wildcard hosts included — callers decide). Empty on
+/// any failure: exit 1 = not found / file missing.
+fn entries_in_file(lookup_key: &str, file: &str) -> Vec<KnownHostEntry> {
     let output = match Command::new(&tools().ssh_keygen)
         .arg("-F")
         .arg(lookup_key)
@@ -302,18 +326,25 @@ fn known_in_file(lookup_key: &str, file: &str) -> bool {
         .output()
     {
         Ok(o) => o,
-        Err(_) => return false,
+        Err(_) => return Vec::new(),
     };
     if !output.status.success() {
-        return false; // exit 1 = not found / file missing
+        return Vec::new();
     }
     // ssh-keygen -F prints `# Host <key> found: line N` comments plus the
-    // matching line(s). Accept only a marker-free, non-wildcard entry — but a
-    // HASHED match (the line printed as `|1|…`) is a legitimate single-host pin
-    // and MUST count, otherwise `HashKnownHosts yes` (the Debian/Ubuntu default)
-    // would silently defeat the whole gate.
-    let text = String::from_utf8_lossy(&output.stdout);
-    text.lines().filter_map(|l| parse_line(l, 0)).any(|e| {
+    // matching line(s); `parse_line` drops the comments.
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|l| parse_line(l, 0))
+        .collect()
+}
+
+fn known_in_file(lookup_key: &str, file: &str) -> bool {
+    // Accept only a marker-free, non-wildcard entry — but a HASHED match (the
+    // line printed as `|1|…`) is a legitimate single-host pin and MUST count,
+    // otherwise `HashKnownHosts yes` (the Debian/Ubuntu default) would silently
+    // defeat the whole gate.
+    entries_in_file(lookup_key, file).iter().any(|e| {
         e.marker.is_none()
             && match &e.host {
                 // ssh-keygen never hashes wildcards/negations or markers (those

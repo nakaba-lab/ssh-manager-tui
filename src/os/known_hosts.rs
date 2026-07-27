@@ -155,14 +155,24 @@ pub fn remove_entry(line_no: usize, raw: &str) -> io::Result<()> {
 
 /// Append entry lines to a known_hosts file (#46 host-key pinning).
 ///
-/// Preservation contract (mirrors `remove_entry`'s newline handling):
+/// Preservation contract:
 /// - the file's existing newline flavor is detected and reused (CRLF file →
 ///   CRLF appends, LF file → LF appends);
 /// - a missing trailing newline on the existing content is repaired BEFORE
 ///   appending (so the first appended entry never glues onto the last line);
-/// - a missing file is created (LF, trailing newline);
-/// - the write replaces the file atomically (no torn known_hosts on crash).
+/// - a missing file is created owner-only (LF, trailing newline).
+///
+/// Unlike `remove_entry` this **appends in place** rather than rewriting the
+/// file through a temp + rename. Appending is what makes the difference
+/// (#46 review): a whole-file rewrite would publish a snapshot read moments
+/// earlier — silently reverting any line OpenSSH or another sshm instance added
+/// in between — and on Windows the delete-before-rename step both opens a
+/// window where known_hosts does not exist and drops the destination's ACL.
+/// An append touches only the tail, so other writers' lines, the file's
+/// permissions and its identity all survive.
 pub fn append_entries(path: &Path, lines: &[String]) -> io::Result<()> {
+    use std::io::Write;
+
     let existing = match std::fs::read_to_string(path) {
         Ok(c) => Some(c),
         Err(e) if e.kind() == io::ErrorKind::NotFound => None,
@@ -172,8 +182,12 @@ pub fn append_entries(path: &Path, lines: &[String]) -> io::Result<()> {
         Some(c) if c.contains("\r\n") => "\r\n",
         _ => "\n",
     };
-    let mut out = existing.unwrap_or_default();
-    if !out.is_empty() && !out.ends_with('\n') {
+    let needs_newline = existing
+        .as_ref()
+        .is_some_and(|c| !c.is_empty() && !c.ends_with('\n'));
+
+    let mut out = String::new();
+    if needs_newline {
         out.push_str(newline);
     }
     for line in lines {
@@ -181,19 +195,14 @@ pub fn append_entries(path: &Path, lines: &[String]) -> io::Result<()> {
         out.push_str(newline);
     }
 
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("known_hosts");
-    let tmp = dir.join(format!(".{name}.tmp"));
-    std::fs::write(&tmp, out.as_bytes())?;
-    #[cfg(windows)]
-    if path.exists() {
-        let _ = std::fs::remove_file(path);
-    }
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+    // A fresh known_hosts is created owner-only; an existing one keeps whatever
+    // permissions the user (or OpenSSH) already gave it.
+    let mut file = match existing {
+        Some(_) => std::fs::OpenOptions::new().append(true).open(path)?,
+        None => crate::secure_fs::create_new_private(path)?,
+    };
+    file.write_all(out.as_bytes())?;
+    file.sync_all()
 }
 
 #[cfg(test)]

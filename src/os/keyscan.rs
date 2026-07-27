@@ -77,6 +77,21 @@ pub enum PinClass {
     /// An existing entry with the same type but a DIFFERENT base64 —
     /// HOST KEY CHANGED. Warn only; never offer a one-key overwrite.
     Changed,
+    /// A `@revoked` entry matches this exact key: the user explicitly marked it
+    /// compromised. Never presentable as trusted, never pinnable.
+    Revoked,
+}
+
+impl PinClass {
+    /// True for a class that makes the WHOLE scan result untrustworthy: a
+    /// contradicted or revoked key means the channel is showing something that
+    /// disagrees with what the user already pinned, so no sibling key from the
+    /// same scan may be pinned either (#46 review: an attacker's second key of
+    /// another type would otherwise be appended next to a genuine pin, and
+    /// OpenSSH accepts ANY matching entry — defeating the pin with no warning).
+    pub fn poisons_result(self) -> bool {
+        matches!(self, PinClass::Changed | PinClass::Revoked)
+    }
 }
 
 /// A completed background scan, reported over the session channel.
@@ -161,17 +176,32 @@ pub fn pinned_lines(keys: &[ScannedKey], lookup_key: &str) -> Vec<String> {
         .collect()
 }
 
-/// Classify one scanned key against the existing entries for this host:
-/// same type + same base64 anywhere → `AlreadyTrusted` (a match beats a
-/// stale mismatch line); same type only → `Changed`; no entry of this
-/// type → `New`.
+/// Classify one scanned key against the entries OpenSSH itself matches for this
+/// host (`resolve::matching_known_entries` — so hashed / wildcard / case
+/// matching is OpenSSH's, not ours).
+///
+/// Marker handling is load-bearing (#46 review):
+/// - `@revoked` matching this exact key → `Revoked`. Presenting a revoked key
+///   as "already trusted" would be the strongest possible false reassurance in
+///   the one state this feature exists to make honest.
+/// - `@cert-authority` lines are CA delegations, not host-key pins, so they
+///   take no part in classification (a CA line must never make a scanned host
+///   key read as `AlreadyTrusted`, nor as `Changed`).
 pub fn classify_key(key: &ScannedKey, existing: &[KnownHostEntry]) -> PinClass {
+    let same_key = |e: &&KnownHostEntry| e.key_type == key.key_type && e.key_b64 == key.key_b64;
     if existing
         .iter()
-        .any(|e| e.key_type == key.key_type && e.key_b64 == key.key_b64)
+        .filter(|e| e.marker.as_deref() == Some("@revoked"))
+        .any(|e| same_key(&e))
     {
+        return PinClass::Revoked;
+    }
+    // Pins only: markers are not host-key pins (`is_host_known` excludes them
+    // from the trust gate for the same reason).
+    let pins = || existing.iter().filter(|e| e.marker.is_none());
+    if pins().any(|e| same_key(&e)) {
         PinClass::AlreadyTrusted
-    } else if existing.iter().any(|e| e.key_type == key.key_type) {
+    } else if pins().any(|e| e.key_type == key.key_type) {
         PinClass::Changed
     } else {
         PinClass::New
@@ -287,12 +317,19 @@ fn run_bounded(cmd: &mut Command, what: &str) -> io::Result<String> {
 /// position (ssh-keygen emits one block per file line, in order).
 fn fingerprint_lines(lines: &[KeyscanLine]) -> io::Result<Vec<ScannedKey>> {
     let tmp = std::env::temp_dir().join(secure_fs::temp_name(".sshm-keyscan")?);
-    {
+    // Written in a closure so a mid-write failure still reaches the cleanup
+    // below rather than leaking the temp file (#46 review).
+    let written = (|| {
         use std::io::Write;
         let mut file = secure_fs::create_new_private(&tmp)?;
         for l in lines {
             writeln!(file, "{} {} {}", l.host, l.key_type, l.key_b64)?;
         }
+        file.sync_all()
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
     }
     let result = run_bounded(
         Command::new(&tools().ssh_keygen)
@@ -492,6 +529,41 @@ mod tests {
                 "({key_type}, {b64})"
             );
         }
+    }
+
+    #[test]
+    fn classify_key_revoked_marker_is_never_trusted() {
+        // given — the user explicitly revoked a compromised key (#46 review)
+        let existing: Vec<KnownHostEntry> = ["@revoked db.example ssh-ed25519 EVILKEY"]
+            .iter()
+            .enumerate()
+            .filter_map(|(i, l)| parse_line(l, i))
+            .collect();
+        // when — the scan returns that very key (attacker still in path)
+        let class = classify_key(&sk("ssh-ed25519", "EVILKEY"), &existing);
+        // then — surfaced as revoked, never as "already trusted"
+        assert_eq!(class, PinClass::Revoked);
+        assert!(class.poisons_result(), "a revoked key must block pinning");
+    }
+
+    #[test]
+    fn classify_key_ignores_cert_authority_lines() {
+        // given — a CA delegation line, which is not a host-key pin
+        let existing: Vec<KnownHostEntry> = ["@cert-authority *.example ssh-ed25519 CAKEY"]
+            .iter()
+            .enumerate()
+            .filter_map(|(i, l)| parse_line(l, i))
+            .collect();
+        // when / then — a scanned key of the same type is still unpinned (New),
+        // and the CA's own key material must not read as trusted either
+        assert_eq!(
+            classify_key(&sk("ssh-ed25519", "HOSTKEY"), &existing),
+            PinClass::New
+        );
+        assert_eq!(
+            classify_key(&sk("ssh-ed25519", "CAKEY"), &existing),
+            PinClass::New
+        );
     }
 
     #[test]
