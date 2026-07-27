@@ -29,8 +29,10 @@ flowchart TB
     hostref -->|Included| refuse[編集/削除キーは<br/>read-only トーストで拒否]
     main --> scan[App::ssh_g_exec_risk<br/>has_match_exec を全ファイルに<br/>＋ blind_spot で fail-safe]
     incparse --> scan
-    trust[autofill_client_trusted<br/>System32 クライアント信頼（#73）] --> gates
-    scan --> gates[ssh -G 3 経路<br/>接続 autofill / SFTP arm / インスペクタ<br/>① trust → ② exec-risk の 2 段]
+    trust[autofill_client_trusted<br/>System32 クライアント信頼] -->|spawn 前の前段（#73）| early[インスペクタ / SFTP arm<br/>untrusted なら ssh -G を実行しない]
+    trust -.->|arming 判定で消費（spawn は止めない）| conn[接続 autofill<br/>秘密の解放だけを差し止め]
+    scan --> early
+    scan --> conn
 ```
 
 - **`src/config/includes.rs`（新規・ヘッドレス・ratatui 依存ゼロ）**: `expand(main: &SshConfig, base_dir: &Path, home: &Path) -> Expansion`（`Expansion { hosts: Vec<IncludedHost>, texts: Vec<String> }`）。`texts` は全ファイル走査（`Match exec`）用に、読んだ各 included ファイルの生テキストを保持する（ホスト 0 件のファイルも含む）。
