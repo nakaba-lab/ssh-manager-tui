@@ -28,7 +28,7 @@ updated: 2026-07-27
 - **画面遷移**: `Screen` enum が駆動。モーダルは `App::prev_screen` + `open_overlay`/`close_overlay`。画面/モード追加時は `Screen`（app.rs）・dispatch（update.rs）・draw（ui/mod.rs）の 3 箇所を触る。
 - **主要画面**: ホスト一覧（検索・到達性列・詳細ペイン）／編集フォーム／保存前 diff ／vault ／SFTP ブラウザ（2 ペイン）／鍵マネージャ／known_hosts ／ヘルプ。キーバインドの一覧は [README](../../README.md#keybindings) が真実源。
 - **状態設計**: 空（0 件）・ローディング（到達性 `checking`）・エラー（`Toast`）・成功（自動失効 Toast）を各画面で扱う。
-- **レスポンシブ**: `responsive_split` が `WIDE_MIN_WIDTH`（90 桁）以上で横並び・未満で縦積み。フッターは 80 桁以内で描ける（`footers_fit_80_cols` テスト）。
+- **レスポンシブ**: `responsive_split` が `WIDE_MIN_WIDTH`（90 桁）以上で横並び・未満で縦積み。フッターは 80 桁以内で描ける（`footers_fit_80_cols` テスト）。**フッターは全画面分を定数として `ALL_FOOTERS` に列挙し、ガードが全部を検査する**（#47 のレビュー時、定数 2 つだけを見ていた旧ガードが Key manager 82 桁・Vault 93 桁の超過を見逃していた）。モーダル内の可変長リスト（同期モーダルの対象ホスト等）は件数を丸めて固定高に収める。
 - **配色/コントラスト**: `theme.rs` の Tokyo Night パレットに集約。
 
 ### 鍵パスフレーズの追加・変更（#47）

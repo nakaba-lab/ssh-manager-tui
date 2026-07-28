@@ -48,6 +48,42 @@ const SFTP_BROWSER_FOOTER: &[(&str, &str)] = &[
     ("Esc", "back"),
 ];
 
+/// Key-manager footer hints (must render within 80 columns).
+const KEY_MANAGER_FOOTER: &[(&str, &str)] = &[
+    ("j/k", "move"),
+    ("g", "gen"),
+    ("p", "passphrase"),
+    ("y", "copy pub"),
+    ("s", "set-id"),
+    ("d", "del"),
+    ("Esc", "back"),
+];
+
+/// Vault footer hints (must render within 80 columns). Like [`LIST_FOOTER`] this
+/// carries only the most-used keys: the password-auto-fill toggle (`p`) lives in
+/// the help modal, because listing it here put the footer at 93 cols — silently
+/// clipping `Esc back` on an 80-column console (found reviewing #47).
+const VAULT_FOOTER: &[(&str, &str)] = &[
+    ("j/k", "move"),
+    ("a", "add"),
+    ("e", "edit"),
+    ("y", "copy"),
+    ("d", "del"),
+    ("Space", "reveal"),
+    ("L", "lock"),
+    ("Esc", "back"),
+];
+
+/// Every single-line footer, so the 80-column guard covers all of them rather
+/// than an allowlist that new screens silently escape (see `footers_fit_80_cols`).
+#[cfg(test)]
+const ALL_FOOTERS: &[(&str, &[(&str, &str)])] = &[
+    ("list", LIST_FOOTER),
+    ("sftp browser", SFTP_BROWSER_FOOTER),
+    ("key manager", KEY_MANAGER_FOOTER),
+    ("vault", VAULT_FOOTER),
+];
+
 /// The non-modal screen rendered underneath the current screen (which may be a
 /// modal overlay).
 fn base_screen(app: &App) -> Screen {
@@ -286,15 +322,7 @@ fn draw_footer(f: &mut Frame, app: &App, base: &Screen, area: Rect) {
             ("Ctrl-S", "save"),
             ("Esc", "back"),
         ]),
-        (Screen::KeyManager, _) => widgets::footer_hints(&[
-            ("j/k", "move"),
-            ("g", "generate"),
-            ("p", "passphrase"),
-            ("y", "copy pub"),
-            ("s", "set-id"),
-            ("d", "delete"),
-            ("Esc", "back"),
-        ]),
+        (Screen::KeyManager, _) => widgets::footer_hints(KEY_MANAGER_FOOTER),
         (Screen::KnownHosts, a) if a.kh_searching => {
             widgets::footer_hints(&[("type", "filter"), ("Esc", "clear")])
         }
@@ -304,17 +332,7 @@ fn draw_footer(f: &mut Frame, app: &App, base: &Screen, area: Rect) {
             ("d", "delete"),
             ("Esc", "back"),
         ]),
-        (Screen::Vault, _) => widgets::footer_hints(&[
-            ("j/k", "move"),
-            ("a", "add"),
-            ("e", "edit"),
-            ("y", "copy"),
-            ("d", "del"),
-            ("Space", "reveal"),
-            ("p", "pw-autofill"),
-            ("L", "lock"),
-            ("Esc", "back"),
-        ]),
+        (Screen::Vault, _) => widgets::footer_hints(VAULT_FOOTER),
         (Screen::SftpBrowser, _) => widgets::footer_hints(SFTP_BROWSER_FOOTER),
         _ => widgets::footer_hints(&[("?", "help"), ("q", "quit")]),
     };
@@ -359,18 +377,14 @@ mod tests {
 
     #[test]
     fn footers_fit_80_cols() {
-        // The host-list and SFTP-browser footers render on a single, non-wrapping
-        // line; a >80-col footer silently clips its trailing hints on an 80-column
-        // terminal (the regression this guards against).
-        assert!(
-            widgets::footer_hints(LIST_FOOTER).width() <= 80,
-            "list footer is {} cols",
-            widgets::footer_hints(LIST_FOOTER).width()
-        );
-        assert!(
-            widgets::footer_hints(SFTP_BROWSER_FOOTER).width() <= 80,
-            "sftp browser footer is {} cols",
-            widgets::footer_hints(SFTP_BROWSER_FOOTER).width()
-        );
+        // Footers render on a single, non-wrapping line; a >80-col footer silently
+        // clips its trailing hints on an 80-column terminal (cmd.exe's default) —
+        // the regression this guards against. Every screen's footer is listed here,
+        // not just two: the earlier two-constant version let the Key-manager footer
+        // grow to 82 cols (and the Vault one to 93) without failing (review #47).
+        for (name, hints) in ALL_FOOTERS {
+            let width = widgets::footer_hints(hints).width();
+            assert!(width <= 80, "{name} footer is {width} cols");
+        }
     }
 }

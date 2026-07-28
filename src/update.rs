@@ -1772,8 +1772,7 @@ fn run_ssh_keygen_inline(
     match status {
         Ok(s) if s.success() => Ok(true),
         Ok(s) => {
-            let (msg, is_err) = describe_exit("ssh-keygen", &s)
-                .unwrap_or_else(|| ("ssh-keygen failed".to_string(), true));
+            let (msg, is_err) = keygen_exit_toast(s.code());
             app.toast(msg, is_err);
             Ok(false)
         }
@@ -1782,6 +1781,21 @@ fn run_ssh_keygen_inline(
             Ok(false)
         }
     }
+}
+
+/// How to report a non-zero `ssh-keygen` exit. Deliberately NOT `describe_exit`:
+/// that one is written for ssh/sftp, where a non-255 exit code is the *remote
+/// command's* status and therefore not an sshm error (auto-dismissing toast).
+/// ssh-keygen has no remote command — every non-zero exit means the operation
+/// failed (a mistyped passphrase confirmation exits 1), and `restore_tui` clears
+/// its diagnostics off the console, so the toast is the only thing left. It must
+/// be a sticky error (AC1). Pure, so the classification is unit-tested.
+fn keygen_exit_toast(code: Option<i32>) -> (String, bool) {
+    let msg = match code {
+        Some(c) => format!("ssh-keygen failed (exit {c})"),
+        None => "ssh-keygen was terminated by a signal".to_string(),
+    };
+    (msg, true)
 }
 
 /// The `p` action on the key manager (Issue #47): run `ssh-keygen -p` inline to
@@ -1913,44 +1927,72 @@ fn submit_passphrase_sync(app: &mut App) {
     // Copy the typed passphrase into a `Secret` (scrubbed on drop) rather than a
     // bare String, so the per-entry copies never accumulate in the clear.
     let secret: Secret = app.passphrase_sync.secret.as_str().into();
-    let mut updated = 0usize;
-    let mut failure = None;
+    let mut outcome = Ok(0usize);
     // Scoped so the vault borrow ends before the toasts below take `app` again.
     if let Some(v) = app.vault.as_mut() {
-        for host in &hosts {
-            let Some(idx) = v
+        let plan = plan_passphrase_sync(v, &hosts);
+        // Snapshot what we are about to overwrite so a failed write can be undone
+        // in memory too — otherwise a rejected save would leave the in-memory
+        // vault holding the new passphrase while the file still has the old one.
+        let previous: Vec<VaultEntry> = plan.iter().map(|(i, _)| v.entries[*i].clone()).collect();
+        for (idx, note) in &plan {
+            let entry = VaultEntry {
+                host: v.entries[*idx].host.clone(),
+                kind: SecretKind::Passphrase,
+                secret: secret.clone(),
+                note: note.clone(),
+            };
+            v.upsert(Some(*idx), entry);
+        }
+        // ONE write for the whole batch: `save` replaces the file atomically, so
+        // either every affected host moves to the new passphrase or none does.
+        // Saving per entry would leave a partially-migrated vault behind on an
+        // ENOSPC/EACCES mid-loop, with no record of where it stopped.
+        outcome = match v.save(&path) {
+            Ok(()) => Ok(plan.len()),
+            Err(e) => {
+                for ((idx, _), old) in plan.iter().zip(previous) {
+                    v.upsert(Some(*idx), old);
+                }
+                Err(e)
+            }
+        };
+    }
+    match outcome {
+        // Keep the modal open so the typed passphrase isn't lost on a transient
+        // save failure; nothing was written, so a retry is safe.
+        Err(e) => app.toast(format!("{e}"), true),
+        Ok(updated) => {
+            app.passphrase_sync = PassphraseSyncForm::default();
+            close_overlay(app);
+            app.toast(
+                if updated == 0 {
+                    "no stored passphrases left to update".to_string()
+                } else {
+                    format!("vault passphrase updated for {updated} host(s)")
+                },
+                false,
+            );
+        }
+    }
+}
+
+/// Which vault entries a bulk sync will rewrite: the index of each affected
+/// host's entry and the note to carry over. Only `Passphrase` entries qualify —
+/// a host's login `Password` must never be overwritten with a key passphrase —
+/// and a host whose entry vanished between detection and submit is skipped.
+/// Pure, so the selection is unit-tested apart from the file write.
+fn plan_passphrase_sync(vault: &Vault, hosts: &[String]) -> Vec<(usize, String)> {
+    hosts
+        .iter()
+        .filter_map(|host| {
+            vault
                 .entries
                 .iter()
                 .position(|e| e.kind == SecretKind::Passphrase && e.host == *host)
-            else {
-                continue; // entry vanished since detection (e.g. deleted) — skip
-            };
-            let entry = VaultEntry {
-                host: host.clone(),
-                kind: SecretKind::Passphrase,
-                secret: secret.clone(),
-                note: v.entries[idx].note.clone(),
-            };
-            if let Err(e) = v.upsert_and_save(Some(idx), entry, &path) {
-                failure = Some(e);
-                break;
-            }
-            updated += 1;
-        }
-    }
-    if let Some(e) = failure {
-        // Keep the modal open so the typed passphrase isn't lost on a transient
-        // save failure; already-saved entries stay updated (upsert_and_save
-        // rolls back only the failing entry).
-        app.toast(format!("{e}"), true);
-        return;
-    }
-    app.passphrase_sync = PassphraseSyncForm::default();
-    close_overlay(app);
-    app.toast(
-        format!("vault passphrase updated for {updated} host(s)"),
-        false,
-    );
+                .map(|idx| (idx, vault.entries[idx].note.clone()))
+        })
+        .collect()
 }
 
 /// The form screen a key/host picker returns to, per its [`PickOrigin`].
@@ -5329,6 +5371,145 @@ mod tests {
             msg.contains("unverified"),
             "toast must warn the pair status may now show unverified: {msg}"
         );
+    }
+
+    /// keygen_exit_toast — ssh-keygen の非ゼロ終了は全て sticky なエラーにする
+    #[test]
+    fn keygen_exit_toast_marks_every_nonzero_exit_as_sticky_error() {
+        // given: describe_exit_code は ssh 用の意味付け（255 以外の非ゼロ＝
+        // リモートコマンドの終了コード＝非エラー）なので、そのまま流用できない。
+        // ssh-keygen では非ゼロは全て「操作が失敗した」を意味する。
+        let cases: &[(Option<i32>, bool)] = &[
+            (Some(1), true),   // 新パスフレーズの確認不一致など
+            (Some(255), true), // 鍵を読めない・現在のパスフレーズ誤り
+            (Some(2), true),
+            (None, true), // シグナルで終了
+        ];
+
+        for (code, expect_error) in cases {
+            // when
+            let (msg, is_err) = keygen_exit_toast(*code);
+
+            // then
+            assert_eq!(is_err, *expect_error, "code {code:?} → {msg}");
+            assert!(
+                !msg.contains("connection"),
+                "ssh 用の文言を流用しないこと: {msg}"
+            );
+        }
+    }
+
+    /// plan_passphrase_sync — Passphrase エントリだけを対象にし note を保存する
+    #[test]
+    fn plan_passphrase_sync_targets_only_passphrase_entries() {
+        // given: 同じ host に Password と Passphrase が両方ある（Password が先）
+        let mut vault = Vault::create("pw").unwrap();
+        for (host, kind, note) in [
+            ("web1", SecretKind::Password, "login"),
+            ("web1", SecretKind::Passphrase, "key"),
+            ("db", SecretKind::Passphrase, "dbkey"),
+        ] {
+            vault.upsert(
+                None,
+                VaultEntry {
+                    host: host.into(),
+                    kind,
+                    secret: "old".into(),
+                    note: note.into(),
+                },
+            );
+        }
+
+        // when: 検出済みホストに、その後 vault から消えた host も混ぜる
+        let plan = plan_passphrase_sync(
+            &vault,
+            &["web1".to_string(), "db".to_string(), "gone".to_string()],
+        );
+
+        // then: Passphrase エントリの index のみ・note は据え置き・消えた host は飛ばす
+        assert_eq!(plan.len(), 2, "plan: {plan:?}");
+        for (idx, note) in &plan {
+            assert_eq!(vault.entries[*idx].kind, SecretKind::Passphrase);
+            assert_eq!(note, &vault.entries[*idx].note);
+        }
+        assert_eq!(plan[0].1, "key", "ログインパスワードを掴んではならない");
+    }
+
+    /// handle_passphrase_sync — Esc は入力を捨てて元の画面へ戻る（AC4 のスキップ）
+    #[test]
+    fn handle_passphrase_sync_esc_discards_the_typed_secret() {
+        // given
+        let mut app = app_fixture("Host h\n  HostName h\n");
+        app.screen = Screen::KeyManager;
+        open_overlay(&mut app, Screen::PassphraseSync);
+        app.passphrase_sync.secret = "typed-secret".to_string();
+        app.passphrase_sync.hosts = vec!["h".to_string()];
+
+        // when
+        handle_passphrase_sync(&mut app, plain_key(KeyCode::Esc));
+
+        // then
+        assert_eq!(app.screen, Screen::KeyManager, "戻り先は元の画面");
+        assert!(
+            app.passphrase_sync.secret.is_empty(),
+            "入力した秘密を残さない"
+        );
+        assert!(app.passphrase_sync.hosts.is_empty());
+    }
+
+    /// offer_passphrase_sync — 陳腐化エントリが無ければモーダルを出さない（AC5）
+    #[test]
+    fn offer_passphrase_sync_opens_nothing_without_stale_entries() {
+        // given: vault はアンロック済みだが、この鍵を使うホストのエントリは無い
+        let mut app = app_fixture("Host h\n  HostName h\n  IdentityFile ~/.ssh/id_a\n");
+        app.screen = Screen::KeyManager;
+        app.vault = Some(Vault::create("pw").unwrap());
+
+        // when
+        offer_passphrase_sync(&mut app, std::path::PathBuf::from("/home/u/.ssh/id_a"));
+
+        // then
+        assert_eq!(app.screen, Screen::KeyManager, "モーダルを開かない");
+        assert!(app.passphrase_sync_pending.is_none());
+    }
+
+    /// handle_gen_wizard — BackTab は 4 フィールドを逆順に巡回する
+    #[test]
+    fn handle_gen_wizard_cycles_four_fields_backwards() {
+        // given
+        let mut app = app_fixture("Host h\n  HostName h\n");
+        app.screen = Screen::GenerateKey {
+            origin: GenOrigin::KeyManager,
+        };
+
+        // when / then: type → passphrase → comment → filename → type
+        for expected in [3usize, 2, 1, 0] {
+            handle_gen_wizard(&mut app, plain_key(KeyCode::BackTab), GenOrigin::KeyManager);
+            assert_eq!(app.gen_wizard.field, expected);
+        }
+    }
+
+    /// handle_gen_wizard — ヒント行が案内する Space でも passphrase をトグルできる
+    #[test]
+    fn handle_gen_wizard_space_toggles_passphrase() {
+        use crate::os::keys::GenPassphrase;
+
+        // given
+        let mut app = app_fixture("Host h\n  HostName h\n");
+        app.screen = Screen::GenerateKey {
+            origin: GenOrigin::KeyManager,
+        };
+        app.gen_wizard.field = 3;
+
+        // when
+        handle_gen_wizard(
+            &mut app,
+            plain_key(KeyCode::Char(' ')),
+            GenOrigin::KeyManager,
+        );
+
+        // then
+        assert_eq!(app.gen_wizard.passphrase, GenPassphrase::Interactive);
     }
 
     /// passphrase_sync_rejection — 一括保存も単体保存と同じ「配送できない秘密」規律で拒否する

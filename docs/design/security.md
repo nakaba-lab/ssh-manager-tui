@@ -55,9 +55,12 @@ flowchart TD
 
 `ssh-keygen -p` によるパスフレーズ追加・変更が成功すると、vault の該当 `Passphrase` エントリは陳腐化する（放置すると接続時オートフィルが旧パスフレーズを出して失敗する）。同期フロー（実装は `update.rs` の `offer_passphrase_sync`／`submit_passphrase_sync`）:
 
-1. **検出**（`keys::stale_passphrase_hosts`・純粋）: 変更した鍵のパス（先頭 `~/` を home で展開して比較）を IdentityFile に持つホストを `HostView` 射影から逆引きし、vault の `Passphrase` エントリと**エイリアス完全一致**で突合する（`match_vault_kinds` と同じ照合規則＝glob パターンは vault エントリに一致しないので陳腐化候補にもならない）。`ssh -G` の全ホスト実行はしない（spawn 数過多・起動遅延を避け、config 射影で決定的に逆引きする）。
+1. **検出**（`keys::stale_passphrase_hosts`・純粋）: 変更した鍵を使うホストを `HostView` 射影から逆引きし、vault の `Passphrase` エントリと突合する。`ssh -G` の全ホスト実行はしない（spawn 数過多・`Match exec` の再実行を避け、config 射影で決定的に逆引きする）。**照合規則は接続時オートフィルと一致させること**が要（ずれると「接続時には使われるのに陳腐化検出では拾えない」＝旧パスフレーズが放出され続ける穴になる。#47 のレビューで実際に検出された）:
+   - **突合キーは `Host` 行の非 glob パターン全て**（先頭の alias だけではない）。`match_vault_kinds`（`vault.rs`）・`gather_secrets`（`update.rs`）と同じ走査。glob（`* ? !`）は vault エントリに一致しえないので候補にしない。
+   - **パス比較は Windows で大小・区切りを畳む**（`keys::same_key_path`）。接続時の `askpass::paths_equal` と同じ扱いで、手書きの `c:\users\…` 表記でも一致する。
+   - **IdentityFile 未宣言のホストは OpenSSH の既定 identity を暗黙候補にする**（`DEFAULT_IDENTITY_FILES`）。`Host x` ＋ `HostName` だけという最も一般的な構成を取りこぼさないため。
 2. **ロック中は検出前にアンロックへ迂回**: ロック中はエントリを読めず陳腐化の有無すら判定できないため、`App::passphrase_sync_pending` に鍵パスを置いて `VaultUnlock` を開き、アンロック成功後に検出をやり直す。Esc（アンロック拒否）は再開マーカーを破棄して黙って終わる＝同期は強制しない。
-3. **一括更新**: 一致があれば一括更新モーダル（`Screen::PassphraseSync`）で新パスフレーズを **1 回**入力し、該当全ホストのエントリへ `upsert_and_save`。入力は `PassphraseSyncForm`（Drop でスクラブ・`Debug` redact）に保持し、各エントリへは `Secret` のクローンとして渡す（平文 String を撒かない）。モーダル表示中にアイドル自動ロックが挟まった場合は**何も更新せず**警告して閉じる（`consent_should_be_recorded` と同じロック境界）。
+3. **一括更新**: 一致があれば一括更新モーダル（`Screen::PassphraseSync`）で新パスフレーズを **1 回**入力する。対象の選定は `plan_passphrase_sync`（純粋）が行い、**`Passphrase` エントリだけ**を選ぶ（同一ホストの login `Password` を鍵パスフレーズで上書きしない）。書き込みは全件をメモリ上で差し替えてから **`save` を 1 回**だけ呼ぶ（`atomic_write` が原子的なので「一部のホストだけ新パスフレーズ」という中途半端な状態が原理的に起きない。保存失敗時はメモリ側も退避から巻き戻す）。入力は `PassphraseSyncForm`（Drop でスクラブ・`Debug` redact）に保持し、各エントリへは `Secret` のクローンとして渡す（平文 String を撒かない）。保存前に単体保存と同じ「配送できない秘密」検証（改行/CR・1023 バイト超）を通す。モーダル表示中にアイドル自動ロックが挟まった場合は**何も更新せず**警告して閉じる（`consent_should_be_recorded` と同じロック境界）。
 4. **限界（受容済み）**: sshm は ssh-keygen の対話を捕捉しないため、モーダル入力値が ssh-keygen に渡した値と一致する保証はない（typo リスク）。誤入力時はオートフィル失敗として顕在化する＝従来（陳腐化放置）と同じ失敗モードであり悪化はしない。
 
 ## 主要な設計判断（現行の理由）

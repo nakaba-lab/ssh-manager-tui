@@ -415,6 +415,19 @@ pub fn generate_key_args(
     args
 }
 
+/// Identity files OpenSSH tries when a host declares no `IdentityFile` of its
+/// own. A host on the defaults still auto-fills its passphrase at connect time,
+/// so its stored secret goes stale like any other — leaving them out would miss
+/// the most common config of all (`Host x` with just a `HostName`).
+const DEFAULT_IDENTITY_FILES: &[&str] = &[
+    "id_rsa",
+    "id_ecdsa",
+    "id_ecdsa_sk",
+    "id_ed25519",
+    "id_ed25519_sk",
+    "id_dsa",
+];
+
 /// Expand a leading `~/` against `home`; anything else is taken verbatim.
 fn expand_tilde(raw: &str, home: &Path) -> PathBuf {
     match raw.strip_prefix("~/") {
@@ -423,23 +436,55 @@ fn expand_tilde(raw: &str, home: &Path) -> PathBuf {
     }
 }
 
-/// Aliases of hosts whose IdentityFile (with a leading `~/` expanded against
-/// `home`) equals `key_path`. Pure.
+/// Whether two key paths name the same file. Windows folds case and treats
+/// `/`≡`\`, so a hand-written lower-case `c:\users\…` config entry really does
+/// reach the same key — the connect-time auto-fill already compares this way
+/// (`askpass::paths_equal`), and a stricter rule here would detect nothing while
+/// the stale secret kept being served.
+fn same_key_path(a: &Path, b: &Path) -> bool {
+    fn norm(p: &Path) -> String {
+        let s = p.to_string_lossy();
+        if cfg!(windows) {
+            s.replace('\\', "/").to_ascii_lowercase()
+        } else {
+            s.into_owned()
+        }
+    }
+    norm(a) == norm(b)
+}
+
+/// The vault lookup keys of every host that uses `key_path` — i.e. each non-glob
+/// pattern of a matching `Host` line, not just its first (alias). This mirrors
+/// how the connect-time auto-fill resolves secrets (`vault::match_vault_kinds`
+/// and `update::gather_secrets` both scan all patterns), so a secret registered
+/// under a secondary name is detected here exactly when it would be served
+/// there. Glob patterns are skipped: they can never equal a vault entry's host.
+/// Pure.
 pub fn hosts_using_key(key_path: &Path, home: &Path, hosts: &[HostView]) -> Vec<String> {
+    let uses_key = |h: &HostView| {
+        if h.identity_files.is_empty() {
+            // No IdentityFile declared — OpenSSH falls back to the defaults in
+            // ~/.ssh, so this host uses `key_path` iff it is one of them.
+            let ssh_dir = home.join(".ssh");
+            return DEFAULT_IDENTITY_FILES
+                .iter()
+                .any(|name| same_key_path(&ssh_dir.join(name), key_path));
+        }
+        h.identity_files
+            .iter()
+            .any(|id| same_key_path(&expand_tilde(id, home), key_path))
+    };
     hosts
         .iter()
-        .filter(|h| {
-            h.identity_files
-                .iter()
-                .any(|id| expand_tilde(id, home) == key_path)
-        })
-        .map(|h| h.alias().to_string())
+        .filter(|h| uses_key(h))
+        .flat_map(|h| h.patterns.iter())
+        .filter(|pat| !pat.contains(['*', '?', '!']))
+        .map(|pat| pat.to_string())
         .collect()
 }
 
-/// `hosts_using_key` ∩ hosts that have a vault `Passphrase` entry. Pure.
-/// Exact-alias matching mirrors `vault::match_vault_kinds` (glob patterns never
-/// match a vault entry, so they can't produce stale candidates either).
+/// `hosts_using_key` ∩ the lookup keys that actually have a vault `Passphrase`
+/// entry — the hosts whose stored secret just went stale. Pure.
 pub fn stale_passphrase_hosts(
     key_path: &Path,
     home: &Path,
@@ -448,11 +493,11 @@ pub fn stale_passphrase_hosts(
 ) -> Vec<String> {
     hosts_using_key(key_path, home, hosts)
         .into_iter()
-        .filter(|alias| {
+        .filter(|host| {
             vault
                 .entries
                 .iter()
-                .any(|e| e.kind == SecretKind::Passphrase && e.host == *alias)
+                .any(|e| e.kind == SecretKind::Passphrase && e.host == *host)
         })
         .collect()
 }
@@ -704,8 +749,14 @@ mod tests {
     }
 
     fn host_view(alias: &str, identity_files: &[&str]) -> HostView {
+        host_view_multi(&[alias], identity_files)
+    }
+
+    /// A `Host` line with several patterns (`Host prod prod-old`), which the
+    /// connect-time auto-fill treats as several vault lookup keys.
+    fn host_view_multi(patterns: &[&str], identity_files: &[&str]) -> HostView {
         HostView {
-            patterns: vec![alias.to_string()],
+            patterns: patterns.iter().map(|s| s.to_string()).collect(),
             identity_files: identity_files.iter().map(|s| s.to_string()).collect(),
             ..Default::default()
         }
@@ -839,6 +890,99 @@ mod tests {
                 "alias {alias} (matched: {matched:?})"
             );
         }
+    }
+
+    /// hosts_using_key — `Host` 行の非 glob パターンを全て返す（接続時オートフィルと同じ照合鍵）
+    #[test]
+    fn hosts_using_key_matches_every_non_glob_pattern() {
+        // given: 1 つの Host 行が別名を複数持ち、glob パターンも混ざる
+        let home = Path::new("/home/u");
+        let key = Path::new("/home/u/.ssh/id_a");
+        let hosts = vec![host_view_multi(
+            &["prod", "prod-old", "*.internal"],
+            &["~/.ssh/id_a"],
+        )];
+
+        // when
+        let matched = hosts_using_key(key, home, &hosts);
+
+        // then: 先頭パターンだけでなく副パターンも返る。glob は vault エントリに
+        // 一致しえないので候補にしない（gather_secrets と同じ規則）。
+        assert_eq!(
+            matched,
+            vec!["prod".to_string(), "prod-old".to_string()],
+            "every non-glob pattern must be a lookup key"
+        );
+    }
+
+    /// hosts_using_key — IdentityFile 未宣言のホストは OpenSSH の既定 identity を暗黙候補にする
+    #[test]
+    fn hosts_using_key_falls_back_to_default_identities() {
+        // given: IdentityFile 行が無い（＝既定 identity を使う典型構成）
+        let home = Path::new("/home/u");
+        let hosts = vec![host_view("prod", &[])];
+
+        // when / then: 既定 identity の 1 つならマッチする
+        assert_eq!(
+            hosts_using_key(Path::new("/home/u/.ssh/id_ed25519"), home, &hosts),
+            vec!["prod".to_string()]
+        );
+        // when / then: 既定でない鍵にはマッチしない
+        assert!(
+            hosts_using_key(Path::new("/home/u/.ssh/deploy_key"), home, &hosts).is_empty(),
+            "a non-default key must not match a host that declares no IdentityFile"
+        );
+        // when / then: IdentityFile を明示したホストには既定を足さない
+        let explicit = vec![host_view("prod", &["~/.ssh/deploy_key"])];
+        assert!(
+            hosts_using_key(Path::new("/home/u/.ssh/id_ed25519"), home, &explicit).is_empty(),
+            "an explicit IdentityFile replaces the defaults"
+        );
+    }
+
+    /// hosts_using_key — Windows ではパスの大小・区切りを畳んで比較する（unix は厳密）
+    #[test]
+    fn hosts_using_key_folds_case_and_separators_on_windows() {
+        // given: 手書き config によくある全小文字・バックスラッシュ表記
+        let home = Path::new("C:/Users/taro");
+        let key = Path::new("C:/Users/taro/.ssh/id_a");
+        let hosts = vec![host_view("prod", &["c:\\users\\taro\\.ssh\\id_a"])];
+
+        // when
+        let matched = hosts_using_key(key, home, &hosts);
+
+        // then: Windows は case-insensitive かつ `/`≡`\` なので接続でき、
+        // 検出もそれに揃える。unix ではこれらは別パスなので一致しない。
+        if cfg!(windows) {
+            assert_eq!(matched, vec!["prod".to_string()]);
+        } else {
+            assert!(matched.is_empty(), "unix paths are compared exactly");
+        }
+    }
+
+    /// stale_passphrase_hosts — 副パターンで登録された vault エントリも陳腐化として拾う
+    #[test]
+    fn stale_passphrase_hosts_covers_secondary_patterns() {
+        // given: vault のエントリは Host 行の 2 つ目のパターン名で登録されている
+        let home = Path::new("/home/u");
+        let key = Path::new("/home/u/.ssh/id_a");
+        let hosts = vec![host_view_multi(&["prod", "prod-old"], &["~/.ssh/id_a"])];
+        let mut vault = Vault::create("pw").unwrap();
+        vault.upsert(
+            None,
+            VaultEntry {
+                host: "prod-old".into(),
+                kind: SecretKind::Passphrase,
+                secret: "s".into(),
+                note: String::new(),
+            },
+        );
+
+        // when
+        let stale = stale_passphrase_hosts(key, home, &hosts, &vault);
+
+        // then: 接続時は prod-old のエントリが使われるので、検出も拾わねばならない
+        assert_eq!(stale, vec!["prod-old".to_string()]);
     }
 
     /// stale_passphrase_hosts — 鍵一致かつ vault に Passphrase がある host だけを返す

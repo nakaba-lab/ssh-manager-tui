@@ -297,6 +297,28 @@ pub fn draw_wizard(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(Text::from(lines)).block(block), modal);
 }
 
+/// How many affected hosts the sync modal names before eliding. The modal is a
+/// fixed-height box, so an unbounded list would wrap past the input row and push
+/// it out of the frame — one shared key can easily serve a dozen hosts.
+const HOSTS_SHOWN: usize = 4;
+
+/// The affected-host line: the first `max_shown` names, then `… +N more`. Pure,
+/// so the elision that keeps the modal's input row on screen is unit-tested.
+fn host_summary(hosts: &[String], max_shown: usize) -> String {
+    if hosts.len() <= max_shown {
+        return hosts.join(", ");
+    }
+    format!(
+        "{}… +{} more",
+        hosts[..max_shown]
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(", "),
+        hosts.len() - max_shown
+    )
+}
+
 /// Bulk vault-passphrase update modal (Issue #47), offered after `ssh-keygen -p`
 /// succeeds while stored vault `Passphrase` entries still hold the OLD
 /// passphrase for the changed key. One typed passphrase updates them all.
@@ -324,7 +346,7 @@ pub fn draw_passphrase_sync(f: &mut Frame, app: &App, area: Rect) {
         faint("  The key's passphrase changed; these hosts' stored"),
         faint("  passphrases are stale and would auto-fill the old one:"),
         Line::from(Span::styled(
-            format!("    {}", form.hosts.join(", ")),
+            format!("    {}", host_summary(&form.hosts, HOSTS_SHOWN)),
             Style::default().fg(theme::ACCENT),
         )),
         Line::from(""),
@@ -343,6 +365,25 @@ pub fn draw_passphrase_sync(f: &mut Frame, app: &App, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// host_summary — ホストが増えても 1 行に収め、入力欄を枠外へ押し出さない（Issue #47）
+    #[test]
+    fn host_summary_elides_beyond_the_shown_limit() {
+        // given
+        let few: Vec<String> = vec!["web1".into(), "db".into()];
+        let many: Vec<String> = (1..=9).map(|i| format!("web-prod-tokyo-{i:02}")).collect();
+
+        // when / then: 収まるうちは全部見せる
+        assert_eq!(host_summary(&few, 4), "web1, db");
+
+        // when / then: 超えたら丸めて残数を示す（折り返しでモーダルが溢れない）
+        let summary = host_summary(&many, 4);
+        assert!(summary.ends_with("… +5 more"), "summary: {summary}");
+        assert!(
+            summary.starts_with("web-prod-tokyo-01, web-prod-tokyo-02"),
+            "summary: {summary}"
+        );
+    }
 
     /// pair_hint — Unverified は「暗号化鍵はパスフレーズ無しで検証できない・エラーではない」旨を説明する（Issue #47）
     #[test]
