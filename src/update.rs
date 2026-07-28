@@ -1566,6 +1566,13 @@ fn deploy_selected_key(app: &mut App) {
             );
             return;
         }
+        Err(crate::os::deploy::DeployError::UnsupportedKeyType) => {
+            app.toast(
+                "not a deployable public key type — refusing to deploy it",
+                true,
+            );
+            return;
+        }
     };
     app.pending_deploy = Some(plan);
     open_confirm(app, ConfirmAction::DeployKey);
@@ -1582,6 +1589,9 @@ fn execute_deploy(app: &mut App, terminal: &mut DefaultTerminal) -> Result<()> {
         .and_then(|i| app.hosts.get(i))
         .map(|h| h.alias().to_string())
     else {
+        // The host context vanished between arming and confirming; say so rather
+        // than returning silently after the user pressed `y`.
+        app.toast("no host in context — nothing was deployed", true);
         return Ok(());
     };
     // `--` ends option parsing so an alias that starts with a dash can't become a
@@ -1591,6 +1601,9 @@ fn execute_deploy(app: &mut App, terminal: &mut DefaultTerminal) -> Result<()> {
     suspend_tui(terminal)?;
     let status = crate::os::connect::run_inline(&crate::os::binaries::tools().ssh, &args, &[]);
     restore_tui(terminal)?;
+    // A deployment that waited on a password prompt (TUI suspended) must not
+    // trigger a spurious idle auto-lock on the next tick (#14).
+    app.last_activity = Instant::now();
 
     use crate::os::deploy::DeployOutcome;
     match status {
@@ -3806,7 +3819,12 @@ fn handle_confirm(
                 other => perform_confirm(app, other),
             }
         }
-        KeyCode::Char('n') | KeyCode::Esc => close_overlay(app),
+        KeyCode::Char('n') | KeyCode::Esc => {
+            // One confirmation arms exactly one deployment: a cancelled modal must
+            // not leave a validated plan parked on App (#48).
+            app.pending_deploy = None;
+            close_overlay(app);
+        }
         _ => {}
     }
     Ok(())

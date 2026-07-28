@@ -28,7 +28,34 @@ pub enum DeployError {
     NotAPublicKey,
     /// The algorithm or base64 body carries characters we refuse to send.
     UnsafeBody,
+    /// The line is shell-safe but is not a public key of a type we deploy: the
+    /// leading token is not a known algorithm, or the blob does not decode to a
+    /// key declaring that same algorithm. Refused because `authorized_keys`
+    /// treats an unrecognised leading token as an OPTIONS field (see
+    /// [`KEY_ALGORITHMS`]).
+    UnsupportedKeyType,
 }
+
+/// The public-key algorithms we are willing to deploy.
+///
+/// This is a security boundary, not a nicety. `authorized_keys` lines are
+/// `[options] <algo> <blob> [comment]`, so a leading token sshd does not
+/// recognise as an algorithm is read as **options** — `cert-authority
+/// ssh-ed25519 AAAA…` turns the deployed key into a trusted certificate
+/// authority for the account. Every character in that line passes a
+/// shell-metacharacter allowlist, so only checking for shell safety lets it
+/// through. Certificate types (`*-cert-v01@openssh.com`) are deliberately absent:
+/// they belong in `TrustedUserCAKeys`, not in `authorized_keys`.
+const KEY_ALGORITHMS: [&str; 8] = [
+    "ssh-ed25519",
+    "ssh-rsa",
+    "ssh-dss",
+    "ecdsa-sha2-nistp256",
+    "ecdsa-sha2-nistp384",
+    "ecdsa-sha2-nistp521",
+    "sk-ssh-ed25519@openssh.com",
+    "sk-ecdsa-sha2-nistp256@openssh.com",
+];
 
 /// A validated, ready-to-run deployment.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,6 +102,37 @@ fn comment_char_ok(c: char) -> bool {
         || matches!(c, ' ' | '-' | '@' | '.' | '+' | '/' | '=' | '_' | ':' | ',')
 }
 
+/// Base64 decoder for the key blob. Deliberately lenient about padding and
+/// trailing bits: we decode only to read the algorithm name the key declares, so
+/// a canonicalisation technicality is no reason to refuse a key whose type we can
+/// still verify. What must not be lenient is the type check itself.
+const KEY_BLOB_BASE64: base64::engine::GeneralPurpose = base64::engine::GeneralPurpose::new(
+    &base64::alphabet::STANDARD,
+    base64::engine::GeneralPurposeConfig::new()
+        .with_decode_padding_mode(base64::engine::DecodePaddingMode::Indifferent)
+        .with_decode_allow_trailing_bits(true),
+);
+
+/// Whether `blob` decodes to an SSH public key whose **embedded** algorithm name
+/// is `algo`. The wire format starts with a length-prefixed string naming the
+/// algorithm, and OpenSSH itself keys off that, so checking it makes the leading
+/// token verifiable rather than merely well-formed: a line that is not a key at
+/// all (`hello world`), or one whose first token is an options field, cannot
+/// produce a blob that declares itself.
+fn blob_declares(algo: &str, blob: &str) -> bool {
+    use base64::Engine;
+    let Ok(raw) = KEY_BLOB_BASE64.decode(blob) else {
+        return false;
+    };
+    let Some(len) = raw
+        .get(..4)
+        .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize)
+    else {
+        return false;
+    };
+    raw.get(4..4 + len) == Some(algo.as_bytes())
+}
+
 /// Validate a `.pub` file's text and build the remote snippet.
 pub fn plan(pub_text: &str) -> Result<DeployPlan, DeployError> {
     // Only ever the FIRST line: a `.pub` read from a CRLF file, or one with a
@@ -86,6 +144,11 @@ pub fn plan(pub_text: &str) -> Result<DeployPlan, DeployError> {
     };
     if !algo.chars().all(body_char_ok) || !blob.chars().all(body_char_ok) {
         return Err(DeployError::UnsafeBody);
+    }
+    // Shell-safe is not enough: the line must be a KEY, not an options field
+    // wearing a key's clothes (see `KEY_ALGORITHMS`).
+    if !KEY_ALGORITHMS.contains(&algo) || !blob_declares(algo, blob) {
+        return Err(DeployError::UnsupportedKeyType);
     }
     let body = format!("{algo} {blob}");
 
@@ -113,7 +176,7 @@ pub fn plan(pub_text: &str) -> Result<DeployPlan, DeployError> {
     // distinct from the line being written.
     let snippet = format!(
         "umask 077; mkdir -p ~/.ssh; touch ~/.ssh/authorized_keys; \
-         if grep -qF '{body}' ~/.ssh/authorized_keys; then exit {ALREADY_PRESENT_EXIT}; fi; \
+         if grep -qF -- '{body}' ~/.ssh/authorized_keys; then exit {ALREADY_PRESENT_EXIT}; fi; \
          if [ -s ~/.ssh/authorized_keys ] && [ -n \"$(tail -c1 ~/.ssh/authorized_keys)\" ]; \
          then printf '\\n' >> ~/.ssh/authorized_keys; fi; \
          printf '%s\\n' \"{line}\" >> ~/.ssh/authorized_keys"
@@ -178,12 +241,12 @@ mod tests {
         let p = plan(&format!("{ALGO} {BLOB} me@laptop")).unwrap();
         assert_eq!(p.body, body());
         assert!(
-            p.snippet.contains(&format!("grep -qF '{}'", body())),
+            p.snippet.contains(&format!("grep -qF -- '{}'", body())),
             "duplicate check must grep the body, not the full line: {}",
             p.snippet
         );
         assert!(
-            !p.snippet.contains("grep -qF 'ssh-ed25519 ") || !p.snippet.contains("me@laptop'"),
+            !p.snippet.contains("grep -qF -- 'ssh-ed25519 ") || !p.snippet.contains("me@laptop'"),
             "the grep pattern must not carry the comment: {}",
             p.snippet
         );
@@ -321,8 +384,59 @@ mod tests {
     #[test]
     fn plan_accepts_the_sk_and_ecdsa_algorithm_spellings() {
         // `@` and `.` are legal in algorithm names; `-` and digits in the curve ones.
-        assert!(plan(&format!("sk-ssh-ed25519@openssh.com {BLOB}")).is_ok());
-        assert!(plan(&format!("ecdsa-sha2-nistp256 {BLOB}")).is_ok());
+        // Each blob must DECLARE its own algorithm, so the fixtures carry the
+        // matching wire-format header rather than reusing the ed25519 one.
+        const SK_BLOB: &str =
+            "AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29tAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        const ECDSA_BLOB: &str =
+            "AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==";
+        assert!(plan(&format!("sk-ssh-ed25519@openssh.com {SK_BLOB}")).is_ok());
+        assert!(plan(&format!("ecdsa-sha2-nistp256 {ECDSA_BLOB}")).is_ok());
+    }
+
+    // --- authorized_keys grammar: an options field is NOT an algorithm ---
+
+    #[test]
+    fn plan_refuses_an_options_prefix_masquerading_as_an_algorithm() {
+        // The attack this guards: every character below is shell-safe, so the
+        // metacharacter allowlist passes it. sshd, however, reads an unrecognised
+        // leading token as OPTIONS — `cert-authority` would make the deployed key a
+        // trusted CA for the account, which is worse than planting a plain key.
+        let text = format!("cert-authority {ALGO} {BLOB} attacker");
+        assert_eq!(plan(&text), Err(DeployError::UnsupportedKeyType));
+        // The same holds for the other no-argument options.
+        for opt in ["restrict", "no-pty", "no-agent-forwarding"] {
+            assert_eq!(
+                plan(&format!("{opt} {ALGO} {BLOB}")),
+                Err(DeployError::UnsupportedKeyType),
+                "{opt} must not be accepted as an algorithm"
+            );
+        }
+    }
+
+    #[test]
+    fn plan_refuses_a_line_that_is_not_a_key_at_all() {
+        // Two shell-safe words used to be enough to build a deployment.
+        assert_eq!(plan("hello world"), Err(DeployError::UnsupportedKeyType));
+    }
+
+    #[test]
+    fn plan_refuses_a_blob_that_declares_a_different_algorithm() {
+        // The named type and the embedded type must agree, so a relabelled key
+        // cannot be deployed under a type it is not.
+        assert_eq!(
+            plan(&format!("ssh-rsa {BLOB}")),
+            Err(DeployError::UnsupportedKeyType)
+        );
+    }
+
+    #[test]
+    fn plan_refuses_a_certificate_type() {
+        // Certificates belong in TrustedUserCAKeys, not authorized_keys.
+        assert_eq!(
+            plan(&format!("ssh-ed25519-cert-v01@openssh.com {BLOB}")),
+            Err(DeployError::UnsupportedKeyType)
+        );
     }
 
     // --- AC2/AC3/AC7: exit-code meanings ---

@@ -295,6 +295,7 @@ fn draw_footer(f: &mut Frame, app: &App, base: &Screen, area: Rect) {
             ("g", "generate"),
             ("y", "copy pub"),
             ("s", "set-id"),
+            ("p", "deploy"),
             ("d", "delete"),
             ("Esc", "back"),
         ]),

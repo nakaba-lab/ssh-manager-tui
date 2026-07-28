@@ -229,10 +229,12 @@ remove, `Enter` commit, `Esc` revert the field.
 | `d` | delete the key pair (with confirm) · `r` rescan · `Esc` back |
 
 > Deployment runs one `ssh` round trip with the TUI suspended, so password
-> authentication and a first-time host-key prompt appear as usual. The remote
-> snippet is POSIX `sh`, so it cannot run against a server whose default shell is
-> `cmd.exe`/PowerShell (Windows OpenSSH) — `ssh-copy-id` has the same limitation.
-> An existing entry is detected and not appended twice.
+> authentication and a first-time host-key prompt appear as usual. The snippet it
+> runs is POSIX `sh`, and it is sent as-is — unlike `ssh-copy-id`, which wraps its
+> payload in `exec sh -c` to survive a non-POSIX login shell. So a remote whose
+> default shell is `cmd.exe`/PowerShell (Windows OpenSSH), `csh` or `tcsh` will
+> reject it, and sshm reports the non-zero exit rather than half-applying
+> anything. An existing entry is detected and not appended twice.
 
 ### known_hosts
 

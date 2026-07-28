@@ -280,4 +280,113 @@ mod tests {
         assert_eq!(ACTION_LABELS[action_idx::EDIT], "Edit host");
         assert_eq!(ACTION_LABELS[action_idx::DELETE], "Delete host");
     }
+
+    // --- #48 deploy confirmation: the last human gate before a remote write ---
+
+    /// Flatten a rendered line back to plain text for assertions.
+    fn text_of(line: &Line<'_>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    fn app_with_key(pub_text: &str) -> (App, std::path::PathBuf) {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("sshm-cfm-{}-{}", std::process::id(), n));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = dir.join("config");
+        std::fs::File::create(&cfg)
+            .unwrap()
+            .write_all(b"Host web-prod\n    HostName 10.0.0.1\n")
+            .unwrap();
+        let pub_path = dir.join("id_ed25519.pub");
+        std::fs::File::create(&pub_path)
+            .unwrap()
+            .write_all(pub_text.as_bytes())
+            .unwrap();
+
+        let mut app = App::new(cfg).unwrap();
+        app.keys = vec![crate::os::keys::KeyInfo {
+            path: dir.join("id_ed25519"),
+            pub_path: Some(pub_path),
+            bits: 256,
+            fingerprint: "SHA256:EXAMPLEfingerprintEXAMPLEfingerprintEXAMPLE".into(),
+            comment: "me@laptop".into(),
+            key_type: "ED25519".into(),
+            has_private: true,
+            pair: crate::os::keys::PairStatus::Matched,
+        }];
+        app.keys_state.select(Some(0));
+        app.key_host_ctx = Some(0);
+        app.pending_deploy = Some(crate::os::deploy::plan(pub_text).expect("fixture key plans"));
+        (app, dir)
+    }
+
+    const CLEAN_PUB: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB1LtRcXaGCS5MFvHi1cJcHjuFF5jJyUpTXBrpEEXAMPLE me@laptop";
+
+    #[test]
+    fn deploy_lines_name_the_host_key_fingerprint_and_comment() {
+        // AC1: the modal is the last gate before rewriting a REMOTE authorized_keys,
+        // so all four identifying facts must be on screen.
+        let (app, dir) = app_with_key(CLEAN_PUB);
+        let rendered: Vec<String> = deploy_lines(&app).iter().map(text_of).collect();
+        let joined = rendered.join("\n");
+        assert!(joined.contains("web-prod"), "{joined}");
+        assert!(joined.contains("10.0.0.1"), "host name is shown: {joined}");
+        assert!(joined.contains("id_ed25519.pub"), "{joined}");
+        assert!(joined.contains("SHA256:"), "{joined}");
+        assert!(
+            joined.contains("me@laptop"),
+            "the comment that lands: {joined}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deploy_lines_say_so_when_the_comment_is_dropped() {
+        // The screen must match what the remote receives — a comment the allowlist
+        // rejected is reported, never silently omitted.
+        let (app, dir) = app_with_key(
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB1LtRcXaGCS5MFvHi1cJcHjuFF5jJyUpTXBrpEEXAMPLE evil'; id; echo '",
+        );
+        let joined: String = deploy_lines(&app)
+            .iter()
+            .map(text_of)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("dropped"), "{joined}");
+        assert!(
+            !joined.contains("id;"),
+            "the hostile comment must not be echoed: {joined}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deploy_lines_fit_the_modal_width() {
+        // kv_line pads the label to 16 columns; a value that overflows would push
+        // the modal border off and corrupt the frame.
+        let (app, dir) = app_with_key(CLEAN_PUB);
+        for line in deploy_lines(&app) {
+            let w = text_of(&line).chars().count();
+            assert!(
+                w <= DEPLOY_MODAL_WIDTH as usize - 2,
+                "line overflows the modal: {w} cols in {:?}",
+                text_of(&line)
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn elide_keeps_the_head_and_tail() {
+        assert_eq!(elide("short", 10), "short");
+        assert_eq!(elide("abcdefghij", 10), "abcdefghij");
+        // Longer than the budget: head + … + last three, within the budget.
+        let out = elide("abcdefghijklmno", 10);
+        assert_eq!(out.chars().count(), 10);
+        assert!(out.starts_with("abcdef"), "{out}");
+        assert!(out.ends_with("mno"), "{out}");
+    }
 }

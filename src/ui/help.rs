@@ -57,6 +57,7 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
             lines.push(key("g", "generate new key"));
             lines.push(key("y", "copy public key"));
             lines.push(key("s", "set as IdentityFile for host in context"));
+            lines.push(key("p", "deploy public key to host in context"));
             lines.push(key("d", "delete key (private + public)"));
             lines.push(key("r", "rescan"));
         }
