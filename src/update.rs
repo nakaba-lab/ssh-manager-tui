@@ -595,21 +595,24 @@ fn pin_block(rows: &[ClassifiedKey], existing: &[KnownHostEntry]) -> Option<PinB
     if rows.iter().any(|r| r.class.poisons_result()) {
         return Some(PinBlocked::Contradicted);
     }
-    // Any EXISTING TRUST DECISION blocks, not just a plain pin: a
-    // `@cert-authority` delegation is an active trust path, and dropping an
-    // unauthenticated raw key beside it bypasses the CA's revocation control
-    // exactly the way a sidecar key bypasses a pin. A `@revoked` line is the
-    // administrator declaring distrust of this host's key material, which is
-    // not something a scan may quietly work around (#46 round 6).
+    // ANY entry blocks. `matching_known_entries` returns exactly what
+    // `ssh-keygen -F` reports, and every one of those is an entry OpenSSH
+    // honours for this host — a plain pin, a `@cert-authority` delegation, a
+    // `@revoked` line, or a wildcard covering the host. Appending an
+    // unauthenticated key beside any of them widens trust past what the user
+    // decided, because OpenSSH accepts a host key matching ANY entry.
     //
-    // MARKER lines count even when the host field is a PATTERN: `@cert-authority
-    // *.example.com` is the form people actually write, and OpenSSH honours it
-    // for this host (#46 round 7). Only a marker-free wildcard is excused — the
-    // trust gate ignores those, so treating one as a decision would leave the
-    // user unable to create the exact pin the gate wants.
-    let has_decision = existing
-        .iter()
-        .any(|e| e.marker.is_some() || !e.is_pattern());
+    // Earlier rounds carved out narrower rules — marker-free only, then
+    // non-pattern only — and each carve-out turned out to be a bypass. The
+    // marker-free WILDCARD carve-out was the last: with `*.example ssh-ed25519
+    // <genuine>` present, real OpenSSH prints HOST KEY CHANGED for an
+    // attacker's key of another type, and appending that key made it accept
+    // silently (#46 round 8, reproduced end-to-end). The usability argument for
+    // the carve-out — "the trust gate ignores wildcards, so the user must be
+    // able to create the exact pin" — was resting on that false premise.
+    // Materialising a wildcard's key as a per-host pin is a job for the
+    // Known hosts screen, not for a scan that authenticates nothing.
+    let has_decision = !existing.is_empty();
     has_decision.then_some(PinBlocked::AlreadyPinned)
 }
 
@@ -655,7 +658,11 @@ fn keyscan_handle_key(state: &KeyScanModal, key: KeyCode, lookup_key: &str) -> K
 fn keyscan_lookup_key_gate(lookup_key: &str) -> Result<(), String> {
     let bad = lookup_key.is_empty()
         || lookup_key.contains(['*', '?', '!', ',', '#', ' ', '\t', '\r', '\n'])
-        || lookup_key.starts_with('@');
+        || lookup_key.starts_with('@')
+        // `-` could be read as a flag by a future caller that forgets `--`;
+        // `|1|` is the hashed-entry prefix and must never be forged by hand.
+        || lookup_key.starts_with('-')
+        || lookup_key.starts_with('|');
     if bad {
         return Err(format!(
             "refusing to pin under {lookup_key:?} — not a single literal host token"
@@ -711,6 +718,22 @@ fn open_keyscan(app: &mut App, host_idx: usize) {
         return;
     }
     let alias = host.alias().to_string();
+    // Same guard the connect and SFTP paths apply: `ssh -G` EXECUTES a
+    // `Match exec` predicate, which this action must not trigger as a side
+    // effect of opening a menu entry. A nondeterministic predicate would also
+    // make this snapshot disagree with the config the real connect uses, so the
+    // pins read and the file written could belong to a different resolution
+    // (#46 round 8).
+    if has_match_exec(&app.config.render()) {
+        app.toast(
+            format!(
+                "can't scan {alias}: the config contains a `Match exec`, and resolving the host \
+                 would run it — pin manually"
+            ),
+            true,
+        );
+        return;
+    }
     let rc = match resolve_config_with_options(&[], &alias) {
         Ok(rc) => rc,
         Err(e) => {
@@ -734,6 +757,19 @@ fn open_keyscan(app: &mut App, host_idx: usize) {
     // would widen the pin past the host that was actually scanned.
     if let Err(msg) = keyscan_lookup_key_gate(&lookup_key) {
         app.toast(msg, true);
+        return;
+    }
+    // This host's trust comes from somewhere `ssh-keygen -F` cannot see
+    // (`KnownHostsCommand` / `VerifyHostKeyDNS yes`), so "no matching entry"
+    // would not mean "unpinned" — appending would sidecar that trust path.
+    if rc.has_external_trust_source {
+        app.toast(
+            format!(
+                "can't scan {alias}: its host keys are verified by KnownHostsCommand or DNS \
+                 (SSHFP), which this build cannot inspect — pin manually"
+            ),
+            true,
+        );
         return;
     }
     // Checked BEFORE the pin target is resolved: a lossy list usually also
@@ -5432,26 +5468,34 @@ mod tests {
     }
 
     #[test]
-    fn keyscan_still_pins_when_only_a_wildcard_entry_matches() {
-        // given — only a wildcard entry matches. The trust gate ignores
-        // wildcards, so the host is effectively unpinned and must stay pinnable
-        // — otherwise the user can never create the exact pin the gate wants.
-        let existing = kh_entries(&["*.example ssh-ed25519 WILDKEY"]);
-        // when — the scan returns a key of an unrelated type
+    fn keyscan_appends_nothing_beside_a_marker_free_wildcard() {
+        // given — a marker-free wildcard holding the host's genuine key. This
+        // IS a trust decision OpenSSH honours: with it present, a real client
+        // prints HOST KEY CHANGED for an attacker's key of another type and
+        // refuses. Appending that key made OpenSSH accept it silently, so the
+        // earlier "wildcards don't count" carve-out was a bypass (#46 round 8,
+        // reproduced end-to-end).
+        let existing = kh_entries(&["*.example ssh-ed25519 GENUINE"]);
+        // when — an in-path responder replays the genuine key and sidecars its own
         let next = keyscan_apply_event(
             KeyScanModal::Scanning,
-            KeyscanEvent::Keys(vec![scanned("ecdsa-sha2-nistp256", "FRESH")]),
+            KeyscanEvent::Keys(vec![
+                scanned("ssh-ed25519", "GENUINE"),
+                scanned("ecdsa-sha2-nistp256", "EVIL"),
+            ]),
             &existing,
         );
-        // then
+        // then — the wildcard's key reads as trusted (OpenSSH does trust it),
+        // and NOTHING may be appended
         let KeyScanModal::Results { rows, blocked } = &next else {
             panic!("expected Results, got {next:?}");
         };
-        assert_eq!(rows[0].class, PinClass::New);
-        assert_eq!(*blocked, None);
+        assert_eq!(rows[0].class, PinClass::AlreadyTrusted);
+        assert_eq!(rows[1].class, PinClass::New);
+        assert_eq!(*blocked, Some(PinBlocked::AlreadyPinned));
         assert_eq!(
             keyscan_handle_key(&next, KeyCode::Char('y'), "db.example"),
-            KeyScanAction::Close(vec!["db.example ecdsa-sha2-nistp256 FRESH".to_string()])
+            KeyScanAction::Close(vec![])
         );
     }
 
@@ -5493,22 +5537,44 @@ mod tests {
     }
 
     #[test]
-    fn keyscan_wildcard_entry_never_masquerades_as_a_per_host_pin() {
-        // given — a wildcard entry holding the host's REAL key
+    fn keyscan_wildcard_entry_with_a_different_key_reads_as_changed() {
+        // given — a wildcard entry whose key differs from what the host offers.
+        // `ssh-keygen -F` only returns entries OpenSSH honours for this host, so
+        // this really is a key OpenSSH would reject: reporting it as `New` would
+        // be dishonest (#46 round 8).
         let existing = kh_entries(&["*.example ssh-ed25519 REALKEY"]);
-        // when — the scan returns exactly that key
+        // when
         let next = keyscan_apply_event(
             KeyScanModal::Scanning,
-            KeyscanEvent::Keys(vec![scanned("ssh-ed25519", "REALKEY")]),
+            KeyscanEvent::Keys(vec![scanned("ssh-ed25519", "OTHERKEY")]),
             &existing,
         );
-        // then — `New`, not `AlreadyTrusted` and not a false CHANGED alarm: the
-        // gate does not accept wildcards, so the exact pin is still creatable
+        // then — CHANGED, and the contradiction outranks "already pinned"
+        let KeyScanModal::Results { rows, blocked } = &next else {
+            panic!("expected Results, got {next:?}");
+        };
+        assert_eq!(rows[0].class, PinClass::Changed);
+        assert_eq!(*blocked, Some(PinBlocked::Contradicted));
+    }
+
+    #[test]
+    fn keyscan_still_pins_a_host_with_no_entry_at_all() {
+        // given — nothing matches this host: the feature must not be dead
+        let next = keyscan_apply_event(
+            KeyScanModal::Scanning,
+            KeyscanEvent::Keys(vec![scanned("ssh-ed25519", "FRESH")]),
+            &[],
+        );
+        // when / then — plain TOFU, pinnable
         let KeyScanModal::Results { rows, blocked } = &next else {
             panic!("expected Results, got {next:?}");
         };
         assert_eq!(rows[0].class, PinClass::New);
         assert_eq!(*blocked, None);
+        assert_eq!(
+            keyscan_handle_key(&next, KeyCode::Char('y'), "db.example"),
+            KeyScanAction::Close(vec!["db.example ssh-ed25519 FRESH".to_string()])
+        );
     }
 
     #[test]

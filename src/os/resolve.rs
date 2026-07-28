@@ -25,6 +25,16 @@ pub struct ResolvedConfig {
     pub proxy_command: Option<String>,
     pub user_known_hosts_files: Vec<String>,
     pub global_known_hosts_files: Vec<String>,
+    /// True when the host's trust decisions come from a source this code cannot
+    /// read: `KnownHostsCommand` (OpenSSH ≥ 8.5 — supplies known-hosts lines
+    /// from a program, honoured for host-key verification) or
+    /// `VerifyHostKeyDNS yes` (a DNSSEC-signed SSHFP authenticates the host
+    /// without any known_hosts entry).
+    ///
+    /// `ssh-keygen -F` sees neither, so the keyscan writer would believe an
+    /// established host is unpinned and append beside that trust path — proven
+    /// end-to-end for `KnownHostsCommand` (#46 round 8). It refuses instead.
+    pub has_external_trust_source: bool,
     /// True when a known-hosts file list could NOT be split back into paths
     /// without losing information: the raw `ssh -G` value contained a run of
     /// two-or-more whitespace characters, or a tab.
@@ -135,6 +145,14 @@ pub fn parse_ssh_g_output(dump: &str) -> ResolvedConfig {
             }
             "proxycommand" if !val.eq_ignore_ascii_case("none") => {
                 rc.proxy_command = Some(val.to_string())
+            }
+            // `ssh -G` omits `knownhostscommand` entirely when unset, and
+            // prints `none` when explicitly disabled.
+            "knownhostscommand" if !val.eq_ignore_ascii_case("none") => {
+                rc.has_external_trust_source = true;
+            }
+            "verifyhostkeydns" if val.eq_ignore_ascii_case("yes") => {
+                rc.has_external_trust_source = true;
             }
             "userknownhostsfile" => {
                 rc.known_hosts_list_lossy |= splitting_loses_information(raw);
@@ -626,6 +644,36 @@ mod tests {
             assert!(
                 !parse_ssh_g_output(ok).known_hosts_list_lossy,
                 "should not be lossy: {ok}"
+            );
+        }
+    }
+
+    #[test]
+    fn external_trust_sources_are_detected() {
+        // given / when / then — trust that `ssh-keygen -F` cannot see. Treating
+        // "no matching entry" as "unpinned" here would let a scan append beside
+        // an established trust path (#46 round 8, reproduced for
+        // KnownHostsCommand end-to-end).
+        for dump in [
+            "knownhostscommand /usr/local/bin/kh.sh",
+            "verifyhostkeydns yes",
+        ] {
+            assert!(
+                parse_ssh_g_output(dump).has_external_trust_source,
+                "should flag: {dump}"
+            );
+        }
+        // and the disabled / default forms must NOT flag (`ssh -G` omits
+        // knownhostscommand entirely when unset, and prints `none` when off)
+        for dump in [
+            "knownhostscommand none",
+            "verifyhostkeydns no",
+            "verifyhostkeydns ask",
+            "hostname db.example",
+        ] {
+            assert!(
+                !parse_ssh_g_output(dump).has_external_trust_source,
+                "should not flag: {dump}"
             );
         }
     }
