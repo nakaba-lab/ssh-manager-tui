@@ -236,10 +236,43 @@ pub fn tofu_lookup_key(rc: &ResolvedConfig) -> Option<String> {
 /// marker / [`KnownHostEntry::is_pattern`] checks itself (as [`is_host_known`]
 /// does).
 pub fn matching_known_entries(lookup_key: &str, files: &[String]) -> Vec<KnownHostEntry> {
-    resolve_known_hosts_files(files)
+    matching_known_entries_in(lookup_key, &resolve_known_hosts_files(files))
+}
+
+/// [`matching_known_entries`] over an ALREADY-resolved path list.
+///
+/// A caller that both writes and then re-reads must resolve once and reuse the
+/// result: resolution keys off `exists()`, so re-resolving after a write lets a
+/// stray file the write itself created join the read set, and the verification
+/// then "finds" the entry in a file OpenSSH never reads (#46 final review).
+pub fn matching_known_entries_in(lookup_key: &str, resolved: &[String]) -> Vec<KnownHostEntry> {
+    resolved
         .iter()
         .flat_map(|file| entries_in_file(lookup_key, file))
         .collect()
+}
+
+/// Public wrapper over the reader's file-list normalization, for callers that
+/// must pin the resolved set across a write (see [`matching_known_entries_in`]).
+pub fn resolved_known_hosts_files(files: &[String]) -> Vec<String> {
+    resolve_known_hosts_files(files)
+}
+
+/// True when `ssh -G` reported a known-hosts file this code cannot resolve to a
+/// real path: an unexpanded `~`/`%` token (which `ssh -G` emits verbatim for an
+/// explicitly-set `GlobalKnownHostsFile`) or a surviving `__PROGRAMDATA__`.
+///
+/// For the READERS this is a documented fail-safe gap — an unresolvable file
+/// contributes no entries, so a host is merely treated as unknown. For the
+/// keyscan WRITER it is fail-open: a genuine pin living only in that file would
+/// be invisible, and a key would be appended beside it. So the writer refuses
+/// to pin rather than decide on an incomplete picture (#46 final review).
+pub fn has_unresolvable_known_hosts_file(files: &[String]) -> bool {
+    files.iter().any(|p| {
+        p.starts_with('~')
+            || p.contains('%')
+            || expand_known_hosts_path(p).contains("__PROGRAMDATA__")
+    })
 }
 
 /// The first known-hosts file `ssh -G` reported, as a real path — the file a
@@ -257,12 +290,11 @@ pub fn matching_known_entries(lookup_key: &str, files: &[String]) -> Vec<KnownHo
 /// emits verbatim. Treating `none` as a filename would create a junk file in
 /// the process's CWD and report success for a pin OpenSSH never reads.
 pub fn primary_known_hosts_file(files: &[String]) -> Option<std::path::PathBuf> {
-    let expanded: Vec<String> = files
-        .iter()
-        .filter(|p| !is_none_sentinel(p))
-        .map(|p| expand_known_hosts_path(p))
-        .collect();
-    coalesce_existing_paths(&expanded, |p| {
+    if is_none_list(files) {
+        return None;
+    }
+    let expanded: Vec<String> = files.iter().map(|p| expand_known_hosts_path(p)).collect();
+    let chosen = coalesce_existing_paths(&expanded, |p| {
         let path = std::path::Path::new(p);
         path.exists()
             || path
@@ -270,25 +302,38 @@ pub fn primary_known_hosts_file(files: &[String]) -> Option<std::path::PathBuf> 
                 .is_some_and(|d| !d.as_os_str().is_empty() && d.is_dir())
     })
     .into_iter()
-    .next()
-    .map(std::path::PathBuf::from)
+    .next()?;
+    // Coalescing degrades to single words when nothing matches, which would
+    // hand back a truncated prefix. Require a real directory to write into.
+    let path = std::path::PathBuf::from(chosen);
+    let writable = path.exists()
+        || path
+            .parent()
+            .is_some_and(|d| !d.as_os_str().is_empty() && d.is_dir());
+    writable.then_some(path)
 }
 
-/// OpenSSH's `none` sentinel for a known-hosts file list ("use no file").
-/// Compared literally, as OpenSSH does.
-fn is_none_sentinel(path: &str) -> bool {
-    path == "none"
+/// True when the list is OpenSSH's `none` sentinel ("use no file").
+///
+/// Tested against the WHOLE list, never per element: OpenSSH rejects `none`
+/// combined with anything else (`argument must appear alone`) and `ssh -G`
+/// lower-cases it, so a bare `none` element inside a longer list is not the
+/// sentinel — it is a path component of a space-bearing directory name (e.g.
+/// `/home/me/my none dir/known_hosts`, which `ssh -G` emits unquoted and split).
+/// Filtering it per element dropped the component and broke the path back apart,
+/// hiding a genuine pin (#46 final review).
+fn is_none_list(files: &[String]) -> bool {
+    files.len() == 1 && files[0] == "none"
 }
 
 /// Shared file-list normalization for the known-hosts readers: expand the
 /// Windows `__PROGRAMDATA__` token, then coalesce `ssh -G`'s unquoted,
 /// space-split list back into paths that exist.
 fn resolve_known_hosts_files(files: &[String]) -> Vec<String> {
-    let expanded: Vec<String> = files
-        .iter()
-        .filter(|p| !is_none_sentinel(p))
-        .map(|p| expand_known_hosts_path(p))
-        .collect();
+    if is_none_list(files) {
+        return Vec::new();
+    }
+    let expanded: Vec<String> = files.iter().map(|p| expand_known_hosts_path(p)).collect();
     // Readers coalesce on the file itself (a file that does not exist holds no
     // entries anyway); the writer's variant keys off the parent directory
     // instead, because it has to name a file that does not exist yet.
@@ -403,6 +448,56 @@ fn known_in_file(lookup_key: &str, file: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn none_sentinel_is_judged_on_the_whole_list_not_per_element() {
+        // given — the sentinel, exactly as OpenSSH allows it (alone)
+        let sentinel = vec!["none".to_string()];
+        // when / then — no file to write, no file to read
+        assert_eq!(primary_known_hosts_file(&sentinel), None);
+        assert!(resolve_known_hosts_files(&sentinel).is_empty());
+
+        // given — a directory literally named `none` inside a space-bearing
+        // path, which `ssh -G` emits UNQUOTED and therefore pre-split. Dropping
+        // the `none` element would break the path apart and hide a real pin.
+        let dir = std::env::temp_dir().join(format!("sshm-none-{}", std::process::id()));
+        let nested = dir.join("my none dir");
+        std::fs::create_dir_all(&nested).unwrap();
+        let kh = nested.join("known_hosts");
+        std::fs::write(&kh, "db.example ssh-ed25519 AAAA\n").unwrap();
+        let split: Vec<String> = kh
+            .to_str()
+            .unwrap()
+            .split(' ')
+            .map(str::to_string)
+            .collect();
+        assert!(split.contains(&"none".to_string()), "fixture must split");
+        // when / then — the path is rejoined intact, not filtered apart
+        assert_eq!(primary_known_hosts_file(&split), Some(kh.clone()));
+        assert_eq!(
+            resolve_known_hosts_files(&split),
+            vec![kh.to_str().unwrap().to_string()]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unresolvable_known_hosts_files_are_reported() {
+        // given / when / then — `ssh -G` leaves an explicitly-set global file's
+        // `~`/`%` tokens unexpanded; deciding pinnability on a partial view of
+        // the pins would be fail-open, so callers must be able to detect it
+        assert!(has_unresolvable_known_hosts_file(&[
+            "/home/me/.ssh/known_hosts".into(),
+            "~/gkh".into()
+        ]));
+        assert!(has_unresolvable_known_hosts_file(&[
+            "%d/.ssh/known_hosts".into()
+        ]));
+        assert!(!has_unresolvable_known_hosts_file(&[
+            "/home/me/.ssh/known_hosts".into(),
+            "/etc/ssh/ssh_known_hosts".into()
+        ]));
+    }
 
     #[test]
     fn resolved_config_default_is_empty() {

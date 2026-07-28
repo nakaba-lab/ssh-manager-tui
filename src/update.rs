@@ -39,8 +39,9 @@ use crate::os::keyscan::{
 };
 use crate::os::known_hosts::{KnownHostEntry, append_entries, known_hosts_path, remove_entry};
 use crate::os::resolve::{
-    ResolvedConfig, has_match_exec, is_host_known, matching_known_entries,
-    primary_known_hosts_file, resolve_config_with_options, tofu_lookup_key,
+    ResolvedConfig, has_match_exec, has_unresolvable_known_hosts_file, is_host_known,
+    matching_known_entries, matching_known_entries_in, primary_known_hosts_file,
+    resolve_config_with_options, resolved_known_hosts_files, tofu_lookup_key,
 };
 use crate::os::sftp::{SftpOp, SftpSession, remote_join, remote_parent, sftp_quote, stage_batch};
 use crate::os::ssh_dir;
@@ -736,6 +737,20 @@ fn open_keyscan(app: &mut App, host_idx: usize) {
     // custom `UserKnownHostsFile`s, wildcards and case, each of which made a
     // CHANGED key render as `[new]` (#46 review).
     let files = known_hosts_files(&rc);
+    // Deciding pinnability needs a COMPLETE picture of the host's pins. If any
+    // reported file cannot be resolved (an explicitly-set `GlobalKnownHostsFile`
+    // with a `~`/`%` token arrives unexpanded from `ssh -G`), a genuine pin
+    // could be living there unseen — refuse rather than pin on a partial view.
+    if has_unresolvable_known_hosts_file(&files) {
+        app.toast(
+            format!(
+                "can't scan {alias}: ssh reports a known_hosts path this build can't resolve \
+                 (unexpanded ~ or %) — pin manually or use an absolute path"
+            ),
+            true,
+        );
+        return;
+    }
     let existing = matching_known_entries(&lookup_key, &files);
     let mut session = KeyscanSession::open();
     session.request(&hostname, &port);
@@ -786,8 +801,35 @@ fn handle_keyscan(app: &mut App, key: KeyEvent) {
         }
     } else if !lines.is_empty() {
         let (alias, target) = (ks.alias.clone(), ks.pin_target.clone());
-        let files = ks.files.clone();
         let lookup_key = ks.lookup_key.clone();
+        // Resolve the read set ONCE, before the write. Re-resolving afterwards
+        // would let a stray file the write itself created join the set, so the
+        // verification below would "find" the entry in a file ssh never reads.
+        let resolved = resolved_known_hosts_files(&ks.files);
+        // Re-read the pins immediately before appending: `ks.existing` is the
+        // snapshot taken when the modal opened, and a pin can appear while it
+        // is open — OpenSSH writes known_hosts BEFORE verifying the signature,
+        // so a TOFU accept in another terminal lands inside the window
+        // (#46 final review).
+        let fresh = matching_known_entries_in(&lookup_key, &resolved);
+        let rows: &[ClassifiedKey] = match &ks.modal {
+            KeyScanModal::Results { rows, .. } => rows,
+            _ => &[],
+        };
+        if let Some(reason) = pin_block(rows, &fresh) {
+            let msg = match reason {
+                PinBlocked::Contradicted => {
+                    "nothing pinned — known_hosts changed while the scan was open and now contradicts these keys"
+                }
+                PinBlocked::AlreadyPinned => {
+                    "nothing pinned — this host was pinned while the scan was open"
+                }
+            };
+            app.toast(msg, true);
+            app.keyscan = None;
+            close_overlay(app);
+            return;
+        }
         match append_entries(&target, &lines) {
             Ok(()) => {
                 app.reload_known_hosts();
@@ -797,7 +839,7 @@ fn handle_keyscan(app: &mut App, key: KeyEvent) {
                 // write landed (#46 final review). Writing to a file ssh does
                 // not read for this host is the failure this feature keeps
                 // re-learning, and it looks exactly like success from here.
-                let seen = matching_known_entries(&lookup_key, &files);
+                let seen = matching_known_entries_in(&lookup_key, &resolved);
                 let visible = lines.iter().all(|line| {
                     let mut f = line.split_whitespace().skip(1);
                     let (Some(key_type), Some(key_b64)) = (f.next(), f.next()) else {
