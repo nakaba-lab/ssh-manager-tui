@@ -53,9 +53,10 @@ const SFTP_BROWSER_FOOTER: &[(&str, &str)] = &[
 const KEY_MANAGER_FOOTER: &[(&str, &str)] = &[
     ("j/k", "move"),
     ("g", "gen"),
-    ("p", "passphrase"),
-    ("y", "copy pub"),
+    ("p", "passphr"),
+    ("y", "copy"),
     ("s", "set-id"),
+    ("D", "deploy"),
     ("d", "del"),
     ("Esc", "back"),
 ];
@@ -145,7 +146,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // Modal overlays on top of the base screen.
     match &app.screen {
         Screen::Help => help::draw(f, app, body_a),
-        Screen::Confirm(action) => confirm::draw(f, action.clone(), body_a),
+        Screen::Confirm(action) => confirm::draw(f, app, action.clone(), body_a),
         Screen::ActionMenu(idx) => confirm::draw_action_menu(f, app, *idx, body_a),
         Screen::GenerateKey { .. } => keys::draw_wizard(f, app, body_a),
         Screen::PickKey { .. } => keys::draw_picker(f, app, body_a),

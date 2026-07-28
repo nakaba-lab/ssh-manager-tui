@@ -58,6 +58,7 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
             lines.push(key("p", "add / change passphrase (ssh-keygen -p)"));
             lines.push(key("y", "copy public key"));
             lines.push(key("s", "set as IdentityFile for host in context"));
+            lines.push(key("D", "deploy public key to host in context"));
             lines.push(key("d", "delete key (private + public)"));
             lines.push(key("r", "rescan"));
         }

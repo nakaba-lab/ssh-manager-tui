@@ -1,8 +1,8 @@
 ---
 title: ui 領域 設計
 area: ui
-status: draft
-relatedIssues: [43, 44, 45, 47, 65, 73]
+status: active
+relatedIssues: [43, 44, 45, 47, 48, 65, 73]
 updated: 2026-07-27
 ---
 
@@ -63,6 +63,29 @@ updated: 2026-07-27
     ```
 
   - **状態**: 入力中（マスク表示）／検証エラー（不一致・空・現行PW誤り＝sticky トースト、モーダルは開いたまま入力PWをスクラブ）／成功（overlay を閉じ成功トースト）。全離脱経路でフォームをスクラブ（Esc・`L`ロック・アイドル自動ロック・終了）。
+- **公開鍵のリモート配布（鍵マネージャ `D`・#48）**: ホスト一覧で `K` → 鍵マネージャ（`key_host_ctx` あり）で鍵を選び `D`（小文字 `p` は #47 のパスフレーズ変更が先に使っているため、Deploy の頭文字を大文字で採る）。フッター（`KEY_MANAGER_FOOTER`）は 1 行 80 桁の制約（`footers_fit_80_cols`）があるため、キーを 1 つ増やすぶんラベルを詰める（`passphrase`→`passphr`・`copy pub`→`copy`）。全文はヘルプモーダルが持つ。**新しい `Screen` は増やさず**、既存の確認モーダル（`Screen::Confirm`）に配布用アクションを 1 つ足すだけに閉じる。実行は確認後に TUI を suspend してインラインで走る（設計の正は [os.md](./os.md)）。
+  - **導線とガード（`s`＝set IdentityFile と同じ流儀に揃える）**: `key_host_ctx` が無ければ「ホスト経由で開いて」の sticky トースト、`.pub` が無ければ「no public key file」、`.pub` 行が検証に落ちれば「配布を拒否した」トースト——いずれも**確認モーダルを開く前**に弾く（危険な行でコマンドを組み立てない）。Include 由来の read-only ホストでも配布は可能（`~/.ssh/config` を書かずリモートの `authorized_keys` だけを変えるため。`s` の read-only ガードとは対象が違う）。
+  - **確認モーダルのレイアウト比較（採択＝案 B）**:
+
+    ```
+    案 A: 汎用確認モーダルを流用          案 B（採択・実装済み）: 配布内容を明示する専用レイアウト
+    centered(56, 7)                       centered(60, 12)
+    ┌─ Deploy public key ────────────┐    ┌─ Deploy public key ──────────────────────────┐
+    │                                │    │                                              │
+    │  Append this key to web-prod?  │    │  Append this key to the remote ~/.ssh/…?     │
+    │                                │    │                                              │
+    │  y/Enter confirm   n/Esc cancel│    │     Host  web-prod (10.0.0.1)                │
+    └────────────────────────────────┘    │      Key  id_ed25519.pub                     │
+                                          │  Fingerprint  SHA256:Rlb…9kQ                 │
+    行数は最小だが「どの鍵が・どこへ・      │  Comment  me@laptop                          │
+    どの指紋で」入るのかが読めない。        │                                              │
+    リモートを書き換える不可逆操作の        │  y/Enter confirm      n/Esc cancel            │
+    確認としては情報が足りない。            └──────────────────────────────────────────────┘
+    ```
+
+    **案 B を採る**理由: 配布は*リモートの認証情報*を書き換える操作で、取り消しは手作業（リモートで該当行を消す）になる。「どの鍵が・どのホストへ」を指紋つきで見せる方が、鍵を取り違えたまま押す事故を防げる。コメントが allowlist で落ちた場合は `Comment` 行を `— (dropped: unsafe characters)` と出し、**リモートに何が入るかを画面と一致させる**（黙って落とさない）。`kv_line` を使うので新しい widget は増えない。値は `kv_line` の 16 桁ラベル溝を差し引いた幅に収まらなければ末尾を残して省略する（`elide`）ため、フル SHA256 指紋は頭尾を残した省略表示になる。汎用モーダルとの共通枠（枠線・色・`y/n` ヒント行）は `draw_modal` に切り出して共有し、体裁が分岐しないようにした。
+  - **状態**: 確認前（モーダル）／実行中（TUI が suspend され `ssh` の出力・パスワードプロンプトが直接見える）／成功（`deployed to <alias>` 自動失効トースト）／既存（`key already present on <alias>` 自動失効トースト）／失敗（sticky エラートースト。非 POSIX シェルの可能性＝Windows OpenSSH サーバに言及する）。
+  - **触る箇所**: `ConfirmAction::DeployKey`（app.rs・ペイロードは `pending_save` と同じ流儀で `App::pending_deploy` に持つ）・`handle_keys` の `D`（update.rs）・`handle_confirm` の terminal 経路（`OverwriteTransfer` と同じ理由で terminal が要る）・`ui/confirm.rs` の描画分岐・ヘルプ/README のキー一覧。**`ACTION_LABELS`／`action_idx` は触らない**（ホストのアクションメニューには足さない＝#48 決定）。
 - **画面追加の 3 箇所**: `Screen::VaultRekey`（app.rs）・`handle_vault_rekey` dispatch（update.rs）・`draw_rekey`（ui/vault.rs＋ui/mod.rs のディスパッチ）。開くキー `m`/`u` は `handle_vault` に追加。
 - **状態設計**: 空（0 件）・ローディング（到達性 `checking`）・エラー（`Toast`）・成功（自動失効 Toast）を各画面で扱う。
 - **レスポンシブ**: `responsive_split` が `WIDE_MIN_WIDTH`（90 桁）以上で横並び・未満で縦積み。フッターは 80 桁以内で描ける（`footers_fit_80_cols` テスト）。**ヒントが増える長いフッターは定数化して `ALL_FOOTERS` に列挙し、ガードがまとめて検査する**（#47 のレビュー時、定数 2 つだけを見ていた旧ガードが Key manager 82 桁・Vault 93 桁の超過を見逃していた）。短いフッターは `draw_footer` 内にインラインのままでよいが、ヒントを足して長くなったら定数へ引き上げてガード対象にする。桁が足りない画面は、使用頻度の低いキーをヘルプモーダル側に寄せる。モーダル内の可変長リスト（同期モーダルの対象ホスト等）は件数を丸めて固定高に収める。
@@ -112,5 +135,6 @@ flowchart TD
 - **ウィザードのパスフレーズはトグルフィールド案を採択**（#47）: 「生成実行時に毎回確認モーダルを挟む」案と比較し、フォームの一貫性（既存 3 フィールドと同じ巡回操作）とパスフレーズ不要ユーザーにステップを増やさない点で優位のため。
 - **PairStatus の見かけ回帰は説明で吸収**（#47）: パスフレーズ無しで検証できないのは仕様（`derive_public_key` は `-P ""`）であり、状態を偽装せず説明文＋トーストで「エラーではない」ことを伝える。
 - **rekey は VaultUnlock 踏襲のオーバーレイ・2 モード 1 画面（#44）**: 中央モーダル（`open_overlay`/`close_overlay`）とし、`m`（パスワード変更）と `u`（KDF 昇格）を `Screen::VaultRekey` の 2 モードに集約（別 Screen を増やさず dispatch/draw を 1 本化）。KDF 昇格は `needs_kdf_upgrade()` 真のときだけ導線を出し、手動強化 vault にダウングレードを勧めない。フォームを `Screen` に載せないのは `Screen` の `Debug`/`Clone` 導出に平文パスワードを漏らさないため（`VaultUnlock` と同じ規律）。
+- **鍵配布は新画面を作らず確認モーダル 1 アクションに閉じる（#48）**: 入口は鍵マネージャの `D` のみとし、ホストのアクションメニュー（`ACTION_LABELS`）には行を足さない。理由は (1) 既存の `s`（set IdentityFile）と同じ「ホスト文脈つきで鍵マネージャを開く」導線に載るので学習コストが増えない、(2) `ACTION_LABELS`/`action_idx`/`action_idx_aligns_with_labels` とモーダル高さの拡張が要らず、既存テストへ波及しない。発見性はヘルプと README のキー一覧で補う。将来アクションメニュー行が欲しくなったら「そのホスト文脈で鍵マネージャを開く」1 行を足すだけで済む（配布ロジックは共有される）。
 - **インスペクタはベース画面（オーバーレイではない）（#43）**: `ssh -G` 出力は 40 行以上になりやすく、full-height の一覧が読みやすいため、Help/DiffPreview のような中央モーダルではなく `known_hosts` と同じベース画面にした（filterable-list パターンを踏襲＝`kh_search`/`kh_state` と同型の inspect 状態を App に持つ）。画面追加の 3 箇所（`Screen`＝app.rs／dispatch＝update.rs／draw＝ui/mod.rs）を触る一般則に従う。
 - **インスペクタにもクライアント信頼ゲート（#73・案 A＝オートフィルと同基準で退避）**: `open_inspect` は `ssh_g_exec_risk()`（config 内容のリスク）に加え、接続 autofill・SFTP arm と同じ **`autofill_client_trusted()` を独立の前段チェック**として通す。untrusted（`[PATH ssh]`）の `ssh -G` は「見るだけ」でも、ゲートが `dirs::home_dir()` 基準で走査した config と Git/MSYS `ssh` が `%HOME%` 基準で読む config が食い違い、未走査の `Match exec` が実行されうるため（根本原因の詳細は [includes.md](./includes.md)）。代替案「開くが警告」は実行リスクが残り、「乖離検出時のみ退避」は検出漏れの余地が残るため不採用（fail-safe 方針を優先）。System32 OpenSSH の無い環境（Git for Windows のみ）ではインスペクタは使えなくなるが、その環境では既にオートフィルが全面停止し `[PATH ssh]` チップで周知済み。ゲートを `ssh_g_exec_risk()` に**混ぜない**のは、exec-risk の意味（config 内容のリスク）を保ち、接続経路の untrusted nudge（`maybe_untrusted_client_nudge`）との区別を崩さないため（接続・SFTP も trust は exec-risk とは別のチェックとして持つ）。なお **trust チェックが `ssh -G` spawn の前段に立つのはインスペクタと SFTP arm の 2 経路**で、接続経路の trust は arming 判定（`connect_plan`）で消費される — その差と受容理由は [includes.md](./includes.md) が正。
