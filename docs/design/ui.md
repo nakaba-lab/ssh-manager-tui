@@ -2,8 +2,8 @@
 title: ui 領域 設計
 area: ui
 status: draft
-relatedIssues: []
-updated: 2026-07-14
+relatedIssues: [49]
+updated: 2026-07-28
 ---
 
 # ui 領域 設計（`src/ui/` — TUI 描画）
@@ -30,6 +30,42 @@ updated: 2026-07-14
 - **状態設計**: 空（0 件）・ローディング（到達性 `checking`）・エラー（`Toast`）・成功（自動失効 Toast）を各画面で扱う。
 - **レスポンシブ**: `responsive_split` が `WIDE_MIN_WIDTH`（90 桁）以上で横並び・未満で縦積み。フッターは 80 桁以内で描ける（`footers_fit_80_cols` テスト）。
 - **配色/コントラスト**: `theme.rs` の Tokyo Night パレットに集約。
+
+### 鍵マネージャの ssh-agent ブロック（#49）
+
+detail ペイン下部に `section_header` で **独立したブロック**を切る。agent 全体状態・サービス状態は**鍵別ではなく全体**の情報なので、鍵別の kv リストには混ぜない（スコープの混在を避ける）。
+
+```
+┌ Keys ──────────────┐┌ Key detail ───────────────┐
+│▶ ● id_ed25519      ││          name  id_ed25519 │
+│    ED25519 256 agent││          type  ED25519    │
+│  ● id_rsa          ││          bits  256        │
+│    RSA 4096        ││   fingerprint  SHA256:Rl… │
+│  ○ work.pub        ││   private key  present    │
+│    ED25519 256     ││          pair  verified … │
+└────────────────────┘│                           │
+                      │ ── ssh-agent ──────────── │
+                      │        status  running (2)│
+                      │       service  running    │
+                      │      this key  loaded     │
+                      └───────────────────────────┘
+```
+
+- **一覧のバッジ**: 既存の `mismatch` バッジと同じ作り（`Span::styled` のテキスト＋`theme` 色）で `agent` を出す。グリフではなくテキストにするのは既存踏襲＋幅計算の安定のため。
+- **状態設計**（このブロックが空/不明/エラーを集約する）:
+
+  | 状態 | `status` 行 | `this key` 行 |
+  |---|---|---|
+  | プローブ中 | `checking…` | `—` |
+  | agent 稼働・鍵あり | `running (N keys)` | `loaded` / `not loaded` |
+  | agent 稼働・鍵なし | `running (no keys)` | `not loaded` |
+  | agent 未起動 | `not running` ＋案内文 | `—` |
+  | `ssh-add` 解決不可 | `unavailable` | `—` |
+  | fingerprint 不明な鍵 | （agent 状態は出る） | `unknown` |
+
+- **サービス停止時の案内**（Windows のみ・2 行）: `管理者権限で Start-Service ssh-agent を実行してください`。sshm は起動を代行しない。
+- **非 Windows**: `service` 行を出さない（`#[cfg(windows)]`）。
+- **レスポンシブ**: 既存 `responsive_split(area, 45, 55)` をそのまま使う。縦積み（90 桁未満）でも agent ブロックは detail 内の最下部に収まる。フッターは 80 桁以内を維持（`footers_fit_80_cols` テストが門番）。フッターへ足すヒントは `a load · D unload` の 2 つのみ。
 
 ## 主要な設計判断（現行の理由）
 
