@@ -1878,6 +1878,11 @@ fn handle_passphrase_sync(app: &mut App, key: KeyEvent) {
             let f = &mut app.passphrase_sync;
             backspace_secret(&mut f.secret, &mut f.cursor);
         }
+        // Drop Ctrl chords instead of typing them: in raw mode crossterm delivers
+        // Ctrl+C as Char('c')+CONTROL, and this field is masked, so a stray chord
+        // would silently corrupt the passphrase that Enter then writes to EVERY
+        // affected host at once.
+        KeyCode::Char(_) if key.modifiers.contains(KeyModifiers::CONTROL) => {}
         KeyCode::Char(c) => {
             let f = &mut app.passphrase_sync;
             insert_char_secret(&mut f.secret, &mut f.cursor, c);
@@ -5433,6 +5438,28 @@ mod tests {
             assert_eq!(note, &vault.entries[*idx].note);
         }
         assert_eq!(plan[0].1, "key", "ログインパスワードを掴んではならない");
+    }
+
+    /// handle_passphrase_sync — Ctrl 修飾のキーは秘密に混入しない
+    #[test]
+    fn handle_passphrase_sync_ignores_control_chords() {
+        // given: raw mode の Windows では Ctrl+C が Char('c')+CONTROL として届く
+        let mut app = app_fixture("Host h\n  HostName h\n");
+        app.screen = Screen::KeyManager;
+        open_overlay(&mut app, Screen::PassphraseSync);
+
+        // when
+        handle_passphrase_sync(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
+
+        // then: マスク表示なので混入に気づけず、Enter 1 回で全ホストへ波及する
+        assert!(
+            app.passphrase_sync.secret.is_empty(),
+            "Ctrl chord must not type into the secret: {:?}",
+            app.passphrase_sync.secret.len()
+        );
     }
 
     /// handle_passphrase_sync — Esc は入力を捨てて元の画面へ戻る（AC4 のスキップ）
