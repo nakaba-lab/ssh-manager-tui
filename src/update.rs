@@ -40,8 +40,8 @@ use crate::os::keyscan::{
 use crate::os::known_hosts::{KnownHostEntry, append_entries, remove_entry};
 use crate::os::resolve::{
     ResolvedConfig, has_match_exec, has_unresolvable_known_hosts_file, is_host_known,
-    is_none_file_list, matching_known_entries, primary_known_hosts_file, read_config_with_includes,
-    resolve_config_with_options, tofu_lookup_key,
+    is_none_file_list, known_hosts_paths_are_ambiguous, matching_known_entries,
+    primary_known_hosts_file, resolve_config_with_options, tofu_lookup_key,
 };
 use crate::os::sftp::{SftpOp, SftpSession, remote_join, remote_parent, sftp_quote, stage_batch};
 use crate::os::ssh_dir;
@@ -718,51 +718,23 @@ fn open_keyscan(app: &mut App, host_idx: usize) {
         return;
     }
     let alias = host.alias().to_string();
-    // `ssh -G` EXECUTES a `Match exec` predicate, which this action must not
-    // trigger as a side effect of opening a menu entry — and a nondeterministic
-    // predicate would also make this snapshot disagree with the resolution the
-    // real connect uses, so the pins read and the file written could belong to
-    // different configs (#46 round 8).
+    // NOTE ON `Match exec`: resolving with `ssh -G` evaluates such a predicate,
+    // exactly as any `ssh` invocation to this host would. This action is an
+    // explicit user choice, so that is accepted rather than guarded against.
     //
-    // The text inspected must be the text `ssh -G` will read: the user config,
-    // the SYSTEM config, and everything they `Include` — plus the file sshm
-    // itself loaded, which `--config` can point elsewhere. Checking only the
-    // loaded file, and stopping at an `Include`, each let the predicate run
-    // (#46 rounds 9-10). `read_config_with_includes` returns `None` when it
-    // cannot see the whole thing (an unexpandable glob, an unreadable include),
-    // and an unseen part is not a basis for deciding — so that refuses too.
-    let mut config_text = app.config.render();
-    for path in [
-        ssh_dir().map(|d| d.join("config")),
-        Some(std::path::PathBuf::from("/etc/ssh/ssh_config")),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        match read_config_with_includes(&path) {
-            Some(text) => config_text.push_str(&text),
-            None => {
-                app.toast(
-                    format!(
-                        "can't scan {alias}: an ssh config `Include` could not be expanded, so \
-                         a `Match exec` cannot be ruled out — pin manually"
-                    ),
-                    true,
-                );
-                return;
-            }
-        }
-    }
-    if has_match_exec(&config_text) {
-        app.toast(
-            format!(
-                "can't scan {alias}: the ssh config contains a `Match exec`, and resolving the \
-                 host would run it — pin manually"
-            ),
-            true,
-        );
-        return;
-    }
+    // Three rounds of review (#46 rounds 9-11) tried to predict it instead, by
+    // reading the config text — the loaded file, then also `~/.ssh/config` and
+    // `/etc/ssh/ssh_config`, then expanding `Include`. Every version was
+    // evaded, because it amounted to reimplementing OpenSSH's parser and
+    // glob(3): `Match !exec`, a non-UTF-8 byte, `Include` with a `[...]` class,
+    // a quoted or `=`-bearing include path, and the Windows system-config
+    // location each slipped through, and the file reading itself opened a DoS
+    // (a fifo include blocks the UI thread forever).
+    //
+    // What actually matters is not "does a predicate exist" but "did the
+    // resolution this scan is based on stay stable" — and that is CHECKED, not
+    // predicted: `handle_keyscan` re-resolves immediately before appending and
+    // refuses if the known_hosts file lists or the pin target moved.
     let rc = match resolve_config_with_options(&[], &alias) {
         Ok(rc) => rc,
         Err(e) => {
@@ -844,6 +816,22 @@ fn open_keyscan(app: &mut App, host_idx: usize) {
         );
         return;
     }
+    // Same principle: if the reported words read equally well as separate paths
+    // or as one space-bearing path, the pins we would see and the file we would
+    // write to are a guess.
+    if known_hosts_file_lists(&rc)
+        .iter()
+        .any(|list| known_hosts_paths_are_ambiguous(list))
+    {
+        app.toast(
+            format!(
+                "can't scan {alias}: the known_hosts paths ssh reports can be read more than \
+                 one way (a file name contains a space) — pin manually"
+            ),
+            true,
+        );
+        return;
+    }
     let existing = matching_entries_per_option(&lookup_key, &rc);
     let mut session = KeyscanSession::open();
     session.request(&hostname, &port);
@@ -896,6 +884,33 @@ fn handle_keyscan(app: &mut App, key: KeyEvent) {
         let (alias, target) = (ks.alias.clone(), ks.pin_target.clone());
         let lookup_key = ks.lookup_key.clone();
         let ks_files = ks.files.clone();
+        // Re-RESOLVE, and refuse if the answer moved. A `Match exec` predicate
+        // (or any config edit) can make `ssh -G` report different known_hosts
+        // files at scan time and at connect time, which would mean the pins
+        // were read from — and the key written to — files the real connection
+        // does not use. Checking the property directly beats predicting it from
+        // config text, which was evaded three rounds running (#46 round 11).
+        let moved = match resolve_config_with_options(&[], &alias) {
+            Ok(fresh_rc) => {
+                known_hosts_file_lists(&fresh_rc) != ks_files
+                    || keyscan_pin_target(&fresh_rc).as_ref() != Some(&target)
+                    || tofu_lookup_key(&fresh_rc).as_deref() != Some(lookup_key.as_str())
+            }
+            // Could not re-resolve: we cannot confirm the basis still holds.
+            Err(_) => true,
+        };
+        if moved {
+            app.toast(
+                format!(
+                    "nothing pinned — {alias} now resolves differently than when the scan \
+                     started, so the keys may belong to another target"
+                ),
+                true,
+            );
+            app.keyscan = None;
+            close_overlay(app);
+            return;
+        }
         // Re-read the pins immediately before appending: `ks.existing` is the
         // snapshot taken when the modal opened, and a pin can appear while it
         // is open — OpenSSH writes known_hosts BEFORE verifying the signature,
