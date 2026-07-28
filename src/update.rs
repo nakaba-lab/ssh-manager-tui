@@ -706,6 +706,64 @@ fn keyscan_gate(is_proxied: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// Every precondition the scan must hold, evaluated on a RESOLVED config.
+///
+/// Returns the lookup key and the pin target, or the user-facing reason to
+/// refuse. Kept as one function because `handle_keyscan` re-evaluates the WHOLE
+/// verdict before appending: checking only a few fields let a config that
+/// acquired a `KnownHostsCommand`, a proxy or an unsplittable path DURING the
+/// modal window append anyway (#46 round 12).
+fn keyscan_preconditions(
+    rc: &ResolvedConfig,
+    alias: &str,
+) -> Result<(String, std::path::PathBuf), String> {
+    // `HostView::is_proxied` only sees what the alias's own block declares, so a
+    // proxy inherited from a `Host *` stanza or an `Include` is caught here.
+    keyscan_gate(rc.proxy_jump.is_some() || rc.proxy_command.is_some())?;
+    // Trust from somewhere `ssh-keygen -F` cannot see (`KnownHostsCommand`,
+    // SSHFP, GSSAPI keyex): "no matching entry" would not mean "unpinned", so
+    // appending would sidecar that trust path.
+    if rc.has_external_trust_source {
+        return Err(format!(
+            "can't scan {alias}: its host keys are verified by KnownHostsCommand, DNS (SSHFP) \
+             or GSSAPI key exchange, which this build cannot inspect — pin manually"
+        ));
+    }
+    if rc.known_hosts_list_lossy {
+        return Err(format!(
+            "can't scan {alias}: a known_hosts path contains repeated spaces or a tab, which \
+             this build cannot split reliably — pin manually"
+        ));
+    }
+    let lists = known_hosts_file_lists(rc);
+    // Deciding pinnability needs a COMPLETE picture of the host's pins. An
+    // explicitly-set `GlobalKnownHostsFile` with a `~`/`%` token arrives
+    // unexpanded from `ssh -G`, so a genuine pin could be living there unseen.
+    if has_unresolvable_known_hosts_file(&lists.concat()) {
+        return Err(format!(
+            "can't scan {alias}: ssh reports a known_hosts path this build can't resolve \
+             (unexpanded ~ or %) — pin manually or use an absolute path"
+        ));
+    }
+    // Same principle: if the reported words read equally well as separate paths
+    // or as one space-bearing path, the pins we would see and the file we would
+    // write to are a guess.
+    if lists.iter().any(|l| known_hosts_paths_are_ambiguous(l)) {
+        return Err(format!(
+            "can't scan {alias}: the known_hosts paths ssh reports can be read more than one \
+             way (a file name contains a space) — pin manually"
+        ));
+    }
+    let lookup_key =
+        tofu_lookup_key(rc).ok_or_else(|| format!("could not resolve a host name for {alias}"))?;
+    // The lookup key becomes the host field of every appended line, so it must
+    // be a single, literal known_hosts token.
+    keyscan_lookup_key_gate(&lookup_key)?;
+    let pin_target = keyscan_pin_target(rc)
+        .ok_or_else(|| format!("could not resolve a known_hosts file for {alias}"))?;
+    Ok((lookup_key, pin_target))
+}
+
 /// Open the host-key scan overlay (#46): gate proxied hosts, resolve the scan
 /// target on the bounded `ssh -G` runner, seed the existing pins for
 /// classification, and dispatch the scan to the worker session.
@@ -742,96 +800,15 @@ fn open_keyscan(app: &mut App, host_idx: usize) {
             return;
         }
     };
-    // Re-gate on the RESOLVED config: `HostView::is_proxied` only sees what this
-    // alias's own block declares, so a proxy inherited from a `Host *` stanza or
-    // an `Include` would otherwise slip through (#46 review).
-    if let Err(msg) = keyscan_gate(rc.proxy_jump.is_some() || rc.proxy_command.is_some()) {
-        app.toast(msg, true);
-        return;
-    }
-    let Some(lookup_key) = tofu_lookup_key(&rc) else {
-        app.toast(format!("could not resolve a host name for {alias}"), true);
-        return;
-    };
-    // The lookup key becomes the host field of every appended line, so it must
-    // be a single, literal known_hosts token. A pattern or embedded whitespace
-    // would widen the pin past the host that was actually scanned.
-    if let Err(msg) = keyscan_lookup_key_gate(&lookup_key) {
-        app.toast(msg, true);
-        return;
-    }
-    // This host's trust comes from somewhere `ssh-keygen -F` cannot see
-    // (`KnownHostsCommand` / `VerifyHostKeyDNS yes`), so "no matching entry"
-    // would not mean "unpinned" — appending would sidecar that trust path.
-    if rc.has_external_trust_source {
-        app.toast(
-            format!(
-                "can't scan {alias}: its host keys are verified by KnownHostsCommand or DNS \
-                 (SSHFP), which this build cannot inspect — pin manually"
-            ),
-            true,
-        );
-        return;
-    }
-    // Checked BEFORE the pin target is resolved: a lossy list usually also
-    // fails to resolve, and the generic "could not resolve" toast would mask
-    // the actionable reason (#46 round 7).
-    if rc.known_hosts_list_lossy {
-        app.toast(
-            format!(
-                "can't scan {alias}: a known_hosts path contains repeated spaces or a tab, \
-                 which this build cannot split reliably — pin manually"
-            ),
-            true,
-        );
-        return;
-    }
-    let Some(pin_target) = keyscan_pin_target(&rc) else {
-        app.toast(
-            format!("could not resolve a known_hosts file for {alias}"),
-            true,
-        );
-        return;
+    let (lookup_key, pin_target) = match keyscan_preconditions(&rc, &alias) {
+        Ok(pair) => pair,
+        Err(msg) => {
+            app.toast(msg, true);
+            return;
+        }
     };
     let hostname = rc.hostname.clone().unwrap_or_else(|| alias.clone());
     let port = rc.port.clone().unwrap_or_else(|| "22".to_string());
-    // Classification source: the entries OpenSSH ITSELF matches for this lookup
-    // key across the files `ssh -G` reported — the same mechanism (and the same
-    // file set) the `is_host_known` trust gate reads. Hand-rolled token matching
-    // missed hashed lines (`HashKnownHosts yes`, the Debian/Ubuntu default),
-    // custom `UserKnownHostsFile`s, wildcards and case, each of which made a
-    // CHANGED key render as `[new]` (#46 review).
-    let files = known_hosts_files(&rc);
-    // Deciding pinnability needs a COMPLETE picture of the host's pins. If any
-    // reported file cannot be resolved (an explicitly-set `GlobalKnownHostsFile`
-    // with a `~`/`%` token arrives unexpanded from `ssh -G`), a genuine pin
-    // could be living there unseen — refuse rather than pin on a partial view.
-    if has_unresolvable_known_hosts_file(&files) {
-        app.toast(
-            format!(
-                "can't scan {alias}: ssh reports a known_hosts path this build can't resolve \
-                 (unexpanded ~ or %) — pin manually or use an absolute path"
-            ),
-            true,
-        );
-        return;
-    }
-    // Same principle: if the reported words read equally well as separate paths
-    // or as one space-bearing path, the pins we would see and the file we would
-    // write to are a guess.
-    if known_hosts_file_lists(&rc)
-        .iter()
-        .any(|list| known_hosts_paths_are_ambiguous(list))
-    {
-        app.toast(
-            format!(
-                "can't scan {alias}: the known_hosts paths ssh reports can be read more than \
-                 one way (a file name contains a space) — pin manually"
-            ),
-            true,
-        );
-        return;
-    }
     let existing = matching_entries_per_option(&lookup_key, &rc);
     let mut session = KeyscanSession::open();
     session.request(&hostname, &port);
@@ -884,25 +861,34 @@ fn handle_keyscan(app: &mut App, key: KeyEvent) {
         let (alias, target) = (ks.alias.clone(), ks.pin_target.clone());
         let lookup_key = ks.lookup_key.clone();
         let ks_files = ks.files.clone();
-        // Re-RESOLVE, and refuse if the answer moved. A `Match exec` predicate
-        // (or any config edit) can make `ssh -G` report different known_hosts
-        // files at scan time and at connect time, which would mean the pins
-        // were read from — and the key written to — files the real connection
-        // does not use. Checking the property directly beats predicting it from
-        // config text, which was evaded three rounds running (#46 round 11).
+        // Re-RESOLVE and re-run the WHOLE precondition verdict, then refuse if
+        // anything moved. A `Match exec` predicate (or any config edit) can make
+        // `ssh -G` answer differently at scan time and at connect time, which
+        // would mean the pins were read from — and the key written to — files
+        // the real connection does not use. Comparing only a few fields let a
+        // config that acquired a `KnownHostsCommand`, a proxy or an
+        // unsplittable path mid-window append anyway (#46 round 12).
+        //
+        // LIMIT: this is two adjacent samples. A resolution that flips OUTSIDE
+        // the modal window — a `Match exec` keyed on time, network or a counter
+        // — is not detected; see docs/design/security.md.
         let moved = match resolve_config_with_options(&[], &alias) {
-            Ok(fresh_rc) => {
-                known_hosts_file_lists(&fresh_rc) != ks_files
-                    || keyscan_pin_target(&fresh_rc).as_ref() != Some(&target)
-                    || tofu_lookup_key(&fresh_rc).as_deref() != Some(lookup_key.as_str())
-            }
+            Ok(fresh_rc) => match keyscan_preconditions(&fresh_rc, &alias) {
+                Ok((fresh_key, fresh_target)) => {
+                    known_hosts_file_lists(&fresh_rc) != ks_files
+                        || fresh_target != target
+                        || fresh_key != lookup_key
+                }
+                // A precondition that now refuses is itself a move.
+                Err(_) => true,
+            },
             // Could not re-resolve: we cannot confirm the basis still holds.
             Err(_) => true,
         };
         if moved {
             app.toast(
                 format!(
-                    "nothing pinned — {alias} now resolves differently than when the scan \
+                    "nothing pinned — {alias} no longer resolves the way it did when the scan \
                      started, so the keys may belong to another target"
                 ),
                 true,

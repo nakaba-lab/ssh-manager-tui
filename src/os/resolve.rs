@@ -332,12 +332,27 @@ pub fn matching_known_entries(lookup_key: &str, files: &[String]) -> Vec<KnownHo
 /// the writer cannot, so it refuses when the input is ambiguous at all.
 pub fn known_hosts_paths_are_ambiguous(files: &[String]) -> bool {
     let expanded: Vec<String> = files.iter().map(|p| expand_known_hosts_path(p)).collect();
-    let exists = |p: &str| std::path::Path::new(p).exists();
+    // A run is JOINABLE under either coalescing predicate in use: the readers
+    // join when the joined path exists; the writer also joins when its parent
+    // directory exists (a first pin names a file that does not exist yet).
+    // Both must be considered, or an attacker picks whichever the checker
+    // ignores (#46 round 12).
+    let joinable = |p: &str| {
+        let path = std::path::Path::new(p);
+        path.exists()
+            || path
+                .parent()
+                .is_some_and(|d| !d.as_os_str().is_empty() && d.is_dir())
+    };
+    // Ambiguity is about what a join would SWALLOW, not about its first word:
+    // if any word inside the run is a real file on its own, "separate paths" is
+    // a legitimate reading and joining would hide that file's pins. Only
+    // REGULAR files count — a directory holds no entries, so a sibling account
+    // directory must not make the space-bearing Windows home ambiguous.
+    let is_file = |p: &str| std::fs::metadata(p).is_ok_and(|m| m.is_file());
     (0..expanded.len()).any(|i| {
-        // A joined run is only ambiguous if its first word is ALSO a real path;
-        // otherwise the join is the only reading (the space-bearing Windows
-        // home, where `C:/Users/First` does not exist on its own).
-        exists(&expanded[i]) && (i + 1..expanded.len()).any(|j| exists(&expanded[i..=j].join(" ")))
+        (i + 1..expanded.len())
+            .any(|j| joinable(&expanded[i..=j].join(" ")) && (i..=j).any(|k| is_file(&expanded[k])))
     })
 }
 
@@ -611,10 +626,62 @@ mod tests {
         // then — ambiguous, and the writer must refuse rather than guess
         assert!(known_hosts_paths_are_ambiguous(&list));
 
-        // and the space-bearing Windows home stays UNambiguous: the first word
-        // is not a real path on its own, so the join is the only reading
+        // and the space-bearing Windows home stays UNambiguous: neither word is
+        // a real FILE on its own, so the join is the only reading
         let win = vec![f("First"), "Last/.ssh/known_hosts".to_string()];
         assert!(!known_hosts_paths_are_ambiguous(&win));
+        // even when a sibling account DIRECTORY exists — a directory holds no
+        // entries, so it must not disable the feature (#46 round 12)
+        std::fs::create_dir_all(dir.join("First")).unwrap();
+        assert!(!known_hosts_paths_are_ambiguous(&win));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ambiguity_covers_a_swallow_whose_first_word_is_absent() {
+        // given — the run the reader would join starts with a word that does
+        // NOT exist. Coalescing joins on whether the JOIN exists, so requiring
+        // the first word to exist missed this entirely, and the swallowed
+        // file's pins went invisible while the write target stayed a real file
+        // (#46 round 12, reproduced end-to-end).
+        let dir = std::env::temp_dir().join(format!("sshm-swallow2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = |n: &str| dir.join(n).to_str().unwrap().to_string();
+        std::fs::write(dir.join("f1"), "").unwrap();
+        std::fs::write(dir.join("f3"), "h ssh-ed25519 GENUINE\n").unwrap();
+        // `g` is absent on purpose
+        let list = vec![f("f1"), f("g"), f("f3")];
+        assert!(!known_hosts_paths_are_ambiguous(&list));
+
+        // when — a file named "<g> <f3>" exists
+        let swallow = std::path::PathBuf::from(format!("{} {}", f("g"), f("f3")));
+        std::fs::create_dir_all(swallow.parent().unwrap()).unwrap();
+        std::fs::write(&swallow, "").unwrap();
+        // then — ambiguous: f3 is a real file the join would swallow
+        assert!(known_hosts_paths_are_ambiguous(&list));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ambiguity_covers_the_writers_parent_dir_join() {
+        // given — two real files, and only the DIRECTORY that the joined name
+        // would live in. The readers do not join (the join does not exist) but
+        // the writer does (its parent is a dir), so the write went to a stray
+        // path while the post-write check re-read it and reported success
+        // (#46 round 12).
+        let dir = std::env::temp_dir().join(format!("sshm-swallow3-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = |n: &str| dir.join(n).to_str().unwrap().to_string();
+        std::fs::write(dir.join("f1"), "").unwrap();
+        std::fs::write(dir.join("f2"), "").unwrap();
+        let list = vec![f("f1"), f("f2")];
+        assert!(!known_hosts_paths_are_ambiguous(&list));
+
+        // when — the attacker creates the directory the join would sit in
+        let join = std::path::PathBuf::from(format!("{} {}", f("f1"), f("f2")));
+        std::fs::create_dir_all(join.parent().unwrap()).unwrap();
+        // then — ambiguous under the writer's predicate too
+        assert!(known_hosts_paths_are_ambiguous(&list));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
