@@ -39,8 +39,8 @@ use crate::os::keyscan::{
 };
 use crate::os::known_hosts::{KnownHostEntry, append_entries, remove_entry};
 use crate::os::resolve::{
-    ResolvedConfig, has_include, has_match_exec, has_unresolvable_known_hosts_file, is_host_known,
-    is_none_file_list, matching_known_entries, primary_known_hosts_file,
+    ResolvedConfig, has_match_exec, has_unresolvable_known_hosts_file, is_host_known,
+    is_none_file_list, matching_known_entries, primary_known_hosts_file, read_config_with_includes,
     resolve_config_with_options, tofu_lookup_key,
 };
 use crate::os::sftp::{SftpOp, SftpSession, remote_join, remote_parent, sftp_quote, stage_batch};
@@ -724,27 +724,41 @@ fn open_keyscan(app: &mut App, host_idx: usize) {
     // real connect uses, so the pins read and the file written could belong to
     // different configs (#46 round 8).
     //
-    // The text inspected must be the text `ssh -G` will read. `app.config` is
-    // whatever file sshm loaded, which `--config` can point elsewhere; and
-    // neither is expanded, so an `Include` hides its contents from the check.
-    // Both evaded the guard while the predicate ran (#46 round 9), so scan the
-    // file ssh reads AS WELL as the loaded one, and refuse outright when either
-    // carries an `Include` — a partial view is not a basis for deciding.
-    let default_config = ssh_dir()
-        .map(|d| d.join("config"))
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .unwrap_or_default();
-    let loaded_config = app.config.render();
-    let refusal = if has_match_exec(&default_config) || has_match_exec(&loaded_config) {
-        Some("contains a `Match exec`, and resolving the host would run it")
-    } else if has_include(&default_config) || has_include(&loaded_config) {
-        Some("uses `Include`, whose contents this build cannot inspect for `Match exec`")
-    } else {
-        None
-    };
-    if let Some(reason) = refusal {
+    // The text inspected must be the text `ssh -G` will read: the user config,
+    // the SYSTEM config, and everything they `Include` — plus the file sshm
+    // itself loaded, which `--config` can point elsewhere. Checking only the
+    // loaded file, and stopping at an `Include`, each let the predicate run
+    // (#46 rounds 9-10). `read_config_with_includes` returns `None` when it
+    // cannot see the whole thing (an unexpandable glob, an unreadable include),
+    // and an unseen part is not a basis for deciding — so that refuses too.
+    let mut config_text = app.config.render();
+    for path in [
+        ssh_dir().map(|d| d.join("config")),
+        Some(std::path::PathBuf::from("/etc/ssh/ssh_config")),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        match read_config_with_includes(&path) {
+            Some(text) => config_text.push_str(&text),
+            None => {
+                app.toast(
+                    format!(
+                        "can't scan {alias}: an ssh config `Include` could not be expanded, so \
+                         a `Match exec` cannot be ruled out — pin manually"
+                    ),
+                    true,
+                );
+                return;
+            }
+        }
+    }
+    if has_match_exec(&config_text) {
         app.toast(
-            format!("can't scan {alias}: the ssh config {reason} — pin manually"),
+            format!(
+                "can't scan {alias}: the ssh config contains a `Match exec`, and resolving the \
+                 host would run it — pin manually"
+            ),
             true,
         );
         return;

@@ -6,6 +6,7 @@
 //! resolved here are consumed by the connect wiring in Phase 3.
 
 use std::io;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -273,7 +274,10 @@ pub fn has_match_exec(config_text: &str) -> bool {
         {
             continue;
         }
-        if words.any(|w| w.eq_ignore_ascii_case("exec")) {
+        // A leading `!` NEGATES a criterion but still evaluates it — OpenSSH
+        // runs `Match !exec "cmd"` just as it runs `Match exec "cmd"` (verified).
+        // Comparing the undecorated word missed it entirely (#46 round 10).
+        if words.any(|w| w.trim_start_matches('!').eq_ignore_ascii_case("exec")) {
             return true;
         }
     }
@@ -318,26 +322,133 @@ pub fn matching_known_entries(lookup_key: &str, files: &[String]) -> Vec<KnownHo
         .collect()
 }
 
-/// True if the config text contains an `Include` directive.
+/// The `Include` targets named on a config line, if it is one.
 ///
-/// Included files are not parsed by this program, so any check that reasons
-/// over config TEXT (notably [`has_match_exec`]) is blind to what they add.
-/// A caller that must not decide on a partial view refuses instead
-/// (#46 round 9: a `Match exec` inside an included file evaded the guard and
-/// `ssh -G` executed the predicate anyway).
-pub fn has_include(config_text: &str) -> bool {
-    config_text.lines().any(|line| {
-        let line = line.trim_start();
-        if line.starts_with('#') {
-            return false;
+/// Returns `None` for any other line. Applies the same splice/`=` normalization
+/// [`has_match_exec`] uses, so `Inc"lude"` and `Include=path` are recognised.
+fn include_targets(line: &str) -> Option<Vec<String>> {
+    let line = line.trim_start();
+    if line.starts_with('#') {
+        return None;
+    }
+    let normalized = line.replace('"', "").replace('=', " ");
+    let mut words = normalized.split_whitespace();
+    if !words.next()?.eq_ignore_ascii_case("include") {
+        return None;
+    }
+    let targets: Vec<String> = words
+        .take_while(|w| !w.starts_with('#'))
+        .map(str::to_string)
+        .collect();
+    Some(targets)
+}
+
+/// Read a config file and everything it `Include`s, concatenated.
+///
+/// `None` means "could not see the whole thing" — an include this code cannot
+/// expand (a glob outside the final path component, an unreadable match, or
+/// nesting past [`INCLUDE_MAX_DEPTH`]). Callers that must not decide on a
+/// partial view refuse rather than proceed: a `Match exec` inside an included
+/// file evaded a text check that stopped at the top-level file, and `ssh -G`
+/// executed the predicate anyway (#46 round 9).
+///
+/// Bytes are read with [`String::from_utf8_lossy`], not `read_to_string`: ssh
+/// reads bytes, and one non-UTF-8 byte anywhere (even in a comment) used to
+/// make the whole guard silently see an empty config (#46 round 10).
+/// A missing file is `Some("")` — ssh tolerates that too.
+pub fn read_config_with_includes(path: &Path) -> Option<String> {
+    let mut out = String::new();
+    read_config_into(path, base_dir_for(path), 0, &mut out)?;
+    Some(out)
+}
+
+/// OpenSSH resolves a relative `Include` against `~/.ssh` for a user config and
+/// `/etc/ssh` for a system one.
+fn base_dir_for(path: &Path) -> PathBuf {
+    if path.starts_with("/etc/ssh") {
+        PathBuf::from("/etc/ssh")
+    } else {
+        super::binaries::ssh_dir().unwrap_or_else(|| PathBuf::from("."))
+    }
+}
+
+const INCLUDE_MAX_DEPTH: usize = 16;
+
+fn read_config_into(path: &Path, base: PathBuf, depth: usize, out: &mut String) -> Option<()> {
+    if depth > INCLUDE_MAX_DEPTH {
+        return None;
+    }
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Some(()),
+        Err(_) => return None, // unreadable: we cannot claim to have seen it
+    };
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    for line in text.lines() {
+        if let Some(targets) = include_targets(line) {
+            for target in targets {
+                for file in expand_include(&target, &base)? {
+                    read_config_into(&file, base.clone(), depth + 1, out)?;
+                }
+            }
         }
-        // Same splice/`=` normalization `has_match_exec` applies.
-        let normalized = line.replace('"', "").replace('=', " ");
-        normalized
-            .split_whitespace()
-            .next()
-            .is_some_and(|kw| kw.eq_ignore_ascii_case("include"))
-    })
+    }
+    out.push_str(&text);
+    out.push('\n');
+    Some(())
+}
+
+/// Resolve one `Include` target to concrete files. `None` when the pattern is
+/// beyond what this expands (a `*`/`?` outside the final component).
+fn expand_include(target: &str, base: &Path) -> Option<Vec<PathBuf>> {
+    let expanded = match target.strip_prefix("~/") {
+        Some(rest) => dirs::home_dir()?.join(rest),
+        None if target.starts_with('~') => return None, // ~user: not expanded
+        None => {
+            let p = Path::new(target);
+            if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                base.join(p)
+            }
+        }
+    };
+    let name = expanded.file_name().and_then(|n| n.to_str())?;
+    let parent = expanded.parent().unwrap_or(Path::new("."));
+    if parent.to_string_lossy().contains(['*', '?']) {
+        return None; // a glob in a directory component — not expanded here
+    }
+    if !name.contains(['*', '?']) {
+        return Some(vec![expanded.clone()]);
+    }
+    let mut out: Vec<PathBuf> = std::fs::read_dir(parent)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|f| glob_matches(name, f))
+        })
+        .map(|e| e.path())
+        .collect();
+    out.sort();
+    Some(out)
+}
+
+/// Minimal `*`/`?` glob over one filename component (OpenSSH's `Include`
+/// patterns are shell globs; `[...]` classes are not supported here and reach
+/// the caller as a literal, which can only widen the match set, never narrow it
+/// into a false "nothing to include").
+fn glob_matches(pattern: &str, name: &str) -> bool {
+    fn go(p: &[u8], n: &[u8]) -> bool {
+        match p.first() {
+            None => n.is_empty(),
+            Some(b'*') => go(&p[1..], n) || (!n.is_empty() && go(p, &n[1..])),
+            Some(b'?') => !n.is_empty() && go(&p[1..], &n[1..]),
+            Some(c) => n.first() == Some(c) && go(&p[1..], &n[1..]),
+        }
+    }
+    go(pattern.as_bytes(), name.as_bytes())
 }
 
 /// True when `ssh -G` reported a known-hosts file this code cannot resolve to a
@@ -693,10 +804,14 @@ mod tests {
         // version of this test used `verifyhostkeydns yes`, which `ssh -G`
         // never emits (it renders the multistate as `true`/`false`/`ask`), so
         // the test passed while the guard was dead code (#46 round 9).
+        // NOTE: `ssh -G` renders `verifyhostkeydns` as true/false/ask but
+        // `gssapikeyexchange` as yes/no — the values below are the ones each
+        // option really prints. A test using a value ssh -G cannot produce
+        // passes while the guard is dead code (#46 rounds 9-10).
         for dump in [
             "knownhostscommand /usr/local/bin/kh.sh",
             "verifyhostkeydns true",
-            "gssapikeyexchange true",
+            "gssapikeyexchange yes",
         ] {
             assert!(
                 parse_ssh_g_output(dump).has_external_trust_source,
@@ -711,7 +826,7 @@ mod tests {
             // `ask` prompts the user and still records the key in known_hosts,
             // so "no matching entry" genuinely means "not yet trusted"
             "verifyhostkeydns ask",
-            "gssapikeyexchange false",
+            "gssapikeyexchange no",
             "hostname db.example",
         ] {
             assert!(
@@ -722,25 +837,93 @@ mod tests {
     }
 
     #[test]
-    fn include_is_detected_so_a_text_check_never_decides_on_a_partial_view() {
-        // given / when / then — an `Include` hides whatever it pulls in, so a
-        // check that reasons over config TEXT (`has_match_exec`) is blind past
-        // it. A `Match exec` inside an included file evaded the guard while
-        // `ssh -G` still ran the predicate (#46 round 9).
+    fn include_targets_recognises_the_forms_ssh_honours() {
+        // given / when / then — every spelling real OpenSSH accepts
         for text in [
-            "Include ~/.ssh/conf.d/*.conf",
+            "Include ~/.ssh/conf.d/x.conf",
             "  include /etc/ssh/extra",
             "Include=\"/etc/ssh/extra\"",
+            "Inc\"lude\" /etc/ssh/extra",
+            "Include /etc/ssh/extra #trailing",
         ] {
-            assert!(has_include(text), "should detect: {text}");
+            assert!(
+                include_targets(text).is_some_and(|t| !t.is_empty()),
+                "should parse: {text}"
+            );
         }
         for text in [
             "# Include ~/.ssh/conf.d/*.conf",
-            "Host db\n  HostName db.example",
+            "Host db",
             "IdentityFile ~/.ssh/include_me",
+            "IncludeFoo /etc/x",
         ] {
-            assert!(!has_include(text), "should not detect: {text}");
+            assert!(include_targets(text).is_none(), "should not parse: {text}");
         }
+        // and a trailing comment is not a target
+        assert_eq!(
+            include_targets("Include /etc/ssh/extra #c").unwrap(),
+            vec!["/etc/ssh/extra".to_string()]
+        );
+    }
+
+    #[test]
+    fn read_config_with_includes_expands_globs_and_refuses_what_it_cannot_see() {
+        // given — a config that includes a glob directory
+        let dir = std::env::temp_dir().join(format!("sshm-inc-{}", std::process::id()));
+        let sub = dir.join("conf.d");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("a.conf"), "Match exec \"/bin/true\"\n").unwrap();
+        std::fs::write(sub.join("b.txt"), "Host ignored\n").unwrap();
+        let top = dir.join("config");
+        std::fs::write(
+            &top,
+            format!("Include {}/*.conf\nHost db\n", sub.to_str().unwrap()),
+        )
+        .unwrap();
+        // when
+        let text = read_config_with_includes(&top).expect("expandable");
+        // then — the included file's `Match exec` is visible to the guard, and
+        // the non-matching file is not pulled in
+        assert!(has_match_exec(&text), "included Match exec must be seen");
+        assert!(!text.contains("Host ignored"));
+
+        // given — a glob in a DIRECTORY component, which this does not expand
+        let bad = dir.join("bad");
+        std::fs::write(&bad, "Include /etc/ssh/*/x.conf\n").unwrap();
+        // when / then — `None`, so the caller refuses rather than assume
+        assert_eq!(read_config_with_includes(&bad), None);
+
+        // a missing file is fine (ssh tolerates it too)
+        assert_eq!(
+            read_config_with_includes(&dir.join("nope")),
+            Some(String::new())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_config_with_includes_survives_non_utf8_bytes() {
+        // given — a config with a Latin-1 byte in a comment. `read_to_string`
+        // fails on it, and falling back to "" silently disabled the whole guard
+        // (#46 round 10).
+        let dir = std::env::temp_dir().join(format!("sshm-inc8-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config");
+        std::fs::write(&path, b"# caf\xE9\nMatch exec \"/bin/true\"\n").unwrap();
+        // when
+        let text = read_config_with_includes(&path).expect("readable");
+        // then — the directive is still seen
+        assert!(has_match_exec(&text));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn match_exec_detects_the_negated_form() {
+        // given / when / then — OpenSSH RUNS the predicate for `!exec` too
+        assert!(has_match_exec("Match !exec \"/bin/true\""));
+        assert!(has_match_exec("Match all !exec=/bin/true"));
+        assert!(has_match_exec("Match exec \"/bin/true\""));
+        assert!(!has_match_exec("Match host db.example"));
     }
 
     #[test]
