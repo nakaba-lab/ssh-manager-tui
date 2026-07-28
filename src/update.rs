@@ -40,8 +40,8 @@ use crate::os::keyscan::{
 use crate::os::known_hosts::{KnownHostEntry, append_entries, known_hosts_path, remove_entry};
 use crate::os::resolve::{
     ResolvedConfig, has_match_exec, has_unresolvable_known_hosts_file, is_host_known,
-    matching_known_entries, matching_known_entries_in, primary_known_hosts_file,
-    resolve_config_with_options, resolved_known_hosts_files, tofu_lookup_key,
+    is_none_file_list, matching_known_entries, primary_known_hosts_file,
+    resolve_config_with_options, tofu_lookup_key,
 };
 use crate::os::sftp::{SftpOp, SftpSession, remote_join, remote_parent, sftp_quote, stage_batch};
 use crate::os::ssh_dir;
@@ -802,21 +802,28 @@ fn handle_keyscan(app: &mut App, key: KeyEvent) {
     } else if !lines.is_empty() {
         let (alias, target) = (ks.alias.clone(), ks.pin_target.clone());
         let lookup_key = ks.lookup_key.clone();
-        // Resolve the read set ONCE, before the write. Re-resolving afterwards
-        // would let a stray file the write itself created join the set, so the
-        // verification below would "find" the entry in a file ssh never reads.
-        let resolved = resolved_known_hosts_files(&ks.files);
+        let ks_files = ks.files.clone();
         // Re-read the pins immediately before appending: `ks.existing` is the
         // snapshot taken when the modal opened, and a pin can appear while it
         // is open — OpenSSH writes known_hosts BEFORE verifying the signature,
         // so a TOFU accept in another terminal lands inside the window
-        // (#46 final review).
-        let fresh = matching_known_entries_in(&lookup_key, &resolved);
-        let rows: &[ClassifiedKey] = match &ks.modal {
-            KeyScanModal::Results { rows, .. } => rows,
-            _ => &[],
+        // (#46 final review). The rows are RE-CLASSIFIED against the fresh
+        // read too, or `Contradicted` would still be judged on the stale
+        // snapshot and a key revoked mid-window would be pinned (#46 round 5).
+        // A window of a few microseconds remains between this read and the
+        // append; closing it entirely would need file locking.
+        let fresh = matching_known_entries(&lookup_key, &ks.files);
+        let rows: Vec<ClassifiedKey> = match &ks.modal {
+            KeyScanModal::Results { rows, .. } => rows
+                .iter()
+                .map(|r| ClassifiedKey {
+                    class: classify_key(&r.key, &fresh),
+                    key: r.key.clone(),
+                })
+                .collect(),
+            _ => Vec::new(),
         };
-        if let Some(reason) = pin_block(rows, &fresh) {
+        if let Some(reason) = pin_block(&rows, &fresh) {
             let msg = match reason {
                 PinBlocked::Contradicted => {
                     "nothing pinned — known_hosts changed while the scan was open and now contradicts these keys"
@@ -839,7 +846,11 @@ fn handle_keyscan(app: &mut App, key: KeyEvent) {
                 // write landed (#46 final review). Writing to a file ssh does
                 // not read for this host is the failure this feature keeps
                 // re-learning, and it looks exactly like success from here.
-                let seen = matching_known_entries_in(&lookup_key, &resolved);
+                // Re-resolving after the write is safe now that
+                // `primary_known_hosts_file` refuses an unreliably-reconstructed
+                // target: no stray file exists to join the read set, and a
+                // first pin's file (absent at open) is picked up (#46 round 5).
+                let seen = matching_known_entries(&lookup_key, &ks_files);
                 let visible = lines.iter().all(|line| {
                     let mut f = line.split_whitespace().skip(1);
                     let (Some(key_type), Some(key_b64)) = (f.next(), f.next()) else {
@@ -1252,9 +1263,19 @@ fn resolved_target(rc: &ResolvedConfig) -> String {
 }
 
 /// The known_hosts files `ssh -G` reported for a resolved host (user + global).
+///
+/// Each option's list is dropped when it is OpenSSH's `none` sentinel ("read no
+/// file"). The check is per option because OpenSSH's "argument must appear
+/// alone" rule is per option — after merging, `UserKnownHostsFile none` is just
+/// one element of a longer list and the sentinel would go unnoticed, arming the
+/// trust gate off a stray file literally named `none` (#46 round 5).
 fn known_hosts_files(rc: &ResolvedConfig) -> Vec<String> {
-    let mut files = rc.user_known_hosts_files.clone();
-    files.extend(rc.global_known_hosts_files.iter().cloned());
+    let mut files = Vec::new();
+    for list in [&rc.user_known_hosts_files, &rc.global_known_hosts_files] {
+        if !is_none_file_list(list) {
+            files.extend(list.iter().cloned());
+        }
+    }
     files
 }
 
@@ -5568,6 +5589,55 @@ mod tests {
             ),
             KeyScanAction::Close(vec![])
         );
+    }
+
+    #[test]
+    fn known_hosts_files_drops_the_none_sentinel_per_option() {
+        // given — `UserKnownHostsFile none` with the default global files, as
+        // real `ssh -G` reports it
+        let rc = ResolvedConfig {
+            user_known_hosts_files: vec!["none".to_string()],
+            global_known_hosts_files: vec![
+                "/etc/ssh/ssh_known_hosts".to_string(),
+                "/etc/ssh/ssh_known_hosts2".to_string(),
+            ],
+            ..Default::default()
+        };
+        // when / then — the user list is dropped, the global list survives. The
+        // sentinel must not reach the reader: a stray file literally named
+        // `none` in the CWD would otherwise arm the vault trust gate (#46 r5).
+        assert_eq!(
+            known_hosts_files(&rc),
+            vec![
+                "/etc/ssh/ssh_known_hosts".to_string(),
+                "/etc/ssh/ssh_known_hosts2".to_string()
+            ]
+        );
+
+        // given — the mirror case on the global option
+        let rc = ResolvedConfig {
+            user_known_hosts_files: vec!["/home/me/.ssh/known_hosts".to_string()],
+            global_known_hosts_files: vec!["none".to_string()],
+            ..Default::default()
+        };
+        // when / then
+        assert_eq!(
+            known_hosts_files(&rc),
+            vec!["/home/me/.ssh/known_hosts".to_string()]
+        );
+
+        // given — a path component named `none` inside a space-bearing path
+        // (pre-split by `ssh -G`): NOT the sentinel, must survive intact
+        let rc = ResolvedConfig {
+            user_known_hosts_files: vec![
+                "/home/me/my".to_string(),
+                "none".to_string(),
+                "dir/known_hosts".to_string(),
+            ],
+            ..Default::default()
+        };
+        // when / then
+        assert_eq!(known_hosts_files(&rc).len(), 3);
     }
 
     #[test]
