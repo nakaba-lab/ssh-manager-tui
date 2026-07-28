@@ -327,9 +327,9 @@ mod interrupt {
 /// around this call. Used for both `ssh` and `sftp` so the two share one launch
 /// path (stdio inheritance, env bundle) and can never drift. A Ctrl+C during the
 /// session ends the child, not sshm (see [`interrupt::InlineInterruptGuard`]).
-pub fn run_inline(
+pub fn run_inline<S: AsRef<std::ffi::OsStr>>(
     program: &Path,
-    args: &[String],
+    args: &[S],
     env: &[(OsString, OsString)],
 ) -> io::Result<std::process::ExitStatus> {
     let _interrupt = interrupt::InlineInterruptGuard::install();

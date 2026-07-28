@@ -42,6 +42,8 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
             Some("Forwarding")
         } else if idx == form_idx::EXTRAS {
             Some("Advanced")
+        } else if idx == form_idx::TAGS {
+            Some("Metadata")
         } else {
             None
         }

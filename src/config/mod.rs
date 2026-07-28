@@ -5,6 +5,7 @@
 //! rendering + editing.
 
 pub mod diff;
+pub mod includes;
 pub mod model;
 pub mod parser;
 pub mod tokens;
@@ -81,6 +82,7 @@ impl SshConfig {
         writer::set_multi(block, "RemoteForward", &view.remote_forwards, false);
         writer::set_multi(block, "DynamicForward", &view.dynamic_forwards, false);
         writer::set_extras(block, &view.extras);
+        writer::set_pre(block, &view.tags, view.description.as_deref());
         self.dirty = true;
         Ok(())
     }
@@ -109,6 +111,7 @@ impl SshConfig {
         writer::set_multi(&mut block, "RemoteForward", &view.remote_forwards, false);
         writer::set_multi(&mut block, "DynamicForward", &view.dynamic_forwards, false);
         writer::set_extras(&mut block, &view.extras);
+        writer::set_pre(&mut block, &view.tags, view.description.as_deref());
 
         let idx = self.items.len();
         self.items.push(Item::Host(block));
@@ -515,5 +518,266 @@ mod tests {
             cfg.render(),
             "Host a\n    IdentityFile ~/.ssh/a\n    IdentityFile ~/.ssh/c\n    IdentityFile ~/.ssh/d\n"
         );
+    }
+
+    // --- #45: host tags & description via `# sshm:` pre-comment directives ---
+
+    #[test]
+    fn parse_sshm_tags_from_pre_comment() {
+        // #45 AC1: `# sshm:tags a,b` above a host projects into HostView.tags.
+        let src = "# sshm:tags prod,db\nHost web\n    HostName 1.1.1.1\n";
+        let cfg = parser::parse(PathBuf::from("c"), src);
+        let (_, view) = cfg.host_views().into_iter().next().unwrap();
+        assert_eq!(view.tags, vec!["prod".to_string(), "db".to_string()]);
+    }
+
+    #[test]
+    fn parse_sshm_tags_trims_and_drops_empty() {
+        // Items are trimmed; empty items (from stray/trailing commas) dropped.
+        let src = "# sshm:tags  prod ,  , db ,\nHost web\n    HostName 1.1.1.1\n";
+        let cfg = parser::parse(PathBuf::from("c"), src);
+        let (_, view) = cfg.host_views().into_iter().next().unwrap();
+        assert_eq!(view.tags, vec!["prod".to_string(), "db".to_string()]);
+    }
+
+    #[test]
+    fn parse_sshm_desc_from_pre_comment() {
+        // #45 AC2: `# sshm:desc <text>` projects into HostView.description.
+        let src = "# sshm:desc web frontend\nHost web\n    HostName 1.1.1.1\n";
+        let cfg = parser::parse(PathBuf::from("c"), src);
+        let (_, view) = cfg.host_views().into_iter().next().unwrap();
+        assert_eq!(view.description.as_deref(), Some("web frontend"));
+    }
+
+    #[test]
+    fn third_party_pre_comment_not_ingested_as_metadata() {
+        // #45 AC3 (footgun): a non-sshm banner above a host is NOT surfaced as
+        // tags/description — only `# sshm:` lines are owned.
+        let src = "# Managed by Ansible\nHost web\n    HostName 1.1.1.1\n";
+        let cfg = parser::parse(PathBuf::from("c"), src);
+        let (_, view) = cfg.host_views().into_iter().next().unwrap();
+        assert!(view.tags.is_empty());
+        assert_eq!(view.description, None);
+    }
+
+    #[test]
+    fn roundtrip_sshm_directives_and_third_party_comment() {
+        // #45 AC4: sshm directives + third-party comments round-trip byte-exact.
+        round_trips(
+            "# Managed by Ansible\n# sshm:tags prod,db\n# sshm:desc web frontend\nHost web\n    HostName 1.1.1.1\n",
+        );
+    }
+
+    #[test]
+    fn set_tags_writes_directive_line_when_absent() {
+        // #45 AC5: adding tags via the view writes a `# sshm:tags` line into pre.
+        let src = "Host web\n    HostName 1.1.1.1\n";
+        let mut cfg = parser::parse(PathBuf::from("c"), src);
+        let (idx, mut view) = cfg.host_views().into_iter().next().unwrap();
+        view.tags = vec!["prod".into(), "db".into()];
+        cfg.apply_view(idx, &view).unwrap();
+        assert_eq!(
+            cfg.render(),
+            "# sshm:tags prod,db\nHost web\n    HostName 1.1.1.1\n"
+        );
+    }
+
+    #[test]
+    fn set_tags_inserts_after_existing_third_party_comment() {
+        // New sshm directive goes at the end of `pre` (adjacent to the header),
+        // leaving third-party comments above it untouched.
+        let src = "# Managed by Ansible\nHost web\n    HostName 1.1.1.1\n";
+        let mut cfg = parser::parse(PathBuf::from("c"), src);
+        let (idx, mut view) = cfg.host_views().into_iter().next().unwrap();
+        view.tags = vec!["prod".into()];
+        cfg.apply_view(idx, &view).unwrap();
+        assert_eq!(
+            cfg.render(),
+            "# Managed by Ansible\n# sshm:tags prod\nHost web\n    HostName 1.1.1.1\n"
+        );
+    }
+
+    #[test]
+    fn set_desc_writes_directive_line_when_absent() {
+        let src = "Host web\n    HostName 1.1.1.1\n";
+        let mut cfg = parser::parse(PathBuf::from("c"), src);
+        let (idx, mut view) = cfg.host_views().into_iter().next().unwrap();
+        view.description = Some("web frontend".into());
+        cfg.apply_view(idx, &view).unwrap();
+        assert_eq!(
+            cfg.render(),
+            "# sshm:desc web frontend\nHost web\n    HostName 1.1.1.1\n"
+        );
+    }
+
+    #[test]
+    fn edit_tags_rewrites_only_the_directive_line() {
+        // Changing tags rewrites the sshm line; a third-party comment above it
+        // stays byte-identical (only-rewrite-on-change).
+        let src = "# Managed by Ansible\n# sshm:tags prod\nHost web\n    HostName 1.1.1.1\n";
+        let mut cfg = parser::parse(PathBuf::from("c"), src);
+        let (idx, mut view) = cfg.host_views().into_iter().next().unwrap();
+        assert_eq!(view.tags, vec!["prod".to_string()]);
+        view.tags = vec!["prod".into(), "db".into()];
+        cfg.apply_view(idx, &view).unwrap();
+        assert_eq!(
+            cfg.render(),
+            "# Managed by Ansible\n# sshm:tags prod,db\nHost web\n    HostName 1.1.1.1\n"
+        );
+    }
+
+    #[test]
+    fn clear_tags_removes_the_directive_line() {
+        let src = "# sshm:tags prod,db\nHost web\n    HostName 1.1.1.1\n";
+        let mut cfg = parser::parse(PathBuf::from("c"), src);
+        let (idx, mut view) = cfg.host_views().into_iter().next().unwrap();
+        view.tags = vec![];
+        cfg.apply_view(idx, &view).unwrap();
+        assert_eq!(cfg.render(), "Host web\n    HostName 1.1.1.1\n");
+    }
+
+    #[test]
+    fn unchanged_tags_leave_pre_byte_identical() {
+        // #45 AC5 crux: editing an unrelated field must not touch the sshm/pre
+        // lines (only-rewrite-on-change preserves the byte round-trip).
+        let src = "# Managed by Ansible\n# sshm:tags prod,db\nHost web\n    HostName old\n";
+        let mut cfg = parser::parse(PathBuf::from("c"), src);
+        let (idx, mut view) = cfg.host_views().into_iter().next().unwrap();
+        view.host_name = Some("new".into());
+        cfg.apply_view(idx, &view).unwrap();
+        assert_eq!(
+            cfg.render(),
+            "# Managed by Ansible\n# sshm:tags prod,db\nHost web\n    HostName new\n"
+        );
+    }
+
+    #[test]
+    fn noncanonical_unchanged_tags_are_not_reformatted() {
+        // A hand-written non-canonical directive must round-trip untouched when
+        // tags are unchanged (semantic, not textual, only-rewrite-on-change).
+        let src = "#sshm:tags  prod , db\nHost web\n    HostName old\n";
+        let mut cfg = parser::parse(PathBuf::from("c"), src);
+        let (idx, mut view) = cfg.host_views().into_iter().next().unwrap();
+        assert_eq!(view.tags, vec!["prod".to_string(), "db".to_string()]);
+        view.host_name = Some("new".into());
+        cfg.apply_view(idx, &view).unwrap();
+        // Directive line preserved byte-for-byte; only HostName changed.
+        assert_eq!(
+            cfg.render(),
+            "#sshm:tags  prod , db\nHost web\n    HostName new\n"
+        );
+    }
+
+    #[test]
+    fn add_host_with_tags_and_desc() {
+        let mut cfg = parser::parse(PathBuf::from("c"), "");
+        cfg.add_host(&HostView {
+            patterns: vec!["web".into()],
+            host_name: Some("1.1.1.1".into()),
+            tags: vec!["prod".into(), "db".into()],
+            description: Some("frontend".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            cfg.render(),
+            "# sshm:tags prod,db\n# sshm:desc frontend\nHost web\n    HostName 1.1.1.1\n"
+        );
+    }
+
+    #[test]
+    fn unchanged_edit_preserves_duplicate_directive_lines() {
+        // #45 only-rewrite-on-change: `from_block` is first-wins, but an UNRELATED
+        // edit (tags semantically unchanged) must not silently drop a duplicate
+        // owned `# sshm:tags` line — `set_pre` must touch nothing when unchanged.
+        let src = "# sshm:tags prod\n# sshm:tags db\nHost web\n    HostName old\n";
+        let mut cfg = parser::parse(PathBuf::from("c"), src);
+        let (idx, mut view) = cfg.host_views().into_iter().next().unwrap();
+        assert_eq!(view.tags, vec!["prod".to_string()]); // first-wins
+        view.host_name = Some("new".into());
+        cfg.apply_view(idx, &view).unwrap();
+        assert_eq!(
+            cfg.render(),
+            "# sshm:tags prod\n# sshm:tags db\nHost web\n    HostName new\n"
+        );
+    }
+
+    #[test]
+    fn unchanged_edit_preserves_empty_tags_directive() {
+        // An empty `# sshm:tags` (parses to []) must survive an unrelated edit:
+        // desired is "no tags", the current state already is "no tags", so
+        // `set_pre` must not remove the hand-written directive line.
+        let src = "# sshm:tags\nHost web\n    HostName old\n";
+        let mut cfg = parser::parse(PathBuf::from("c"), src);
+        let (idx, mut view) = cfg.host_views().into_iter().next().unwrap();
+        assert!(view.tags.is_empty());
+        view.host_name = Some("new".into());
+        cfg.apply_view(idx, &view).unwrap();
+        assert_eq!(cfg.render(), "# sshm:tags\nHost web\n    HostName new\n");
+    }
+
+    #[test]
+    fn edit_desc_rewrites_only_the_directive_line() {
+        let src = "# Managed by Ansible\n# sshm:desc old note\nHost web\n    HostName 1.1.1.1\n";
+        let mut cfg = parser::parse(PathBuf::from("c"), src);
+        let (idx, mut view) = cfg.host_views().into_iter().next().unwrap();
+        assert_eq!(view.description.as_deref(), Some("old note"));
+        view.description = Some("new note".into());
+        cfg.apply_view(idx, &view).unwrap();
+        assert_eq!(
+            cfg.render(),
+            "# Managed by Ansible\n# sshm:desc new note\nHost web\n    HostName 1.1.1.1\n"
+        );
+    }
+
+    #[test]
+    fn clear_desc_removes_the_directive_line() {
+        let src = "# sshm:desc note\nHost web\n    HostName 1.1.1.1\n";
+        let mut cfg = parser::parse(PathBuf::from("c"), src);
+        let (idx, mut view) = cfg.host_views().into_iter().next().unwrap();
+        view.description = None;
+        cfg.apply_view(idx, &view).unwrap();
+        assert_eq!(cfg.render(), "Host web\n    HostName 1.1.1.1\n");
+    }
+
+    #[test]
+    fn unchanged_desc_leaves_pre_byte_identical() {
+        let src = "# sshm:desc note\nHost web\n    HostName old\n";
+        let mut cfg = parser::parse(PathBuf::from("c"), src);
+        let (idx, mut view) = cfg.host_views().into_iter().next().unwrap();
+        view.host_name = Some("new".into());
+        cfg.apply_view(idx, &view).unwrap();
+        assert_eq!(
+            cfg.render(),
+            "# sshm:desc note\nHost web\n    HostName new\n"
+        );
+    }
+
+    #[test]
+    fn noncanonical_unchanged_desc_not_reformatted() {
+        // A hand-written non-canonical desc must round-trip untouched when the
+        // description is unchanged (semantic, not textual, compare).
+        let src = "#sshm:desc   spaced note  \nHost web\n    HostName old\n";
+        let mut cfg = parser::parse(PathBuf::from("c"), src);
+        let (idx, mut view) = cfg.host_views().into_iter().next().unwrap();
+        assert_eq!(view.description.as_deref(), Some("spaced note"));
+        view.host_name = Some("new".into());
+        cfg.apply_view(idx, &view).unwrap();
+        assert_eq!(
+            cfg.render(),
+            "#sshm:desc   spaced note  \nHost web\n    HostName new\n"
+        );
+    }
+
+    #[test]
+    fn roundtrip_and_parse_sshm_directive_with_utf8() {
+        // #45: multi-byte directive values and non-ASCII third-party comments
+        // round-trip byte-for-byte and parse without panic (byte-slice safety).
+        let src = "# サーバ備考\n# sshm:desc 日本語の説明\n# sshm:tags 本番,db\nHost web\n    HostName 1.1.1.1\n";
+        round_trips(src);
+        let cfg = parser::parse(PathBuf::from("c"), src);
+        let (_, view) = cfg.host_views().into_iter().next().unwrap();
+        assert_eq!(view.description.as_deref(), Some("日本語の説明"));
+        assert_eq!(view.tags, vec!["本番".to_string(), "db".to_string()]);
     }
 }

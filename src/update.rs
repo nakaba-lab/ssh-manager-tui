@@ -16,10 +16,11 @@ use ratatui::crossterm::terminal::{
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::app::{
-    App, ConfirmAction, ConnectMode, EditForm, FormMode, GenOrigin, ListFocus,
-    PasswordConfirmOrigin, PendingSave, PickOrigin, SFTP_FIELDS, Screen, SftpBrowser,
-    SftpDirection, SftpForm, SftpPane, VaultEntryForm, VaultUnlock, form_from_view, form_idx,
-    override_form_from_host, override_idx, overrides_from_form, read_local_dir, view_from_form,
+    App, ConfirmAction, ConnectMode, EditForm, FormMode, GenOrigin, HostRef, ListFocus,
+    PassphraseSyncForm, PasswordConfirmOrigin, PendingSave, PickOrigin, RekeyMode, SFTP_FIELDS,
+    Screen, SftpBrowser, SftpDirection, SftpForm, SftpPane, VaultEntryForm, VaultRekey,
+    VaultUnlock, form_from_view, form_idx, override_form_from_host, override_idx,
+    overrides_from_form, read_local_dir, view_from_form,
 };
 use crate::config::SshConfig;
 use crate::config::diff;
@@ -29,18 +30,21 @@ use crate::os::agent;
 use crate::os::askpass::{
     AskpassListener, DeclineReason, Outcome, arm_connect, os_tokens, resolved_identity,
 };
+use crate::os::binaries::tools;
 use crate::os::connect::{
     ConnectOverrides, Protocol, command_line, connect_new_tab, describe_exit, describe_exit_code,
     resolve_options, run_inline,
 };
-use crate::os::keys::{generate_key, read_public_key};
+use crate::os::keys::{
+    GenPassphrase, change_passphrase_args, generate_key, generate_key_args, read_public_key,
+    stale_passphrase_hosts,
+};
 use crate::os::known_hosts::remove_entry;
 use crate::os::resolve::{
-    ResolvedConfig, has_match_exec, is_host_known, resolve_config_with_options, tofu_lookup_key,
+    ResolvedConfig, is_host_known, resolve_config_with_options, resolve_full, tofu_lookup_key,
 };
 use crate::os::sftp::{SftpOp, SftpSession, remote_join, remote_parent, sftp_quote, stage_batch};
 use crate::os::ssh_dir;
-use crate::os::tools;
 use crate::os::vault::{
     self, MatchedKinds, Secret, SecretKind, Vault, VaultEntry, match_vault_kinds,
 };
@@ -60,10 +64,18 @@ pub fn handle_key(app: &mut App, key: KeyEvent, terminal: &mut DefaultTerminal) 
         Screen::DiffPreview => handle_diff_preview(app, key),
         Screen::KeyManager => handle_keys(app, key, terminal)?,
         Screen::KnownHosts => handle_known_hosts(app, key),
+        Screen::Inspect => handle_inspect(app, key),
         Screen::Help => handle_help(app, key),
         Screen::Confirm(action) => handle_confirm(app, key, action, terminal)?,
         Screen::ActionMenu(idx) => handle_action_menu(app, key, idx, terminal)?,
-        Screen::GenerateKey { origin } => handle_gen_wizard(app, key, origin),
+        Screen::GenerateKey { origin } => {
+            // Interactive generation must suspend the TUI, which needs the
+            // terminal — but `handle_gen_wizard` stays terminal-free so its
+            // unit tests run headless; it returns the pending run instead.
+            if let Some(pending) = handle_gen_wizard(app, key, origin) {
+                run_generate_interactive(app, pending, terminal)?;
+            }
+        }
         Screen::PickKey { origin } => handle_pick_key(app, key, origin),
         Screen::PickJump { origin } => handle_pick_jump(app, key, origin),
         Screen::ConnectOverride { host } => handle_connect_override(app, key, host, terminal)?,
@@ -71,7 +83,9 @@ pub fn handle_key(app: &mut App, key: KeyEvent, terminal: &mut DefaultTerminal) 
         Screen::SftpBrowser => handle_sftp_browser(app, key, terminal)?,
         Screen::Vault => handle_vault(app, key),
         Screen::VaultUnlock => handle_vault_unlock(app, key),
+        Screen::VaultRekey => handle_vault_rekey(app, key),
         Screen::VaultEntry { editing } => handle_vault_entry(app, key, editing),
+        Screen::PassphraseSync => handle_passphrase_sync(app, key),
         Screen::PasswordConfirm { target, origin, .. } => {
             handle_password_confirm(app, key, target, origin, terminal)?
         }
@@ -88,6 +102,23 @@ pub fn handle_key(app: &mut App, key: KeyEvent, terminal: &mut DefaultTerminal) 
 /// would otherwise pass the whole suite silently.
 fn consent_should_be_recorded(confirmed: bool, vault_unlocked: bool) -> bool {
     confirmed && vault_unlocked
+}
+
+/// Pure gate for the "change master password" rekey submit: proceed ONLY when the
+/// current password verified AND the new password is non-empty AND matches its
+/// confirmation. Pure, so the load-bearing order (verify + validate BEFORE any
+/// re-encrypt/write) is unit-tested independently of the modal plumbing.
+fn rekey_change_should_proceed(new: &str, confirm: &str, current_verified: bool) -> bool {
+    current_verified && !new.is_empty() && new == confirm
+}
+
+/// Pure gate for the "upgrade KDF" rekey submit: proceed ONLY when the current
+/// password verified. Load-bearing because `rekey` re-encrypts under the *typed*
+/// password — dropping this guard would re-key the vault under a wrong/mistyped
+/// password and permanently lock the user out, yet every other test would still
+/// pass. Pinned like `rekey_change_should_proceed` so the guard can't vanish silently.
+fn rekey_upgrade_should_proceed(current_verified: bool) -> bool {
+    current_verified
 }
 
 /// The one-time password-confirm modal: Enter/`y` confirms (re-enter the connect
@@ -322,8 +353,12 @@ fn handle_list(app: &mut App, key: KeyEvent, terminal: &mut DefaultTerminal) -> 
         KeyCode::Char('a') => open_add(app),
         KeyCode::Char('d') => {
             if let Some(h) = app.selected_host() {
-                let item = app.host_items[h];
-                open_confirm(app, ConfirmAction::DeleteHost(item));
+                match app.host_items[h] {
+                    HostRef::Main(item) => open_confirm(app, ConfirmAction::DeleteHost(item)),
+                    // Include'd hosts are read-only (#52): refuse rather than risk a
+                    // delete against the wrong file.
+                    HostRef::Included(_) => app.toast_included_readonly(),
+                }
             }
         }
         KeyCode::Char('r') => app.refresh_all_liveness(),
@@ -345,6 +380,7 @@ fn handle_list(app: &mut App, key: KeyEvent, terminal: &mut DefaultTerminal) -> 
             app.reload_known_hosts();
             app.screen = Screen::KnownHosts;
         }
+        KeyCode::Char('i') => open_inspect(app),
         KeyCode::Char('P') => open_vault(app),
         _ => {}
     }
@@ -675,15 +711,19 @@ fn connect_by_alias(
     let (host_has_match_exec, rc) = match cached_rc {
         Some(rc) => (false, Some(rc)),
         None => {
-            let mex = has_match_exec(&app.config.render());
+            // Withhold resolve/autofill when the effective config (main + every
+            // Include'd file) carries a `Match exec` OR uses an include form we
+            // cannot fully scan (block-nested / quote-spliced / too deep) — fail
+            // safe (#52), since `ssh -G` would honor what we can't verify.
+            let unsafe_cfg = app.autofill_config_unsafe();
             // Feed the override's resolution flags (user/port/identity/proxy/-o)
             // to `ssh -G` so the resolved target, identity and TOFU key reflect
             // the *effective* connection, not the saved config.
             let opts = resolve_options(&ov);
-            let rc = (!mex)
+            let rc = (!unsafe_cfg)
                 .then(|| resolve_config_with_options(&opts, alias).ok())
                 .flatten();
-            (mex, rc)
+            (unsafe_cfg, rc)
         }
     };
     let resolved = rc.is_some();
@@ -1105,9 +1145,13 @@ fn open_edit(app: &mut App) {
     let Some(idx) = app.selected_host() else {
         return;
     };
+    // Only main-config hosts are editable; an Include'd host is read-only (#52).
+    let HostRef::Main(item) = app.host_items[idx] else {
+        app.toast_included_readonly();
+        return;
+    };
     let view = app.hosts[idx].clone();
     app.form = form_from_view(&view);
-    let item = app.host_items[idx];
     app.screen = Screen::Edit {
         editing: Some(item),
     };
@@ -1474,6 +1518,7 @@ fn handle_keys(app: &mut App, key: KeyEvent, terminal: &mut DefaultTerminal) -> 
                 origin: GenOrigin::KeyManager,
             };
         }
+        KeyCode::Char('p') => change_passphrase(app, terminal)?,
         KeyCode::Char('y') => copy_public_key(app),
         KeyCode::Char('s') => set_identity_for_host(app),
         KeyCode::Char('d') => {
@@ -1601,8 +1646,15 @@ fn set_identity_for_host(app: &mut App) {
         return;
     }
     let id_path = tildify(&k.private_path());
-    let Some(&item) = app.host_items.get(host_idx) else {
-        return;
+    let item = match app.host_items.get(host_idx).copied() {
+        Some(HostRef::Main(i)) => i,
+        // An Include'd host is read-only; writing its IdentityFile would target
+        // the wrong file (#52).
+        Some(HostRef::Included(_)) => {
+            app.toast_included_readonly();
+            return;
+        }
+        None => return,
     };
     let mut view = app.hosts[host_idx].clone();
     view.identity_files = vec![id_path.clone()];
@@ -1630,24 +1682,23 @@ fn tildify(path: &std::path::Path) -> String {
     path.display().to_string()
 }
 
-fn handle_gen_wizard(app: &mut App, key: KeyEvent, origin: GenOrigin) {
+fn handle_gen_wizard(app: &mut App, key: KeyEvent, origin: GenOrigin) -> Option<InteractiveGen> {
     let w = &mut app.gen_wizard;
     match key.code {
         KeyCode::Esc => {
             app.screen = gen_return_screen(&origin);
-            return;
+            return None;
         }
         KeyCode::Tab | KeyCode::Down => {
-            w.field = (w.field + 1) % 3;
-            return;
+            w.field = (w.field + 1) % 4;
+            return None;
         }
         KeyCode::BackTab | KeyCode::Up => {
-            w.field = (w.field + 2) % 3;
-            return;
+            w.field = (w.field + 3) % 4;
+            return None;
         }
         KeyCode::Enter => {
-            run_generate(app, origin);
-            return;
+            return run_generate(app, origin);
         }
         _ => {}
     }
@@ -1674,8 +1725,20 @@ fn handle_gen_wizard(app: &mut App, key: KeyEvent, origin: GenOrigin) {
         }
         1 => edit_wizard_field(&mut w.filename, &mut w.filename_cursor, key),
         2 => edit_wizard_field(&mut w.comment, &mut w.comment_cursor, key),
+        3 => {
+            if matches!(
+                key.code,
+                KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right
+            ) {
+                w.passphrase = match w.passphrase {
+                    GenPassphrase::NoPassphrase => GenPassphrase::Interactive,
+                    GenPassphrase::Interactive => GenPassphrase::NoPassphrase,
+                };
+            }
+        }
         _ => {}
     }
+    None
 }
 
 fn edit_wizard_field(s: &mut String, cursor: &mut usize, key: KeyEvent) {
@@ -1689,6 +1752,26 @@ fn edit_wizard_field(s: &mut String, cursor: &mut usize, key: KeyEvent) {
         KeyCode::Char(c) => insert_char(s, cursor, c),
         _ => {}
     }
+}
+
+/// Precondition check for the change-passphrase (`p`) action on the key
+/// manager screen (Issue #47). Pure — inspects the current selection only:
+/// nothing selected or a `.pub`-only entry is an `Err` with a toast-ready
+/// message; a selected entry with a private key yields its private path.
+fn passphrase_change_target(app: &App) -> Result<std::path::PathBuf, &'static str> {
+    let Some(k) = app.keys_state.selected().and_then(|i| app.keys.get(i)) else {
+        return Err("select a key to change its passphrase");
+    };
+    if !k.has_private {
+        return Err("no private key file for this entry");
+    }
+    Ok(k.private_path())
+}
+
+/// Success toast after `ssh-keygen -p` (Issue #47). Must mention that the pair
+/// status can show "unverified" for the now-encrypted key (not an error).
+fn passphrase_success_toast() -> &'static str {
+    "passphrase updated — an encrypted key shows pair: unverified (not an error)"
 }
 
 /// Screen the generate-key wizard returns to when cancelled.
@@ -1709,36 +1792,341 @@ fn add_identity_row(app: &mut App, path: &str) {
     app.form.focused = form_idx::IDENTITY;
 }
 
-fn run_generate(app: &mut App, origin: GenOrigin) {
+/// A validated interactive key generation waiting for the terminal: the wizard
+/// handler is terminal-free (headless-testable), so the dispatch layer runs it.
+/// It carries everything the run needs, so the runner never re-reads the wizard
+/// state. `filename` is the name the user typed (what the toast reports); `out`
+/// is that name resolved under `~/.ssh`.
+struct InteractiveGen {
+    out: std::path::PathBuf,
+    filename: String,
+    args: Vec<std::ffi::OsString>,
+    origin: GenOrigin,
+}
+
+fn run_generate(app: &mut App, origin: GenOrigin) -> Option<InteractiveGen> {
     let w = app.gen_wizard.clone();
     let filename = w.filename.trim();
     if filename.is_empty() {
         app.toast("filename is required", true);
-        return;
+        return None;
     }
     let Some(dir) = ssh_dir() else {
         app.toast("cannot resolve ~/.ssh", true);
-        return;
+        return None;
     };
     let out = dir.join(filename);
-    match generate_key(w.key_type, &out, w.comment.trim()) {
-        Ok(()) => {
-            app.reload_keys();
-            match origin {
-                GenOrigin::KeyManager => {
-                    app.screen = Screen::KeyManager;
-                    app.toast(format!("generated {filename}"), false);
-                }
-                GenOrigin::EditForm { editing } => {
-                    let id_path = tildify(&out);
-                    add_identity_row(app, &id_path);
-                    app.screen = Screen::Edit { editing };
-                    app.toast(format!("generated {filename} → IdentityFile"), false);
-                }
-            }
+    if w.passphrase == GenPassphrase::Interactive {
+        // Mirror generate_key's refuse-to-clobber guard: an existing file would
+        // otherwise make the interactive ssh-keygen prompt "Overwrite (y/n)?".
+        if out.exists() {
+            app.toast(format!("{} already exists", out.display()), true);
+            return None;
         }
+        let args = generate_key_args(
+            w.key_type,
+            &out,
+            w.comment.trim(),
+            GenPassphrase::Interactive,
+        );
+        return Some(InteractiveGen {
+            out,
+            filename: filename.to_string(),
+            args,
+            origin,
+        });
+    }
+    match generate_key(w.key_type, &out, w.comment.trim()) {
+        Ok(()) => finish_generate(app, &origin, &out, filename),
         Err(e) => app.toast(format!("{e}"), true),
     }
+    None
+}
+
+/// Shared success tail of both generation paths: refresh the key list, return
+/// to the origin screen, and (from the edit form) wire the new key in.
+fn finish_generate(app: &mut App, origin: &GenOrigin, out: &std::path::Path, filename: &str) {
+    app.reload_keys();
+    match origin {
+        GenOrigin::KeyManager => {
+            app.screen = Screen::KeyManager;
+            app.toast(format!("generated {filename}"), false);
+        }
+        GenOrigin::EditForm { editing } => {
+            let id_path = tildify(out);
+            add_identity_row(app, &id_path);
+            app.screen = Screen::Edit { editing: *editing };
+            app.toast(format!("generated {filename} → IdentityFile"), false);
+        }
+    }
+}
+
+/// Run an interactive (passphrase-prompting) key generation inline.
+fn run_generate_interactive(
+    app: &mut App,
+    pending: InteractiveGen,
+    terminal: &mut DefaultTerminal,
+) -> Result<()> {
+    // ssh-keygen won't create missing parent dirs — mirror generate_key.
+    if let Some(parent) = pending.out.parent()
+        && !parent.exists()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        app.toast(format!("{e}"), true);
+        return Ok(());
+    }
+    if run_ssh_keygen_inline(app, terminal, &pending.args)? {
+        finish_generate(app, &pending.origin, &pending.out, &pending.filename);
+    }
+    Ok(())
+}
+
+/// Run `ssh-keygen` with the TUI suspended so it owns the console for its own
+/// passphrase prompts, then restore. Returns whether it exited successfully;
+/// a non-zero exit or a launch failure is toasted here (and reported `false`),
+/// so callers only have to describe the success path.
+fn run_ssh_keygen_inline(
+    app: &mut App,
+    terminal: &mut DefaultTerminal,
+    args: &[std::ffi::OsString],
+) -> Result<bool> {
+    suspend_tui(terminal)?;
+    let status = run_inline(&tools().ssh_keygen, args, &[]);
+    restore_tui(terminal)?;
+    // Sitting at ssh-keygen's passphrase prompts (TUI suspended, no keypresses)
+    // must not make the next on_tick spuriously idle-auto-lock the vault (#14) —
+    // which the passphrase-sync flow is about to need. Same re-stamp the inline
+    // connect / SFTP transfer paths do.
+    app.last_activity = Instant::now();
+    match status {
+        Ok(s) if s.success() => Ok(true),
+        Ok(s) => {
+            let (msg, is_err) = keygen_exit_toast(s.code());
+            app.toast(msg, is_err);
+            Ok(false)
+        }
+        Err(e) => {
+            app.toast(format!("ssh-keygen: {e}"), true);
+            Ok(false)
+        }
+    }
+}
+
+/// How to report a non-zero `ssh-keygen` exit. Deliberately NOT `describe_exit`:
+/// that one is written for ssh/sftp, where a non-255 exit code is the *remote
+/// command's* status and therefore not an sshm error (auto-dismissing toast).
+/// ssh-keygen has no remote command — every non-zero exit means the operation
+/// failed (a mistyped passphrase confirmation exits 1), and `restore_tui` clears
+/// its diagnostics off the console, so the toast is the only thing left. It must
+/// be a sticky error (AC1). Pure, so the classification is unit-tested.
+fn keygen_exit_toast(code: Option<i32>) -> (String, bool) {
+    let msg = match code {
+        Some(c) => format!("ssh-keygen failed (exit {c})"),
+        None => "ssh-keygen was terminated by a signal".to_string(),
+    };
+    (msg, true)
+}
+
+/// The `p` action on the key manager (Issue #47): run `ssh-keygen -p` inline to
+/// add/change the selected key's passphrase (ssh-keygen prompts for the current
+/// and new passphrase itself — sshm never sees them), then offer to sync stored
+/// vault `Passphrase` entries that reference the changed key (they now hold the
+/// old passphrase, so connect-time auto-fill would fail confusingly).
+fn change_passphrase(app: &mut App, terminal: &mut DefaultTerminal) -> Result<()> {
+    let path = match passphrase_change_target(app) {
+        Ok(p) => p,
+        Err(msg) => {
+            app.toast(msg, true);
+            return Ok(());
+        }
+    };
+    if !run_ssh_keygen_inline(app, terminal, &change_passphrase_args(&path))? {
+        return Ok(());
+    }
+    // Success: the key file changed on disk — re-derive pair status (an
+    // encrypted key legitimately reads Unverified now; see ui::keys::pair_hint).
+    app.reload_keys();
+    app.toast(passphrase_success_toast(), false);
+    offer_passphrase_sync(app, path);
+    Ok(())
+}
+
+/// After a successful passphrase change, look for stale vault `Passphrase`
+/// entries. Unlocked vault: open the bulk-update modal when any match. Locked
+/// vault: offer to unlock first (Esc skips), resumed by `submit_vault_unlock`.
+fn offer_passphrase_sync(app: &mut App, key_path: std::path::PathBuf) {
+    if app.vault.is_some() {
+        let stale = stale_hosts_for_key(app, &key_path);
+        if !stale.is_empty() {
+            open_passphrase_sync(app, stale);
+        }
+    } else if app.has_vault_file {
+        // Entries are unreadable while locked, so we can't even tell whether
+        // any are stale — route through the unlock prompt with a resume marker.
+        app.passphrase_sync_pending = Some(key_path);
+        // A vault file exists, so this is an unlock (not a create) prompt — which
+        // is exactly `VaultUnlock::default()`.
+        app.vault_unlock = VaultUnlock::default();
+        open_overlay(app, Screen::VaultUnlock);
+    }
+}
+
+/// Host aliases whose stored vault passphrase went stale when `key_path`'s
+/// passphrase changed. Empty when the vault is locked or `~` can't be resolved —
+/// in both cases there is nothing readable to check.
+fn stale_hosts_for_key(app: &App, key_path: &std::path::Path) -> Vec<String> {
+    match (dirs::home_dir(), &app.vault) {
+        (Some(home), Some(v)) => stale_passphrase_hosts(key_path, &home, &app.hosts, v),
+        _ => Vec::new(),
+    }
+}
+
+fn open_passphrase_sync(app: &mut App, hosts: Vec<String>) {
+    // Struct-update (`..Default::default()`) can't move out of a Drop type.
+    app.passphrase_sync = PassphraseSyncForm {
+        hosts,
+        secret: String::new(),
+        cursor: 0,
+    };
+    open_overlay(app, Screen::PassphraseSync);
+}
+
+/// Bulk vault-passphrase update modal: one typed passphrase, upserted into the
+/// `Passphrase` entry of every affected host. Esc skips (entries stay stale).
+fn handle_passphrase_sync(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => {
+            // Replacing the form drops the old one, whose Drop scrubs the secret.
+            app.passphrase_sync = PassphraseSyncForm::default();
+            close_overlay(app);
+        }
+        KeyCode::Enter => submit_passphrase_sync(app),
+        // Edits go through the zeroizing variants so a typed passphrase never
+        // leaves an un-scrubbed copy on the heap (as on the vault entry form).
+        KeyCode::Backspace => {
+            let f = &mut app.passphrase_sync;
+            backspace_secret(&mut f.secret, &mut f.cursor);
+        }
+        // Drop Ctrl chords instead of typing them: in raw mode crossterm delivers
+        // Ctrl+C as Char('c')+CONTROL, and this field is masked, so a stray chord
+        // would silently corrupt the passphrase that Enter then writes to EVERY
+        // affected host at once.
+        KeyCode::Char(_) if key.modifiers.contains(KeyModifiers::CONTROL) => {}
+        KeyCode::Char(c) => {
+            let f = &mut app.passphrase_sync;
+            insert_char_secret(&mut f.secret, &mut f.cursor, c);
+        }
+        _ => {}
+    }
+}
+
+/// The bulk sync's pre-save guard, mirroring the single-entry path
+/// (`save_vault_entry`): an empty secret means "nothing typed yet", and one the
+/// connect-time askpass channel cannot deliver (newline/CR, or over OpenSSH's
+/// 1023-byte read cap) must be rejected BEFORE it is written — a bulk write is
+/// exactly where storing an undeliverable value does the most damage. Returns
+/// the toast to show, or `None` to proceed. Pure so the guard is unit-tested;
+/// dropping it would otherwise pass the whole suite silently (the same reason
+/// `consent_should_be_recorded` is a separate function).
+fn passphrase_sync_rejection(secret: &str) -> Option<String> {
+    if secret.is_empty() {
+        return Some("enter the new passphrase (Esc to skip)".to_string());
+    }
+    vault::reject_unservable_secret(secret)
+        .err()
+        .map(|e| e.to_string())
+}
+
+fn submit_passphrase_sync(app: &mut App) {
+    if let Some(msg) = passphrase_sync_rejection(&app.passphrase_sync.secret) {
+        app.toast(msg, true);
+        return;
+    }
+    let Some(path) = vault::default_path() else {
+        app.toast("cannot resolve ~/.ssh", true);
+        return;
+    };
+    // An idle auto-lock may have fired while the modal was open: a locked vault
+    // updates nothing (same boundary as `consent_should_be_recorded`).
+    if app.vault.is_none() {
+        app.passphrase_sync = PassphraseSyncForm::default();
+        close_overlay(app);
+        app.toast(
+            "vault is locked — stored passphrases were not updated",
+            true,
+        );
+        return;
+    }
+    let hosts = app.passphrase_sync.hosts.clone();
+    // Copy the typed passphrase into a `Secret` (scrubbed on drop) rather than a
+    // bare String, so the per-entry copies never accumulate in the clear.
+    let secret: Secret = app.passphrase_sync.secret.as_str().into();
+    let mut outcome = Ok(0usize);
+    // Scoped so the vault borrow ends before the toasts below take `app` again.
+    if let Some(v) = app.vault.as_mut() {
+        let plan = plan_passphrase_sync(v, &hosts);
+        // Snapshot what we are about to overwrite so a failed write can be undone
+        // in memory too — otherwise a rejected save would leave the in-memory
+        // vault holding the new passphrase while the file still has the old one.
+        let previous: Vec<VaultEntry> = plan.iter().map(|(i, _)| v.entries[*i].clone()).collect();
+        for (idx, note) in &plan {
+            let entry = VaultEntry {
+                host: v.entries[*idx].host.clone(),
+                kind: SecretKind::Passphrase,
+                secret: secret.clone(),
+                note: note.clone(),
+            };
+            v.upsert(Some(*idx), entry);
+        }
+        // ONE write for the whole batch: `save` replaces the file atomically, so
+        // either every affected host moves to the new passphrase or none does.
+        // Saving per entry would leave a partially-migrated vault behind on an
+        // ENOSPC/EACCES mid-loop, with no record of where it stopped.
+        outcome = match v.save(&path) {
+            Ok(()) => Ok(plan.len()),
+            Err(e) => {
+                for ((idx, _), old) in plan.iter().zip(previous) {
+                    v.upsert(Some(*idx), old);
+                }
+                Err(e)
+            }
+        };
+    }
+    match outcome {
+        // Keep the modal open so the typed passphrase isn't lost on a transient
+        // save failure; nothing was written, so a retry is safe.
+        Err(e) => app.toast(format!("{e}"), true),
+        Ok(updated) => {
+            app.passphrase_sync = PassphraseSyncForm::default();
+            close_overlay(app);
+            app.toast(
+                if updated == 0 {
+                    "no stored passphrases left to update".to_string()
+                } else {
+                    format!("vault passphrase updated for {updated} host(s)")
+                },
+                false,
+            );
+        }
+    }
+}
+
+/// Which vault entries a bulk sync will rewrite: the index of each affected
+/// host's entry and the note to carry over. Only `Passphrase` entries qualify —
+/// a host's login `Password` must never be overwritten with a key passphrase —
+/// and a host whose entry vanished between detection and submit is skipped.
+/// Pure, so the selection is unit-tested apart from the file write.
+fn plan_passphrase_sync(vault: &Vault, hosts: &[String]) -> Vec<(usize, String)> {
+    hosts
+        .iter()
+        .filter_map(|host| {
+            vault
+                .entries
+                .iter()
+                .position(|e| e.kind == SecretKind::Passphrase && e.host == *host)
+                .map(|idx| (idx, vault.entries[idx].note.clone()))
+        })
+        .collect()
 }
 
 /// The form screen a key/host picker returns to, per its [`PickOrigin`].
@@ -2064,7 +2452,9 @@ fn sftp_arm_gate(app: &App, host: &HostView, alias: &str) -> Option<SftpArmGate>
         return None;
     }
     let candidacy = app.vault_secret_kinds(host)?;
-    if has_match_exec(&app.config.render()) {
+    // Fail safe: a `Match exec` or an un-scannable include form (#52) means
+    // `ssh -G` could execute a predicate, so don't arm a secret here.
+    if app.autofill_config_unsafe() {
         return None;
     }
     let rc = resolve_config_with_options(&[], alias).ok()?;
@@ -3092,6 +3482,102 @@ fn handle_known_hosts(app: &mut App, key: KeyEvent) {
 }
 
 // ---------------------------------------------------------------------------
+// #43 effective-config inspector (`ssh -G` view)
+// ---------------------------------------------------------------------------
+
+/// Open the effective-config inspector for the selected host, behind the same
+/// two-stage gate as connect autofill / SFTP arm (#73): ① the client-trust gate
+/// ([`autofill_client_trusted`]) — an untrusted `[PATH ssh]` fallback is refused
+/// outright, because its `ssh -G` honors `%HOME%` and may read a config the
+/// exec-risk scan (rooted at `dirs::home_dir()`) never saw, so an unscanned
+/// `Match exec` could run; ② the shared exec-risk gate [`App::ssh_g_exec_risk`]
+/// (#65), which scans the main file **and** every `Include`d file and fails safe
+/// on include forms it cannot follow. A plain, scannable `Include` no longer
+/// blocks the inspector on its own. Both refusals are a sticky error toast.
+/// Otherwise runs `ssh -G` ONCE here (bounded 500ms), stashes the ordered
+/// key/value rows on `App`, and switches to the base `Screen::Inspect`. The
+/// resolve never runs per-draw. On `ssh -G` failure the screen is not entered.
+fn open_inspect(app: &mut App) {
+    open_inspect_gated(app, autofill_client_trusted());
+}
+
+/// [`open_inspect`] with the client trust injected — `tools()` is process-global
+/// (always trusted off-Windows), so tests exercise the untrusted branch by
+/// passing `false` here, mirroring how `connect_plan` receives the same bit.
+fn open_inspect_gated(app: &mut App, client_trusted: bool) {
+    let Some(h) = app.selected_host() else { return };
+    let alias = app.hosts[h].alias().to_string();
+    if !client_trusted {
+        app.toast(
+            "inspector off: untrusted ssh client ([PATH ssh]) — use System32 OpenSSH to enable",
+            true,
+        );
+        return;
+    }
+    if let Some(reason) = app.ssh_g_exec_risk() {
+        app.toast(reason, true);
+        return;
+    }
+    match resolve_full(&[], &alias) {
+        Ok(rows) => {
+            app.inspect_alias = alias;
+            app.inspect_rows = rows;
+            app.inspect_search.clear();
+            app.inspect_searching = false;
+            app.inspect_state
+                .select((!app.inspect_rows.is_empty()).then_some(0));
+            app.screen = Screen::Inspect;
+        }
+        Err(e) => app.toast(format!("ssh -G failed: {e}"), true),
+    }
+}
+
+/// Key handling for the effective-config inspector. Mirrors `handle_known_hosts`:
+/// `/` enters a substring filter; j/k/g/G scroll; Esc clears an active filter
+/// then closes back to the list. Read-only (no mutation of the resolved rows).
+fn handle_inspect(app: &mut App, key: KeyEvent) {
+    if app.inspect_searching {
+        match key.code {
+            KeyCode::Esc => {
+                app.inspect_searching = false;
+                app.inspect_search.clear();
+                app.clamp_inspect_selection();
+            }
+            KeyCode::Enter => app.inspect_searching = false,
+            KeyCode::Backspace => {
+                app.inspect_search.pop();
+                app.clamp_inspect_selection();
+            }
+            KeyCode::Char(c) => {
+                app.inspect_search.push(c);
+                app.clamp_inspect_selection();
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    let filtered_len = app.inspect_filtered().len();
+    match key.code {
+        KeyCode::Esc => {
+            if !app.inspect_search.is_empty() {
+                app.inspect_search.clear();
+                app.clamp_inspect_selection();
+            } else {
+                app.screen = Screen::List;
+            }
+        }
+        KeyCode::Char('?') => open_overlay(app, Screen::Help),
+        KeyCode::Char('/') => app.inspect_searching = true,
+        KeyCode::Char('j') | KeyCode::Down => move_list(&mut app.inspect_state, filtered_len, 1),
+        KeyCode::Char('k') | KeyCode::Up => move_list(&mut app.inspect_state, filtered_len, -1),
+        KeyCode::Char('g') => app.inspect_state.select((filtered_len > 0).then_some(0)),
+        KeyCode::Char('G') => app.inspect_state.select(filtered_len.checked_sub(1)),
+        _ => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Password vault
 // ---------------------------------------------------------------------------
 
@@ -3157,6 +3643,20 @@ fn handle_vault(app: &mut App, key: KeyEvent) {
             }
         }
         KeyCode::Char('p') => toggle_password_autofill(app),
+        KeyCode::Char('m') => open_vault_rekey(app, RekeyMode::ChangePassword),
+        KeyCode::Char('u') => {
+            // The KDF-upgrade affordance only exists for a vault whose params are
+            // strictly weaker than the current default (never nudge a manually
+            // strengthened vault into a downgrade — see `Vault::needs_kdf_upgrade`).
+            if app.vault.as_ref().is_some_and(|v| v.needs_kdf_upgrade()) {
+                open_vault_rekey(app, RekeyMode::UpgradeKdf);
+            } else {
+                app.toast(
+                    "vault KDF is already at or above the current default",
+                    false,
+                );
+            }
+        }
         KeyCode::Char('L') => {
             // Lock via the shared teardown: drops the decrypted vault, forgets the
             // session password-confirm consents (must not survive a re-unlock), scrubs
@@ -3229,6 +3729,9 @@ fn handle_vault_unlock(app: &mut App, key: KeyEvent) {
     let creating = app.vault_unlock.creating;
     match key.code {
         KeyCode::Esc => {
+            // Also skip any pending passphrase-sync resume (Issue #47): declining
+            // to unlock means the stale-entry check is consciously skipped.
+            app.passphrase_sync_pending = None;
             app.vault_unlock = VaultUnlock::default();
             close_overlay(app);
         }
@@ -3297,6 +3800,23 @@ fn submit_vault_unlock(app: &mut App) {
             app.vault_state.select((n > 0).then_some(0));
             // Replacing the struct drops the old one, whose Drop scrubs the password.
             app.vault_unlock = VaultUnlock::default();
+            // A pending passphrase sync (Issue #47) resumes on the key manager
+            // instead of landing on the vault screen: re-run the stale check now
+            // that the entries are readable.
+            if let Some(key_path) = app.passphrase_sync_pending.take() {
+                app.prev_screen = None;
+                app.screen = Screen::KeyManager;
+                let stale = stale_hosts_for_key(app, &key_path);
+                if stale.is_empty() {
+                    app.toast(
+                        "vault unlocked — no stored passphrases reference this key",
+                        false,
+                    );
+                } else {
+                    open_passphrase_sync(app, stale);
+                }
+                return;
+            }
             app.prev_screen = None;
             app.screen = Screen::Vault;
             // On unlock, nudge discoverability: stored passphrases auto-fill on the
@@ -3321,6 +3841,156 @@ fn submit_vault_unlock(app: &mut App) {
             app.vault_unlock.confirm.zeroize();
             app.vault_unlock.cursor = 0;
             app.vault_unlock.field = 0;
+            app.toast(format!("{e}"), true);
+        }
+    }
+}
+
+/// Open the master-password change / KDF-upgrade modal (#44) in `mode` over the
+/// vault list. Starts from a fresh (empty, scrubbed) form focused on the
+/// current-password field.
+fn open_vault_rekey(app: &mut App, mode: RekeyMode) {
+    // Struct-update (`..Default::default()`) can't move out of a Drop type.
+    let mut r = VaultRekey::default();
+    r.mode = mode;
+    app.vault_rekey = r;
+    open_overlay(app, Screen::VaultRekey);
+}
+
+/// Move focus among the rekey form's fields (wrapping), resetting the shared
+/// cursor to the end of the newly focused field. A no-op in `UpgradeKdf` mode
+/// (single field).
+fn rekey_focus(app: &mut App, dir: i32) {
+    let r = &mut app.vault_rekey;
+    let n = r.field_count();
+    if n <= 1 {
+        return;
+    }
+    r.field = (r.field as i32 + dir).rem_euclid(n as i32) as usize;
+    r.cursor = match r.field {
+        0 => r.current.len(),
+        1 => r.new.len(),
+        _ => r.confirm.len(),
+    };
+}
+
+fn handle_vault_rekey(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => {
+            app.vault_rekey = VaultRekey::default();
+            close_overlay(app);
+        }
+        KeyCode::Tab | KeyCode::Down => rekey_focus(app, 1),
+        KeyCode::BackTab | KeyCode::Up => rekey_focus(app, -1),
+        KeyCode::Enter => submit_vault_rekey(app),
+        KeyCode::Backspace => {
+            // Disjoint field borrows (value field + cursor) — do not extract into a
+            // helper returning `&mut String`, which would borrow the whole struct.
+            let r = &mut app.vault_rekey;
+            let s = match r.field {
+                0 => &mut r.current,
+                1 => &mut r.new,
+                _ => &mut r.confirm,
+            };
+            backspace_secret(s, &mut r.cursor);
+        }
+        KeyCode::Char(c) => {
+            let r = &mut app.vault_rekey;
+            let s = match r.field {
+                0 => &mut r.current,
+                1 => &mut r.new,
+                _ => &mut r.confirm,
+            };
+            insert_char_secret(s, &mut r.cursor, c);
+        }
+        _ => {}
+    }
+}
+
+fn submit_vault_rekey(app: &mut App) {
+    let Some(path) = vault::default_path() else {
+        app.toast("cannot resolve ~/.ssh", true);
+        return;
+    };
+    let mode = app.vault_rekey.mode;
+    // Verify the current password against the unlocked vault. Scope the immutable
+    // borrow to the match so the later `as_mut` rekey borrow is free.
+    let verified = match app.vault.as_ref() {
+        Some(v) => v.verify_password(&app.vault_rekey.current),
+        None => {
+            // Reachable only while unlocked; stay defensive.
+            app.toast("vault is locked", true);
+            return;
+        }
+    };
+
+    match mode {
+        RekeyMode::ChangePassword => {
+            if !rekey_change_should_proceed(
+                &app.vault_rekey.new,
+                &app.vault_rekey.confirm,
+                verified,
+            ) {
+                let msg = if !verified {
+                    "incorrect current master password"
+                } else if app.vault_rekey.new.is_empty() {
+                    "new master password is required"
+                } else {
+                    "new passwords do not match"
+                };
+                // Scrub the current-password field on a wrong password so a retry
+                // starts clean; keep new/confirm so the user needn't retype them.
+                if !verified {
+                    app.vault_rekey.current.zeroize();
+                    app.vault_rekey.cursor = 0;
+                    app.vault_rekey.field = 0;
+                }
+                app.toast(msg, true);
+                return;
+            }
+        }
+        RekeyMode::UpgradeKdf => {
+            if !rekey_upgrade_should_proceed(verified) {
+                app.vault_rekey.current.zeroize();
+                app.vault_rekey.cursor = 0;
+                app.toast("incorrect master password", true);
+                return;
+            }
+        }
+    }
+
+    // Re-key. For a KDF-only upgrade the "new" password is the current one. Borrow
+    // the typed value directly — never clone the whole form onto the heap.
+    let result = {
+        let vault = app.vault.as_mut().expect("vault present (verified above)");
+        match mode {
+            RekeyMode::ChangePassword => vault.rekey(&app.vault_rekey.new, &path),
+            RekeyMode::UpgradeKdf => vault.rekey(&app.vault_rekey.current, &path),
+        }
+    };
+
+    match result {
+        Ok(()) => {
+            // Replacing the struct drops the old one, whose Drop scrubs the fields.
+            app.vault_rekey = VaultRekey::default();
+            close_overlay(app);
+            app.toast(
+                match mode {
+                    RekeyMode::ChangePassword => "master password changed",
+                    RekeyMode::UpgradeKdf => "vault KDF upgraded to current default",
+                },
+                false,
+            );
+        }
+        Err(e) => {
+            // rekey rolled the in-memory key/salt/params back to the old password,
+            // so the vault is still usable; scrub the typed passwords and let the
+            // user retry from the still-open modal.
+            app.vault_rekey.current.zeroize();
+            app.vault_rekey.new.zeroize();
+            app.vault_rekey.confirm.zeroize();
+            app.vault_rekey.cursor = 0;
+            app.vault_rekey.field = 0;
             app.toast(format!("{e}"), true);
         }
     }
@@ -3638,10 +4308,14 @@ fn handle_action_menu(
             match sel {
                 // Delete opens its confirm WHILE the action menu is still the
                 // current screen, so cancelling the confirm returns to the menu.
-                action_idx::DELETE => {
-                    let item = app.host_items[host_idx];
-                    open_confirm(app, ConfirmAction::DeleteHost(item));
-                }
+                action_idx::DELETE => match app.host_items[host_idx] {
+                    HostRef::Main(item) => open_confirm(app, ConfirmAction::DeleteHost(item)),
+                    // Include'd hosts are read-only (#52): close the menu and refuse.
+                    HostRef::Included(_) => {
+                        close_overlay(app);
+                        app.toast_included_readonly();
+                    }
+                },
                 _ => {
                     close_overlay(app);
                     match sel {
@@ -4038,6 +4712,28 @@ mod tests {
         assert!(!consent_should_be_recorded(true, false)); // vault locked mid-modal
         assert!(!consent_should_be_recorded(false, true)); // declined
         assert!(!consent_should_be_recorded(false, false));
+    }
+
+    #[test]
+    fn rekey_change_gate() {
+        // The "Change master password" submit proceeds ONLY when the current
+        // password verified, the new password is non-empty, and it matches its
+        // confirmation. Pure so the load-bearing order (verify + validate BEFORE any
+        // write) is pinned by a unit test — a dropped `current_verified` gate would
+        // otherwise pass the whole suite silently.
+        assert!(rekey_change_should_proceed("newpw", "newpw", true));
+        assert!(!rekey_change_should_proceed("newpw", "different", true)); // confirm mismatch
+        assert!(!rekey_change_should_proceed("", "", true)); // empty new password
+        assert!(!rekey_change_should_proceed("newpw", "newpw", false)); // current not verified
+    }
+
+    #[test]
+    fn rekey_upgrade_gate() {
+        // The KDF-upgrade path re-keys under the TYPED current password, so a
+        // dropped verify guard would re-encrypt under a wrong password and lock the
+        // user out permanently — pin that the guard is verify-gated.
+        assert!(rekey_upgrade_should_proceed(true));
+        assert!(!rekey_upgrade_should_proceed(false)); // current password not verified
     }
 
     #[test]
@@ -4772,8 +5468,343 @@ mod tests {
             .unwrap()
             .write_all(config_body.as_bytes())
             .unwrap();
-        let app = App::new(path.clone()).expect("App::new over scratch config");
+        let mut app = App::new(path.clone()).expect("App::new over scratch config");
+        // Hermetic: the gate's second root would otherwise read the developer's
+        // real ~/.ssh/config (see `.claude/rules/tdd.md` — no external I/O).
+        app.default_config_root = None;
         (app, path)
+    }
+
+    /// Build an app over a scratch main config plus one `Include`d file next to it
+    /// (the main body should reference `include_name`). Returns `(app, dir)`.
+    fn app_with_include(
+        main_body: &str,
+        include_name: &str,
+        include_body: &str,
+    ) -> (App, std::path::PathBuf) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("sshm-inc-upd-{}-{}", std::process::id(), n));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(include_name), include_body).unwrap();
+        let path = dir.join("config");
+        std::fs::write(&path, main_body).unwrap();
+        let mut app = App::new(path).expect("App::new over scratch config with include");
+        app.default_config_root = None; // hermetic — see `app_fixture_on_disk`
+        (app, dir)
+    }
+
+    #[test]
+    fn included_host_is_listed_but_edit_is_refused() {
+        // #52 AC1/AC2/AC7: an Include'd host appears in the list, is classified
+        // Included in host_items, and open_edit refuses it (stays on List with a
+        // sticky toast) — the surgical writer path never targets an included file.
+        let (mut app, dir) = app_with_include(
+            "Include extra.conf\n\nHost main-host\n    HostName 1.1.1.1\n",
+            "extra.conf",
+            "Host inc-host\n    HostName 9.9.9.9\n",
+        );
+
+        let inc_row = app
+            .hosts
+            .iter()
+            .position(|h| h.alias() == "inc-host")
+            .expect("included host is listed");
+        let main_row = app
+            .hosts
+            .iter()
+            .position(|h| h.alias() == "main-host")
+            .expect("main host is listed");
+        assert!(matches!(app.host_items[inc_row], HostRef::Included(_)));
+        assert!(matches!(app.host_items[main_row], HostRef::Main(_)));
+
+        // Selecting the included host and editing must be refused.
+        let disp = app.filtered.iter().position(|&hi| hi == inc_row).unwrap();
+        app.list_state.select(Some(disp));
+        open_edit(&mut app);
+        assert_eq!(
+            app.screen,
+            Screen::List,
+            "included host edit must be refused"
+        );
+        assert!(app.toast.is_error, "a sticky read-only toast is shown");
+
+        // The main host still edits normally.
+        let disp_main = app.filtered.iter().position(|&hi| hi == main_row).unwrap();
+        app.list_state.select(Some(disp_main));
+        open_edit(&mut app);
+        assert!(matches!(app.screen, Screen::Edit { editing: Some(_) }));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn autofill_unsafe_on_match_exec_in_included_file() {
+        // #52 AC6: a `Match exec` hiding in an Include'd file makes the autofill
+        // gate refuse, even though the main file has none.
+        let (app, dir) = app_with_include(
+            "Include danger.conf\n\nHost main-host\n    HostName 1.1.1.1\n",
+            "danger.conf",
+            "Match exec \"cmd\"\n    User bob\n",
+        );
+        assert!(
+            app.autofill_config_unsafe(),
+            "an included Match exec must be caught by the whole-config safety scan"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn autofill_unsafe_on_block_nested_include() {
+        // #52 conservative fail-safe (security regression): a `Match exec` behind a
+        // block-nested Include (which `ssh -G` honors but expand does not follow)
+        // must NOT slip past the autofill gate — the un-scannable include form
+        // itself trips the fail-safe.
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("sshm-inc-bn-{}-{}", std::process::id(), n));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("evil.conf"), "Match exec \"cmd\"\n    User me\n").unwrap();
+        let path = dir.join("config");
+        // The Include lives inside `Host *`'s body → not a top-level Item::Include.
+        std::fs::write(
+            &path,
+            "Host *\n    Include evil.conf\nHost prod\n    HostName 10.0.0.1\n",
+        )
+        .unwrap();
+        let app = App::new(path).unwrap();
+        assert!(
+            app.autofill_config_unsafe(),
+            "a block-nested include must trip the fail-safe even if we can't scan it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- #65: one shared `ssh -G` exec-risk gate for connect / SFTP / inspector ---
+
+    #[test]
+    fn ssh_g_exec_risk_none_for_benign_include() {
+        // #65 crux: a plain top-level include no longer counts as a risk. The gate
+        // scans the included files instead of refusing on sight, so the common
+        // `config.d/*` setup keeps both autofill AND the inspector available.
+        let (app, dir) = app_with_include(
+            "Include plain.conf\n\nHost main-host\n    HostName 1.1.1.1\n",
+            "plain.conf",
+            "Host inc\n    HostName 2.2.2.2\n",
+        );
+        assert!(
+            app.ssh_g_exec_risk().is_none(),
+            "a scannable, clean include is not an exec risk"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ssh_g_exec_risk_flags_match_exec_in_included_file() {
+        // A `Match exec` inside an included file is a risk for every ssh -G caller.
+        let (app, dir) = app_with_include(
+            "Include danger.conf\n\nHost main-host\n    HostName 1.1.1.1\n",
+            "danger.conf",
+            "Match exec \"cmd\"\n    User bob\n",
+        );
+        assert!(app.ssh_g_exec_risk().is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ssh_g_exec_risk_flags_unscannable_include() {
+        // A block-nested include can't be followed, so the gate fails safe.
+        let (app, dir) = app_with_include(
+            "Host gate\n    Include hidden.conf\n",
+            "hidden.conf",
+            "Host inc\n    HostName 2.2.2.2\n",
+        );
+        assert!(
+            app.ssh_g_exec_risk().is_some(),
+            "an include form ssh -G honors but we can't scan must fail safe"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ssh_g_exec_risk_scans_the_default_config_root() {
+        // #65: production `ssh -G` passes no `-F`, so it reads ~/.ssh/config even
+        // when `--config` loaded something else. The gate therefore scans BOTH
+        // roots — here the loaded fixture is clean but the default root is not.
+        // (A scratch path stands in for the default root so the test stays
+        // hermetic; `default_config_root` is the injection point.)
+        let (mut app, dir) = app_with_include(
+            "Include plain.conf\n\nHost main-host\n    HostName 1.1.1.1\n",
+            "plain.conf",
+            "Host inc\n    HostName 2.2.2.2\n",
+        );
+        assert!(
+            app.ssh_g_exec_risk().is_none(),
+            "loaded config alone is clean"
+        );
+
+        let other = dir.join("default-config");
+        std::fs::write(&other, "Match exec \"cmd\"\nHost x\n    HostName 3.3.3.3\n").unwrap();
+        app.default_config_root = Some(other);
+        assert!(
+            app.ssh_g_exec_risk().is_some(),
+            "a Match exec in the config ssh -G actually reads must be caught"
+        );
+
+        // A default root that does not exist is not a risk (ssh can't read it either).
+        app.default_config_root = Some(dir.join("nonexistent"));
+        assert!(app.ssh_g_exec_risk().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ssh_g_exec_risk_flags_main_match_exec() {
+        let (app, path) = app_fixture_on_disk("Match exec \"cmd\"\nHost a\n    HostName 1.1.1.1\n");
+        assert!(app.ssh_g_exec_risk().is_some());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn inspect_refused_for_match_exec_in_included_file() {
+        // The inspector must refuse when an INCLUDED file carries `Match exec`
+        // (previously covered only incidentally by the blanket has_include block).
+        //
+        // This also pins the WIRING: asserting the toast carries the gate's own
+        // reason distinguishes "the gate refused" from "the gate was skipped and
+        // `ssh -G` merely failed" — the latter also yields a sticky error toast, so
+        // a state-only assertion here would pass even with the gate removed.
+        //
+        // NOTE: the benign-include direction is deliberately NOT tested through
+        // `open_inspect`: passing the gate runs the real `ssh -G` against the
+        // developer's own `~/.ssh/config` (production never passes `-F`), which is
+        // environment-dependent and could execute their own `Match exec`. The gate
+        // itself is covered by `ssh_g_exec_risk_none_for_benign_include`.
+        let (mut app, dir) = app_with_include(
+            "Include danger.conf\n\nHost main-host\n    HostName 1.1.1.1\n",
+            "danger.conf",
+            "Match exec \"cmd\"\n    User bob\n",
+        );
+        app.list_state.select(Some(0));
+        // Trust is injected (#73) so the exec-risk verdict is what's under test on
+        // every host: `tools()` is process-global, and on a Windows box without
+        // System32 OpenSSH the trust gate would fire first and change the toast.
+        open_inspect_gated(&mut app, true);
+        assert_ne!(
+            app.screen,
+            Screen::Inspect,
+            "inspector must not open when ssh -G would run a predicate"
+        );
+        assert!(app.toast.is_error, "refusal is a sticky error toast");
+        assert!(
+            app.toast.text.contains("Match exec"),
+            "the refusal must come from the gate, got: {:?}",
+            app.toast.text
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- #73: inspector client-trust gate (untrusted [PATH ssh] fallback) ---
+
+    #[test]
+    fn inspect_refused_for_untrusted_client() {
+        // #73: the inspector must refuse OUTRIGHT on an untrusted ssh client
+        // ([PATH ssh] fallback), before ever spawning `ssh -G` — same trust gate
+        // as connect autofill / SFTP arm. `tools()` is process-global (OnceLock,
+        // always trusted on Linux), so trust is injected as an argument.
+        //
+        // given: a benign config (no Match exec, no Include) with a selected host
+        let (mut app, path) = app_fixture_on_disk("Host a\n    HostName 1.1.1.1\n");
+        app.list_state.select(Some(0));
+        // when: the inspector is opened with an UNTRUSTED client
+        open_inspect_gated(&mut app, false);
+        // then: refused with a sticky error toast naming the untrusted client,
+        // and no resolved rows exist (proof `ssh -G` never ran)
+        assert_ne!(
+            app.screen,
+            Screen::Inspect,
+            "inspector must not open for an untrusted ssh client"
+        );
+        assert!(app.toast.is_error, "refusal is a sticky error toast");
+        assert!(
+            app.toast.text.contains("[PATH ssh]"),
+            "the refusal must name the untrusted client, got: {:?}",
+            app.toast.text
+        );
+        assert!(
+            app.inspect_rows.is_empty(),
+            "no rows may be stashed — ssh -G must not have run"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn inspect_trust_gate_precedes_exec_risk() {
+        // #73: gate ORDER — ① client trust runs BEFORE ② ssh_g_exec_risk. With an
+        // untrusted client AND a Match exec config, the toast must be the trust
+        // refusal, not the exec-risk one.
+        //
+        // given: a config carrying `Match exec` (would trip gate ②) and a selection
+        let (mut app, path) =
+            app_fixture_on_disk("Match exec \"cmd\"\nHost a\n    HostName 1.1.1.1\n");
+        app.list_state.select(Some(0));
+        // when: the inspector is opened with an UNTRUSTED client
+        open_inspect_gated(&mut app, false);
+        // then: refused, and the toast is the TRUST-side message (① fired first)
+        assert_ne!(app.screen, Screen::Inspect);
+        assert!(app.toast.is_error, "refusal is a sticky error toast");
+        assert!(
+            app.toast.text.contains("[PATH ssh]"),
+            "trust gate must fire first, got: {:?}",
+            app.toast.text
+        );
+        assert!(
+            !app.toast.text.contains("Match exec"),
+            "exec-risk gate must not be reached for an untrusted client, got: {:?}",
+            app.toast.text
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn inspect_trusted_client_reaches_exec_risk_gate() {
+        // #73: a TRUSTED client passes gate ① and reaches gate ② — pinned via a
+        // Match exec config so the run stays hermetic (no real `ssh -G`).
+        //
+        // NOTE: the benign+trusted direction is deliberately NOT tested through
+        // the open path for the same reason as
+        // `inspect_refused_for_match_exec_in_included_file`: passing both gates
+        // runs the real `ssh -G` against the developer's own `~/.ssh/config`.
+        //
+        // given: a config carrying `Match exec` and a selection
+        let (mut app, path) =
+            app_fixture_on_disk("Match exec \"cmd\"\nHost a\n    HostName 1.1.1.1\n");
+        app.list_state.select(Some(0));
+        // when: the inspector is opened with a TRUSTED client
+        open_inspect_gated(&mut app, true);
+        // then: still refused, but by the EXEC-RISK gate (② was reached)
+        assert_ne!(app.screen, Screen::Inspect);
+        assert!(app.toast.is_error, "refusal is a sticky error toast");
+        assert!(
+            app.toast.text.contains("Match exec"),
+            "a trusted client must fall through to the exec-risk gate, got: {:?}",
+            app.toast.text
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn autofill_safe_for_plain_top_level_include() {
+        // Negative: a plain top-level include with no Match exec keeps autofill
+        // available (the common config.d/* case is not over-blocked).
+        let (app, dir) = app_with_include(
+            "Include plain.conf\n\nHost main-host\n    HostName 1.1.1.1\n",
+            "plain.conf",
+            "Host inc\n    HostName 2.2.2.2\n",
+        );
+        assert!(!app.autofill_config_unsafe());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // The load-bearing guarantee: what the preview renders is byte-for-byte what
@@ -4783,7 +5814,9 @@ mod tests {
     fn apply_preview_matches_committed_bytes() {
         let (mut app, path) =
             app_fixture_on_disk("Host a\n    HostName old.example.com\n    User deploy\n");
-        let item = app.host_items[0];
+        let HostRef::Main(item) = app.host_items[0] else {
+            unreachable!("fixture host lives in the main config")
+        };
         let mut view = app.hosts[0].clone();
         view.host_name = Some("new.example.com".into());
         let pending = PendingSave::Apply {
@@ -4854,7 +5887,9 @@ mod tests {
     fn no_op_edit_previews_no_changes_and_skips_modal() {
         let (mut app, path) =
             app_fixture_on_disk("Host a\n    HostName 1.1.1.1\n    User deploy\n");
-        let item = app.host_items[0];
+        let HostRef::Main(item) = app.host_items[0] else {
+            unreachable!("fixture host lives in the main config")
+        };
         let view = app.hosts[0].clone(); // unchanged
         app.screen = Screen::Edit {
             editing: Some(item),
@@ -4886,7 +5921,9 @@ mod tests {
         // Someone edits the file behind our back.
         std::fs::write(&path, "Host a\n    HostName 9.9.9.9\n").unwrap();
 
-        let item = app.host_items[0];
+        let HostRef::Main(item) = app.host_items[0] else {
+            unreachable!("fixture host lives in the main config")
+        };
         let view = app.hosts[0].clone(); // form unchanged (still 1.1.1.1 in memory)
         app.screen = Screen::Edit {
             editing: Some(item),
@@ -4921,7 +5958,9 @@ mod tests {
     fn esc_cancels_preview_without_writing() {
         let (mut app, path) = app_fixture_on_disk("Host a\n    HostName 1.1.1.1\n");
         let before = std::fs::read_to_string(&path).unwrap();
-        let item = app.host_items[0];
+        let HostRef::Main(item) = app.host_items[0] else {
+            unreachable!("fixture host lives in the main config")
+        };
         let mut view = app.hosts[0].clone();
         view.host_name = Some("2.2.2.2".into());
         app.screen = Screen::Edit {
@@ -4995,5 +6034,297 @@ mod tests {
             "the un-written host must not linger in the in-memory config"
         );
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // --- Issue #47: gen wizard passphrase field + change-passphrase (`p`) ---
+
+    fn plain_key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// handle_gen_wizard — Tab を 4 回押すと field が 0→1→2→3→0 と巡回する
+    #[test]
+    fn handle_gen_wizard_cycles_four_fields() {
+        // given
+        let mut app = app_fixture("Host h\n  HostName h\n");
+        app.screen = Screen::GenerateKey {
+            origin: GenOrigin::KeyManager,
+        };
+        assert_eq!(app.gen_wizard.field, 0);
+
+        // when / then: type → filename → comment → passphrase → type
+        for expected in [1usize, 2, 3, 0] {
+            handle_gen_wizard(&mut app, plain_key(KeyCode::Tab), GenOrigin::KeyManager);
+            assert_eq!(app.gen_wizard.field, expected);
+        }
+    }
+
+    /// handle_gen_wizard — field=3 の Left/Right が passphrase をトグルする
+    #[test]
+    fn handle_gen_wizard_toggles_passphrase_on_field3() {
+        use crate::os::keys::GenPassphrase;
+
+        // given
+        let mut app = app_fixture("Host h\n  HostName h\n");
+        app.screen = Screen::GenerateKey {
+            origin: GenOrigin::KeyManager,
+        };
+        app.gen_wizard.field = 3;
+        assert_eq!(app.gen_wizard.passphrase, GenPassphrase::NoPassphrase);
+
+        // when
+        handle_gen_wizard(&mut app, plain_key(KeyCode::Right), GenOrigin::KeyManager);
+
+        // then
+        assert_eq!(app.gen_wizard.passphrase, GenPassphrase::Interactive);
+
+        // when: 逆方向で元に戻る
+        handle_gen_wizard(&mut app, plain_key(KeyCode::Left), GenOrigin::KeyManager);
+
+        // then
+        assert_eq!(app.gen_wizard.passphrase, GenPassphrase::NoPassphrase);
+    }
+
+    /// passphrase_change_target — 未選択/秘密鍵なしは Err・秘密鍵ありは Ok(パス)
+    #[test]
+    fn passphrase_change_target_rejects_missing_private_key() {
+        use crate::os::keys::{KeyInfo, PairStatus};
+
+        fn key_info(path: &str, has_private: bool) -> KeyInfo {
+            KeyInfo {
+                path: std::path::PathBuf::from(path),
+                pub_path: None,
+                bits: 256,
+                fingerprint: "SHA256:abc".into(),
+                comment: String::new(),
+                key_type: "ED25519".into(),
+                has_private,
+                pair: PairStatus::NotApplicable,
+            }
+        }
+
+        // given: 鍵一覧はあるが未選択
+        let mut app = app_fixture("Host h\n  HostName h\n");
+        app.keys = vec![key_info("/home/u/.ssh/id_a", true)];
+        app.keys_state.select(None);
+        // when / then
+        assert!(passphrase_change_target(&app).is_err());
+
+        // given: 選択エントリに秘密鍵が無い（.pub のみ）
+        app.keys = vec![key_info("/home/u/.ssh/orphan", false)];
+        app.keys_state.select(Some(0));
+        // when / then
+        assert!(passphrase_change_target(&app).is_err());
+
+        // given: 秘密鍵あり
+        app.keys = vec![key_info("/home/u/.ssh/id_a", true)];
+        app.keys_state.select(Some(0));
+        // when
+        let got = passphrase_change_target(&app);
+        // then
+        assert_eq!(got, Ok(std::path::PathBuf::from("/home/u/.ssh/id_a")));
+    }
+
+    /// passphrase_success_toast — 成功トーストが "unverified" 表示の理由を説明する
+    #[test]
+    fn passphrase_success_toast_mentions_unverified() {
+        // given / when
+        let msg = passphrase_success_toast();
+
+        // then
+        assert!(
+            msg.contains("unverified"),
+            "toast must warn the pair status may now show unverified: {msg}"
+        );
+    }
+
+    /// keygen_exit_toast — ssh-keygen の非ゼロ終了は全て sticky なエラーにする
+    #[test]
+    fn keygen_exit_toast_marks_every_nonzero_exit_as_sticky_error() {
+        // given: describe_exit_code は ssh 用の意味付け（255 以外の非ゼロ＝
+        // リモートコマンドの終了コード＝非エラー）なので、そのまま流用できない。
+        // ssh-keygen では非ゼロは全て「操作が失敗した」を意味する。
+        let cases: &[(Option<i32>, bool)] = &[
+            (Some(1), true),   // 新パスフレーズの確認不一致など
+            (Some(255), true), // 鍵を読めない・現在のパスフレーズ誤り
+            (Some(2), true),
+            (None, true), // シグナルで終了
+        ];
+
+        for (code, expect_error) in cases {
+            // when
+            let (msg, is_err) = keygen_exit_toast(*code);
+
+            // then
+            assert_eq!(is_err, *expect_error, "code {code:?} → {msg}");
+            assert!(
+                !msg.contains("connection"),
+                "ssh 用の文言を流用しないこと: {msg}"
+            );
+        }
+    }
+
+    /// plan_passphrase_sync — Passphrase エントリだけを対象にし note を保存する
+    #[test]
+    fn plan_passphrase_sync_targets_only_passphrase_entries() {
+        // given: 同じ host に Password と Passphrase が両方ある（Password が先）
+        let mut vault = Vault::create("pw").unwrap();
+        for (host, kind, note) in [
+            ("web1", SecretKind::Password, "login"),
+            ("web1", SecretKind::Passphrase, "key"),
+            ("db", SecretKind::Passphrase, "dbkey"),
+        ] {
+            vault.upsert(
+                None,
+                VaultEntry {
+                    host: host.into(),
+                    kind,
+                    secret: "old".into(),
+                    note: note.into(),
+                },
+            );
+        }
+
+        // when: 検出済みホストに、その後 vault から消えた host も混ぜる
+        let plan = plan_passphrase_sync(
+            &vault,
+            &["web1".to_string(), "db".to_string(), "gone".to_string()],
+        );
+
+        // then: Passphrase エントリの index のみ・note は据え置き・消えた host は飛ばす
+        assert_eq!(plan.len(), 2, "plan: {plan:?}");
+        for (idx, note) in &plan {
+            assert_eq!(vault.entries[*idx].kind, SecretKind::Passphrase);
+            assert_eq!(note, &vault.entries[*idx].note);
+        }
+        assert_eq!(plan[0].1, "key", "ログインパスワードを掴んではならない");
+    }
+
+    /// handle_passphrase_sync — Ctrl 修飾のキーは秘密に混入しない
+    #[test]
+    fn handle_passphrase_sync_ignores_control_chords() {
+        // given: raw mode の Windows では Ctrl+C が Char('c')+CONTROL として届く
+        let mut app = app_fixture("Host h\n  HostName h\n");
+        app.screen = Screen::KeyManager;
+        open_overlay(&mut app, Screen::PassphraseSync);
+
+        // when
+        handle_passphrase_sync(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
+
+        // then: マスク表示なので混入に気づけず、Enter 1 回で全ホストへ波及する
+        assert!(
+            app.passphrase_sync.secret.is_empty(),
+            "Ctrl chord must not type into the secret: {:?}",
+            app.passphrase_sync.secret.len()
+        );
+    }
+
+    /// handle_passphrase_sync — Esc は入力を捨てて元の画面へ戻る（AC4 のスキップ）
+    #[test]
+    fn handle_passphrase_sync_esc_discards_the_typed_secret() {
+        // given
+        let mut app = app_fixture("Host h\n  HostName h\n");
+        app.screen = Screen::KeyManager;
+        open_overlay(&mut app, Screen::PassphraseSync);
+        app.passphrase_sync.secret = "typed-secret".to_string();
+        app.passphrase_sync.hosts = vec!["h".to_string()];
+
+        // when
+        handle_passphrase_sync(&mut app, plain_key(KeyCode::Esc));
+
+        // then
+        assert_eq!(app.screen, Screen::KeyManager, "戻り先は元の画面");
+        assert!(
+            app.passphrase_sync.secret.is_empty(),
+            "入力した秘密を残さない"
+        );
+        assert!(app.passphrase_sync.hosts.is_empty());
+    }
+
+    /// offer_passphrase_sync — 陳腐化エントリが無ければモーダルを出さない（AC5）
+    #[test]
+    fn offer_passphrase_sync_opens_nothing_without_stale_entries() {
+        // given: vault はアンロック済みだが、この鍵を使うホストのエントリは無い
+        let mut app = app_fixture("Host h\n  HostName h\n  IdentityFile ~/.ssh/id_a\n");
+        app.screen = Screen::KeyManager;
+        app.vault = Some(Vault::create("pw").unwrap());
+
+        // when
+        offer_passphrase_sync(&mut app, std::path::PathBuf::from("/home/u/.ssh/id_a"));
+
+        // then
+        assert_eq!(app.screen, Screen::KeyManager, "モーダルを開かない");
+        assert!(app.passphrase_sync_pending.is_none());
+    }
+
+    /// handle_gen_wizard — BackTab は 4 フィールドを逆順に巡回する
+    #[test]
+    fn handle_gen_wizard_cycles_four_fields_backwards() {
+        // given
+        let mut app = app_fixture("Host h\n  HostName h\n");
+        app.screen = Screen::GenerateKey {
+            origin: GenOrigin::KeyManager,
+        };
+
+        // when / then: type → passphrase → comment → filename → type
+        for expected in [3usize, 2, 1, 0] {
+            handle_gen_wizard(&mut app, plain_key(KeyCode::BackTab), GenOrigin::KeyManager);
+            assert_eq!(app.gen_wizard.field, expected);
+        }
+    }
+
+    /// handle_gen_wizard — ヒント行が案内する Space でも passphrase をトグルできる
+    #[test]
+    fn handle_gen_wizard_space_toggles_passphrase() {
+        use crate::os::keys::GenPassphrase;
+
+        // given
+        let mut app = app_fixture("Host h\n  HostName h\n");
+        app.screen = Screen::GenerateKey {
+            origin: GenOrigin::KeyManager,
+        };
+        app.gen_wizard.field = 3;
+
+        // when
+        handle_gen_wizard(
+            &mut app,
+            plain_key(KeyCode::Char(' ')),
+            GenOrigin::KeyManager,
+        );
+
+        // then
+        assert_eq!(app.gen_wizard.passphrase, GenPassphrase::Interactive);
+    }
+
+    /// passphrase_sync_rejection — 一括保存も単体保存と同じ「配送できない秘密」規律で拒否する
+    #[test]
+    fn passphrase_sync_rejection_matches_single_entry_rules() {
+        // given: (秘密, 拒否されるべきか)
+        let at_cap = "x".repeat(1023);
+        let over_cap = "x".repeat(1024);
+        let cases: Vec<(&str, bool)> = vec![
+            ("", true),                 // 未入力
+            ("good-passphrase", false), // 正常
+            ("two\nlines", true),       // 改行は askpass チャネルで配送できない
+            ("cr\rret", true),          // CR も同様
+            (at_cap.as_str(), false),   // OpenSSH の 1023 バイト上限ちょうど
+            (over_cap.as_str(), true),  // 超過は無言に切り詰められる
+        ];
+
+        for (secret, expect_rejected) in cases {
+            // when
+            let rejected = passphrase_sync_rejection(secret);
+
+            // then
+            assert_eq!(
+                rejected.is_some(),
+                expect_rejected,
+                "secret (len {}) rejection mismatch: {rejected:?}",
+                secret.len()
+            );
+        }
     }
 }
