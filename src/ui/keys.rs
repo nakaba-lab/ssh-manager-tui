@@ -8,11 +8,40 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Clear, List, ListItem, Paragraph, Wrap};
 
 use crate::app::App;
+use crate::os::agent::{AgentSnapshot, AgentStatus, KeyAgentState, ServiceState};
 use crate::os::keys::{GenPassphrase, KeyType, PairStatus};
 
 use super::theme;
 use super::vault::masked_input;
-use super::widgets::{centered, input_line, modal_block, panel, responsive_split};
+use super::widgets::{
+    centered, input_line, kv_line, kv_line_colored, modal_block, panel, responsive_split,
+    section_header,
+};
+
+/// Advice lines for the current agent/service pairing. Empty when there is
+/// nothing useful to say.
+fn service_advice(snapshot: &AgentSnapshot) -> Vec<&'static str> {
+    match (&snapshot.status, snapshot.service) {
+        // Stock Windows ships ssh-agent *disabled*, and `sc query` reports a
+        // disabled service as plain STOPPED — indistinguishable from stopped.
+        // Advising only `Start-Service` would therefore fail outright ("Cannot
+        // start service ssh-agent") for the single most common case, so both
+        // steps are given.
+        (_, Some(ServiceState::Stopped)) => vec![
+            "As Administrator: Set-Service ssh-agent -StartupType Automatic",
+            "then: Start-Service ssh-agent",
+        ],
+        // A running service we cannot reach almost always means sshm and the
+        // agent are in different security contexts — the classic symptom of
+        // launching one of them elevated.
+        (AgentStatus::NotRunning, Some(ServiceState::Running)) => {
+            vec![
+                "Service is running but unreachable — is sshm elevated and the agent not (or vice versa)?",
+            ]
+        }
+        _ => Vec::new(),
+    }
+}
 
 pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
     if app.keys.is_empty() {
@@ -65,6 +94,18 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
                         .add_modifier(Modifier::BOLD),
                 ));
             }
+            // Agent membership badge (#49), built like the `mismatch` badge
+            // above: plain text in a theme colour, never a glyph — the list
+            // width maths stays predictable and no terminal has to have the
+            // font for it.
+            if app.key_agent_state(k) == KeyAgentState::Loaded {
+                spans.push(Span::styled(
+                    "  agent",
+                    Style::default()
+                        .fg(theme::ACCENT)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
             ListItem::new(Line::from(spans))
         })
         .collect();
@@ -87,12 +128,7 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
     };
 
     let mut lines: Vec<Line> = Vec::new();
-    let mut kv = |key: &str, v: String| {
-        lines.push(Line::from(vec![
-            Span::styled(format!("{key:>14}  "), Style::default().fg(theme::DIM)),
-            Span::styled(v, Style::default().fg(theme::TEXT)),
-        ]));
-    };
+    let mut kv = |key: &str, v: String| lines.push(kv_line(key, v));
     kv("name", k.name());
     kv("type", k.key_type.clone());
     kv("bits", k.bits.to_string());
@@ -122,10 +158,59 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
     );
     // Pair verification result — only shown when both halves exist.
     if let Some((text, color)) = pair_hint(k.pair) {
-        lines.push(Line::from(vec![
-            Span::styled(format!("{:>14}  ", "pair"), Style::default().fg(theme::DIM)),
-            Span::styled(text, Style::default().fg(color)),
-        ]));
+        lines.push(kv_line_colored("pair", text.to_string(), color));
+    }
+
+    // --- ssh-agent block (#49) ---
+    // Kept as its own section rather than folded into the key/value list above:
+    // `status` and `service` describe the agent, not this key, and mixing the
+    // two scopes in one column reads as if the agent were a property of the key.
+    lines.push(Line::from(""));
+    lines.push(section_header("ssh-agent"));
+
+    let (status_text, status_color) = match &app.agent.status {
+        AgentStatus::Probing => ("checking…".to_string(), theme::CHECKING),
+        AgentStatus::Running(fps) if fps.is_empty() => {
+            ("running (no keys)".to_string(), theme::WARN)
+        }
+        AgentStatus::Running(fps) => (format!("running ({} keys)", fps.len()), theme::UP),
+        AgentStatus::NotRunning => ("not running".to_string(), theme::DOWN),
+        // Deliberately not "no ssh-add": any exit code outside 0/1/2 lands here
+        // too (OpenSSH's fatal() exits 255), so naming a missing binary would
+        // send the user down the wrong path in those cases.
+        AgentStatus::Unavailable => ("unavailable".to_string(), theme::DOWN),
+    };
+    lines.push(kv_line_colored("status", status_text, status_color));
+
+    // Absent off Windows, where there is no ssh-agent service to report on.
+    if let Some(service) = app.agent.service {
+        let (text, color) = match service {
+            ServiceState::Running => ("running", theme::UP),
+            ServiceState::Stopped => ("stopped or disabled", theme::DOWN),
+            ServiceState::Paused => ("paused", theme::WARN),
+            ServiceState::Transitioning => ("starting/stopping…", theme::CHECKING),
+            ServiceState::Unknown => ("unknown", theme::DIM),
+        };
+        lines.push(kv_line_colored("service", text.to_string(), color));
+    }
+
+    let (key_text, key_color) = match app.key_agent_state(k) {
+        KeyAgentState::Loaded => ("loaded", theme::UP),
+        KeyAgentState::NotLoaded => ("not loaded", theme::DIM),
+        // The fingerprint could not be read, or the pair is mismatched — either
+        // way we genuinely do not know, and "not loaded" would be a confident lie.
+        KeyAgentState::Unknown => ("unknown (no usable fingerprint)", theme::WARN),
+        KeyAgentState::NoAgent => ("—", theme::DIM),
+    };
+    lines.push(kv_line_colored("this key", key_text.to_string(), key_color));
+
+    // Actionable advice only. Starting the service needs elevation, so we print
+    // the command rather than silently failing to run it ourselves.
+    for advice in service_advice(&app.agent) {
+        lines.push(Line::from(Span::styled(
+            format!("  {advice}"),
+            Style::default().fg(theme::FAINT),
+        )));
     }
 
     if let Some(ctx) = app.key_host_ctx.and_then(|i| app.hosts.get(i)) {

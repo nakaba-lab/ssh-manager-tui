@@ -24,7 +24,7 @@ use crate::os::liveness::{Liveness, LivenessProbe, ProbeTarget};
 use crate::os::resolve::{ResolvedConfig, has_match_exec};
 use crate::os::sftp::{RemoteEntry, SftpEvent, SftpSession};
 use crate::os::vault::{MatchedKinds, SecretKind, Vault, match_vault_kinds};
-use crate::os::{self, keys, known_hosts};
+use crate::os::{self, agent, keys, known_hosts};
 
 /// Ordered labels of the edit-form fields. Indices are referenced by name in
 /// [`FormIdx`].
@@ -958,6 +958,11 @@ pub struct App {
     /// [`App::pending_save`]: the confirm popup names the action, `App` carries
     /// the payload.
     pub pending_deploy: Option<crate::os::deploy::DeployPlan>,
+    /// Last answer from the ssh-agent probe (#49). `Probing` until the first
+    /// result lands; re-probed on entering the key manager and after load/unload.
+    pub agent: agent::AgentSnapshot,
+    /// In-flight agent probe, drained per tick. `None` when idle.
+    pub agent_probe: Option<agent::AgentProbe>,
     pub gen_wizard: GenWizard,
     /// Selection state for the IdentityFile key picker modal.
     pub pick_key_state: ListState,
@@ -1080,6 +1085,8 @@ impl App {
             keys_state: ListState::default(),
             key_host_ctx: None,
             pending_deploy: None,
+            agent: agent::AgentSnapshot::default(),
+            agent_probe: None,
             gen_wizard: GenWizard::default(),
             pick_key_state: ListState::default(),
             pick_jump_state: ListState::default(),
@@ -1542,6 +1549,58 @@ impl App {
             }
         }
         rank_changed
+    }
+
+    /// Start an ssh-agent probe, unless one is already in flight.
+    ///
+    /// The guard is not an optimisation. Dropping an `AgentProbe` only detaches
+    /// its thread — that thread stays blocked in `ssh-add -l` with no timeout.
+    /// Without the guard, holding `r` down (terminal autorepeat) against a
+    /// wedged agent — the very situation this panel exists to explain — would
+    /// pin one thread and one `ssh-add` process per repeat for the rest of the
+    /// session.
+    pub fn refresh_agent(&mut self) {
+        if self.agent_probe.is_some() {
+            return;
+        }
+        self.agent.status = agent::AgentStatus::Probing;
+        self.agent_probe = Some(agent::AgentProbe::spawn());
+    }
+
+    /// Drain the in-flight agent probe (#49). Called per tick, like
+    /// [`drain_liveness`](Self::drain_liveness), so the UI thread never blocks
+    /// on `ssh-add`. Returns true if the snapshot changed (so the caller
+    /// redraws).
+    pub fn drain_agent(&mut self) -> bool {
+        let Some(probe) = &self.agent_probe else {
+            return false;
+        };
+        let (snapshot, disconnected) = probe.drain();
+        if disconnected {
+            self.agent_probe = None;
+        }
+        match snapshot {
+            Some(snapshot) if snapshot != self.agent => {
+                self.agent = snapshot;
+                true
+            }
+            // The probe closed its channel without ever sending (its thread
+            // died). Fall back to Unavailable rather than leaving the panel on
+            // "checking…" until the user happens to press `r`.
+            None if disconnected && self.agent.status == agent::AgentStatus::Probing => {
+                self.agent.status = agent::AgentStatus::Unavailable;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// How the selected key stands relative to the agent (#49). The key's
+    /// [`PairStatus`](crate::os::keys::PairStatus) is part of the decision: a
+    /// mismatched pair means the fingerprint we hold is not the one the agent
+    /// would report for this private key.
+    pub fn key_agent_state(&self, key: &KeyInfo) -> agent::KeyAgentState {
+        agent::key_state(&self.agent.status, &key.fingerprint, key.pair)
     }
 
     /// Drain completed SFTP browse-session ops into the browser state (no-op when

@@ -49,6 +49,9 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
             // Apply any completed SFTP browse ops so the panes refresh without
             // blocking the draw (no-op when not browsing).
             app.drain_sftp_browser();
+            // Pick up a finished ssh-agent probe (no-op when none is in flight),
+            // so the key manager's badges settle without blocking the draw.
+            app.drain_agent();
             update::tick_clipboard(app);
             last_tick = Instant::now();
         }

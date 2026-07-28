@@ -50,14 +50,23 @@ const SFTP_BROWSER_FOOTER: &[(&str, &str)] = &[
 ];
 
 /// Key-manager footer hints (must render within 80 columns).
+///
+/// This screen has the most actions in the app, so the full hint list does not
+/// fit: with deploy (#77) and the agent actions (#49) it reaches 98 cols. Per
+/// the policy above, the two most occasional keys moved to the help modal:
+///
+/// - `s set-id` — the detail pane *already* prints "Press 's' to set as
+///   IdentityFile for host X" exactly when it applies, and pressing it without a
+///   host context only toasts an error, so the footer slot bought nothing.
+/// - `g gen` — the empty-state text and the key-picker footer both advertise it.
 const KEY_MANAGER_FOOTER: &[(&str, &str)] = &[
     ("j/k", "move"),
-    ("g", "gen"),
     ("p", "passphr"),
     ("y", "copy"),
-    ("s", "set-id"),
     ("D", "deploy"),
     ("d", "del"),
+    ("a", "load"),
+    ("U", "unload"),
     ("Esc", "back"),
 ];
 
