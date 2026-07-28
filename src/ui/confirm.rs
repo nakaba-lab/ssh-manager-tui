@@ -9,7 +9,7 @@ use ratatui::widgets::{Clear, Paragraph};
 use crate::app::{App, ConfirmAction, SftpDirection};
 
 use super::theme;
-use super::widgets::{centered, modal_block};
+use super::widgets::{centered, kv_line, modal_block};
 
 /// The labels shown in the per-host action menu, in selection order.
 pub const ACTION_LABELS: [&str; 8] = [
@@ -38,7 +38,93 @@ pub mod action_idx {
     pub const DELETE: usize = 7;
 }
 
-pub fn draw(f: &mut Frame, action: ConfirmAction, area: Rect) {
+/// Width of the deploy modal. The key/value rows use [`kv_line`]'s 16-column label
+/// gutter, so a full SHA256 fingerprint does not fit and is elided (see [`elide`]).
+const DEPLOY_MODAL_WIDTH: u16 = 60;
+
+/// Shorten `s` to `max` columns, keeping the head and the last few characters so
+/// a fingerprint stays comparable at a glance.
+fn elide(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(max.saturating_sub(4)).collect();
+    let tail: String = s
+        .chars()
+        .skip(s.chars().count().saturating_sub(3))
+        .collect();
+    format!("{head}…{tail}")
+}
+
+/// Body of the deploy confirmation (#48). Deployment rewrites the REMOTE host's
+/// credentials and undoing it means editing `authorized_keys` by hand, so the
+/// modal names the host, the key, its fingerprint and the comment that will land
+/// — mistaking one key for another must not survive this screen. A comment the
+/// allowlist rejected is shown as dropped rather than silently omitted, so the
+/// screen matches what the remote actually receives.
+fn deploy_lines(app: &App) -> Vec<Line<'static>> {
+    let host = app
+        .key_host_ctx
+        .and_then(|i| app.hosts.get(i))
+        .map(|h| match &h.host_name {
+            Some(n) => format!("{} ({n})", h.alias()),
+            None => h.alias().to_string(),
+        })
+        .unwrap_or_else(|| "?".to_string());
+    let (name, fingerprint) = app
+        .keys_state
+        .selected()
+        .and_then(|i| app.keys.get(i))
+        .map(|k| {
+            let p = k.pub_path.as_ref().unwrap_or(&k.path);
+            let name = p
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| p.display().to_string());
+            (name, k.fingerprint.clone())
+        })
+        .unwrap_or_else(|| ("?".into(), "?".into()));
+    let comment = match app.pending_deploy.as_ref() {
+        Some(p) if p.comment_dropped => "— (dropped: unsafe characters)".to_string(),
+        Some(p) => p
+            .line
+            .strip_prefix(&p.body)
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .unwrap_or("—")
+            .to_string(),
+        None => "—".to_string(),
+    };
+
+    // 16 columns go to kv_line's label gutter, 2 more to the modal border.
+    let value_w = DEPLOY_MODAL_WIDTH as usize - 18;
+    vec![
+        Line::from(Span::styled(
+            "  Append this key to the remote ~/.ssh/authorized_keys?",
+            Style::default().fg(theme::TEXT),
+        )),
+        Line::from(""),
+        kv_line("Host", elide(&host, value_w)),
+        kv_line("Key", elide(&name, value_w)),
+        kv_line("Fingerprint", elide(&fingerprint, value_w)),
+        kv_line("Comment", elide(&comment, value_w)),
+    ]
+}
+
+pub fn draw(f: &mut Frame, app: &App, action: ConfirmAction, area: Rect) {
+    // The deploy confirmation has its own key/value layout (see `deploy_lines`),
+    // so it is built here rather than as a one-line message.
+    if matches!(action, ConfirmAction::DeployKey) {
+        draw_modal(
+            f,
+            "Deploy public key",
+            deploy_lines(app),
+            false,
+            DEPLOY_MODAL_WIDTH,
+            area,
+        );
+        return;
+    }
     let (title, message, danger) = match action {
         ConfirmAction::DeleteHost(_) => (
             "Delete host",
@@ -79,40 +165,55 @@ pub fn draw(f: &mut Frame, action: ConfirmAction, area: Rect) {
                 true,
             )
         }
+        // Handled above: it needs `app` for the host/key detail lines.
+        ConfirmAction::DeployKey => unreachable!("DeployKey is drawn by draw_modal"),
         ConfirmAction::Quit => ("Quit", "Quit SSH Manager?".to_string(), false),
     };
 
-    let modal = centered(56, 7, area);
+    let body = vec![Line::from(Span::styled(
+        format!("  {message}"),
+        Style::default().fg(theme::TEXT),
+    ))];
+    draw_modal(f, title, body, danger, 56, area);
+}
+
+/// Render a confirm modal: the body lines above the y/n hint row. Shared so the
+/// one-line confirmations and the key/value deploy modal (#48) can never drift in
+/// framing, colours, or key hints.
+fn draw_modal(
+    f: &mut Frame,
+    title: &str,
+    body: Vec<Line<'static>>,
+    danger: bool,
+    width: u16,
+    area: Rect,
+) {
+    let modal = centered(width, 6 + body.len() as u16, area);
     f.render_widget(Clear, modal);
     let block = modal_block(title, danger);
 
-    let lines = vec![
-        Line::from(""),
-        Line::from(Span::styled(
-            format!("  {message}"),
-            Style::default().fg(theme::TEXT),
-        )),
-        Line::from(""),
-        Line::from(vec![
-            Span::raw("   "),
-            Span::styled(
-                " y / Enter ",
-                Style::default()
-                    .fg(theme::BG)
-                    .bg(if danger { theme::DOWN } else { theme::UP })
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("  confirm    ", Style::default().fg(theme::DIM)),
-            Span::styled(
-                " n / Esc ",
-                Style::default()
-                    .fg(theme::BG)
-                    .bg(theme::DIM)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("  cancel", Style::default().fg(theme::DIM)),
-        ]),
-    ];
+    let mut lines = vec![Line::from("")];
+    lines.extend(body);
+    lines.push(Line::from(""));
+    lines.extend([Line::from(vec![
+        Span::raw("   "),
+        Span::styled(
+            " y / Enter ",
+            Style::default()
+                .fg(theme::BG)
+                .bg(if danger { theme::DOWN } else { theme::UP })
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  confirm    ", Style::default().fg(theme::DIM)),
+        Span::styled(
+            " n / Esc ",
+            Style::default()
+                .fg(theme::BG)
+                .bg(theme::DIM)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  cancel", Style::default().fg(theme::DIM)),
+    ])]);
     f.render_widget(Paragraph::new(Text::from(lines)).block(block), modal);
 }
 
