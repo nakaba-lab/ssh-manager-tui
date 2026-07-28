@@ -236,9 +236,11 @@ pub struct KeyScanUi {
     /// NOT a hardcoded `~/.ssh/known_hosts` (which would no-op for a custom
     /// `UserKnownHostsFile` while reporting success).
     pub pin_target: std::path::PathBuf,
-    /// The known_hosts files `ssh -G` reported for this host, kept so the pin
-    /// can be re-checked through OpenSSH's matcher after it is written.
-    pub files: Vec<String>,
+    /// The known_hosts file lists `ssh -G` reported for this host, kept SEPARATE
+    /// per option (user / global) so the pin can be re-checked through
+    /// OpenSSH's matcher without letting path reconstruction straddle the
+    /// option boundary.
+    pub files: Vec<Vec<String>>,
 }
 
 /// Where a [`Screen::PasswordConfirm`] modal was opened from — determines what its

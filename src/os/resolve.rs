@@ -151,7 +151,20 @@ pub fn parse_ssh_g_output(dump: &str) -> ResolvedConfig {
             "knownhostscommand" if !val.eq_ignore_ascii_case("none") => {
                 rc.has_external_trust_source = true;
             }
-            "verifyhostkeydns" if val.eq_ignore_ascii_case("yes") => {
+            // `ssh -G` renders this through OpenSSH's multistate table, which
+            // prints `true`/`false`/`ask` — never the `yes`/`no` the config
+            // uses. Matching only `yes` made this arm dead code (#46 round 9).
+            // `ask` is deliberately NOT flagged: with it, trust does not exist
+            // without user interaction and the accepted key lands in
+            // known_hosts, so "no matching entry" really does mean "not trusted".
+            "verifyhostkeydns" if matches!(val, "true" | "yes") => {
+                rc.has_external_trust_source = true;
+            }
+            // Kerberos-authenticated key exchange (the Debian/Ubuntu GSSAPI
+            // patch): the server is authenticated without any host key, so a
+            // host in daily use legitimately has no known_hosts entry and a pin
+            // would create a host-key fallback that did not exist before.
+            "gssapikeyexchange" if matches!(val, "true" | "yes") => {
                 rc.has_external_trust_source = true;
             }
             "userknownhostsfile" => {
@@ -303,6 +316,28 @@ pub fn matching_known_entries(lookup_key: &str, files: &[String]) -> Vec<KnownHo
         .iter()
         .flat_map(|file| entries_in_file(lookup_key, file))
         .collect()
+}
+
+/// True if the config text contains an `Include` directive.
+///
+/// Included files are not parsed by this program, so any check that reasons
+/// over config TEXT (notably [`has_match_exec`]) is blind to what they add.
+/// A caller that must not decide on a partial view refuses instead
+/// (#46 round 9: a `Match exec` inside an included file evaded the guard and
+/// `ssh -G` executed the predicate anyway).
+pub fn has_include(config_text: &str) -> bool {
+    config_text.lines().any(|line| {
+        let line = line.trim_start();
+        if line.starts_with('#') {
+            return false;
+        }
+        // Same splice/`=` normalization `has_match_exec` applies.
+        let normalized = line.replace('"', "").replace('=', " ");
+        normalized
+            .split_whitespace()
+            .next()
+            .is_some_and(|kw| kw.eq_ignore_ascii_case("include"))
+    })
 }
 
 /// True when `ssh -G` reported a known-hosts file this code cannot resolve to a
@@ -654,9 +689,14 @@ mod tests {
         // "no matching entry" as "unpinned" here would let a scan append beside
         // an established trust path (#46 round 8, reproduced for
         // KnownHostsCommand end-to-end).
+        // NOTE: the values here are the ones REAL `ssh -G` prints. An earlier
+        // version of this test used `verifyhostkeydns yes`, which `ssh -G`
+        // never emits (it renders the multistate as `true`/`false`/`ask`), so
+        // the test passed while the guard was dead code (#46 round 9).
         for dump in [
             "knownhostscommand /usr/local/bin/kh.sh",
-            "verifyhostkeydns yes",
+            "verifyhostkeydns true",
+            "gssapikeyexchange true",
         ] {
             assert!(
                 parse_ssh_g_output(dump).has_external_trust_source,
@@ -667,14 +707,39 @@ mod tests {
         // knownhostscommand entirely when unset, and prints `none` when off)
         for dump in [
             "knownhostscommand none",
-            "verifyhostkeydns no",
+            "verifyhostkeydns false",
+            // `ask` prompts the user and still records the key in known_hosts,
+            // so "no matching entry" genuinely means "not yet trusted"
             "verifyhostkeydns ask",
+            "gssapikeyexchange false",
             "hostname db.example",
         ] {
             assert!(
                 !parse_ssh_g_output(dump).has_external_trust_source,
                 "should not flag: {dump}"
             );
+        }
+    }
+
+    #[test]
+    fn include_is_detected_so_a_text_check_never_decides_on_a_partial_view() {
+        // given / when / then — an `Include` hides whatever it pulls in, so a
+        // check that reasons over config TEXT (`has_match_exec`) is blind past
+        // it. A `Match exec` inside an included file evaded the guard while
+        // `ssh -G` still ran the predicate (#46 round 9).
+        for text in [
+            "Include ~/.ssh/conf.d/*.conf",
+            "  include /etc/ssh/extra",
+            "Include=\"/etc/ssh/extra\"",
+        ] {
+            assert!(has_include(text), "should detect: {text}");
+        }
+        for text in [
+            "# Include ~/.ssh/conf.d/*.conf",
+            "Host db\n  HostName db.example",
+            "IdentityFile ~/.ssh/include_me",
+        ] {
+            assert!(!has_include(text), "should not detect: {text}");
         }
     }
 

@@ -39,7 +39,7 @@ use crate::os::keyscan::{
 };
 use crate::os::known_hosts::{KnownHostEntry, append_entries, remove_entry};
 use crate::os::resolve::{
-    ResolvedConfig, has_match_exec, has_unresolvable_known_hosts_file, is_host_known,
+    ResolvedConfig, has_include, has_match_exec, has_unresolvable_known_hosts_file, is_host_known,
     is_none_file_list, matching_known_entries, primary_known_hosts_file,
     resolve_config_with_options, tofu_lookup_key,
 };
@@ -718,18 +718,33 @@ fn open_keyscan(app: &mut App, host_idx: usize) {
         return;
     }
     let alias = host.alias().to_string();
-    // Same guard the connect and SFTP paths apply: `ssh -G` EXECUTES a
-    // `Match exec` predicate, which this action must not trigger as a side
-    // effect of opening a menu entry. A nondeterministic predicate would also
-    // make this snapshot disagree with the config the real connect uses, so the
-    // pins read and the file written could belong to a different resolution
-    // (#46 round 8).
-    if has_match_exec(&app.config.render()) {
+    // `ssh -G` EXECUTES a `Match exec` predicate, which this action must not
+    // trigger as a side effect of opening a menu entry — and a nondeterministic
+    // predicate would also make this snapshot disagree with the resolution the
+    // real connect uses, so the pins read and the file written could belong to
+    // different configs (#46 round 8).
+    //
+    // The text inspected must be the text `ssh -G` will read. `app.config` is
+    // whatever file sshm loaded, which `--config` can point elsewhere; and
+    // neither is expanded, so an `Include` hides its contents from the check.
+    // Both evaded the guard while the predicate ran (#46 round 9), so scan the
+    // file ssh reads AS WELL as the loaded one, and refuse outright when either
+    // carries an `Include` — a partial view is not a basis for deciding.
+    let default_config = ssh_dir()
+        .map(|d| d.join("config"))
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .unwrap_or_default();
+    let loaded_config = app.config.render();
+    let refusal = if has_match_exec(&default_config) || has_match_exec(&loaded_config) {
+        Some("contains a `Match exec`, and resolving the host would run it")
+    } else if has_include(&default_config) || has_include(&loaded_config) {
+        Some("uses `Include`, whose contents this build cannot inspect for `Match exec`")
+    } else {
+        None
+    };
+    if let Some(reason) = refusal {
         app.toast(
-            format!(
-                "can't scan {alias}: the config contains a `Match exec`, and resolving the host \
-                 would run it — pin manually"
-            ),
+            format!("can't scan {alias}: the ssh config {reason} — pin manually"),
             true,
         );
         return;
@@ -815,7 +830,7 @@ fn open_keyscan(app: &mut App, host_idx: usize) {
         );
         return;
     }
-    let existing = matching_known_entries(&lookup_key, &files);
+    let existing = matching_entries_per_option(&lookup_key, &rc);
     let mut session = KeyscanSession::open();
     session.request(&hostname, &port);
     let target = if port == "22" {
@@ -831,7 +846,7 @@ fn open_keyscan(app: &mut App, host_idx: usize) {
         target,
         existing,
         pin_target,
-        files,
+        files: known_hosts_file_lists(&rc),
     });
     open_overlay(app, Screen::KeyScan);
 }
@@ -876,7 +891,7 @@ fn handle_keyscan(app: &mut App, key: KeyEvent) {
         // snapshot and a key revoked mid-window would be pinned (#46 round 5).
         // A window of a few microseconds remains between this read and the
         // append; closing it entirely would need file locking.
-        let fresh = matching_known_entries(&lookup_key, &ks.files);
+        let fresh = matching_entries_in_lists(&lookup_key, &ks.files);
         let rows: Vec<ClassifiedKey> = match &ks.modal {
             KeyScanModal::Results { rows, .. } => rows
                 .iter()
@@ -914,7 +929,7 @@ fn handle_keyscan(app: &mut App, key: KeyEvent) {
                 // `primary_known_hosts_file` refuses an unreliably-reconstructed
                 // target: no stray file exists to join the read set, and a
                 // first pin's file (absent at open) is picked up (#46 round 5).
-                let seen = matching_known_entries(&lookup_key, &ks_files);
+                let seen = matching_entries_in_lists(&lookup_key, &ks_files);
                 let visible = lines.iter().all(|line| {
                     let mut f = line.split_whitespace().skip(1);
                     let (Some(key_type), Some(key_b64)) = (f.next(), f.next()) else {
@@ -1334,13 +1349,36 @@ fn resolved_target(rc: &ResolvedConfig) -> String {
 /// one element of a longer list and the sentinel would go unnoticed, arming the
 /// trust gate off a stray file literally named `none` (#46 round 5).
 fn known_hosts_files(rc: &ResolvedConfig) -> Vec<String> {
-    let mut files = Vec::new();
-    for list in [&rc.user_known_hosts_files, &rc.global_known_hosts_files] {
-        if !is_none_file_list(list) {
-            files.extend(list.iter().cloned());
-        }
-    }
-    files
+    known_hosts_file_lists(rc).concat()
+}
+
+/// The same lists, kept SEPARATE per option.
+///
+/// Path reconstruction coalesces adjacent words by existence, so running it
+/// over the merged list lets a run straddle the user→global boundary: a file
+/// named `"<last user file> <first global file>"` — creatable with write access
+/// to the user's own `.ssh` — swallows the global file and hides the pins in it
+/// (#46 round 9). Resolving each option's list on its own removes that shape.
+fn known_hosts_file_lists(rc: &ResolvedConfig) -> Vec<Vec<String>> {
+    [&rc.user_known_hosts_files, &rc.global_known_hosts_files]
+        .into_iter()
+        .filter(|list| !is_none_file_list(list))
+        .map(|list| list.to_vec())
+        .collect()
+}
+
+/// Entries OpenSSH matches for `lookup_key`, resolving each option's file list
+/// separately (see [`known_hosts_file_lists`]).
+fn matching_entries_per_option(lookup_key: &str, rc: &ResolvedConfig) -> Vec<KnownHostEntry> {
+    matching_entries_in_lists(lookup_key, &known_hosts_file_lists(rc))
+}
+
+/// [`matching_entries_per_option`] over already-separated lists.
+fn matching_entries_in_lists(lookup_key: &str, lists: &[Vec<String>]) -> Vec<KnownHostEntry> {
+    lists
+        .iter()
+        .flat_map(|list| matching_known_entries(lookup_key, list))
+        .collect()
 }
 
 /// One-time-per-session nudge: a host has a stored password but connect-time
@@ -5716,6 +5754,32 @@ mod tests {
             ),
             KeyScanAction::Close(vec![])
         );
+    }
+
+    #[test]
+    fn known_hosts_file_lists_stay_separate_per_option() {
+        // given — the default shapes of both options
+        let rc = ResolvedConfig {
+            user_known_hosts_files: vec![
+                "/h/.ssh/known_hosts".into(),
+                "/h/.ssh/known_hosts2".into(),
+            ],
+            global_known_hosts_files: vec![
+                "/etc/ssh/ssh_known_hosts".into(),
+                "/etc/ssh/ssh_known_hosts2".into(),
+            ],
+            ..Default::default()
+        };
+        // when / then — kept apart, so path reconstruction (which joins
+        // adjacent words by existence) can never straddle the boundary: a file
+        // named "<last user file> <first global file>" would otherwise swallow
+        // the global file and hide the pins in it (#46 round 9)
+        let lists = known_hosts_file_lists(&rc);
+        assert_eq!(lists.len(), 2);
+        assert_eq!(lists[0].len(), 2);
+        assert_eq!(lists[1][0], "/etc/ssh/ssh_known_hosts");
+        // and the flattened view still matches the old merged order
+        assert_eq!(known_hosts_files(&rc), lists.concat());
     }
 
     #[test]
