@@ -1521,13 +1521,15 @@ fn handle_keys(app: &mut App, key: KeyEvent, terminal: &mut DefaultTerminal) -> 
         KeyCode::Char('p') => change_passphrase(app, terminal)?,
         KeyCode::Char('y') => copy_public_key(app),
         KeyCode::Char('s') => set_identity_for_host(app),
+        KeyCode::Char('D') => deploy_selected_key(app),
         KeyCode::Char('d') => {
             if let Some(sel) = app.keys_state.selected() {
                 open_confirm(app, ConfirmAction::RemoveKey(sel));
             }
         }
         KeyCode::Char('a') => agent_load_key(app, terminal)?,
-        KeyCode::Char('D') => agent_unload_key(app, terminal)?,
+        // `U`, not `D`: deploy (#77) already owns `D` on this screen.
+        KeyCode::Char('U') => agent_unload_key(app, terminal)?,
         KeyCode::Char('r') => {
             app.reload_keys();
             app.refresh_agent();
@@ -1556,8 +1558,9 @@ fn agent_load_key(app: &mut App, terminal: &mut DefaultTerminal) -> Result<()> {
     run_agent_command(app, terminal, &args, "key loaded into agent")
 }
 
-/// Remove the selected key from the ssh-agent (#49). Needs no input, but goes
-/// through the same inline path so both directions report failures identically.
+/// Remove the selected key from the ssh-agent (#49), bound to `U`. Needs no
+/// input, but goes through the same inline path so both directions report
+/// failures identically.
 ///
 /// The `has_private` guard from [`agent_load_key`] is deliberately absent:
 /// `ssh-add -d` wants the *public* half and falls back from `<path>` to
@@ -1631,6 +1634,105 @@ fn copy_public_key(app: &mut App) {
         Ok(()) => app.toast("public key copied", false),
         Err(e) => app.toast(format!("{e}"), true),
     }
+}
+
+/// #48 — validate the selected key against the host context and open the deploy
+/// confirmation. Every refusal happens here, BEFORE any remote command exists.
+fn deploy_selected_key(app: &mut App) {
+    // No host context means there is nothing to deploy TO — the same guard `s`
+    // (set IdentityFile) uses, so both key-manager actions behave alike.
+    if app.key_host_ctx.is_none() {
+        app.toast("open Keys from a host (K) to deploy a key to it", true);
+        return;
+    }
+    let Some(k) = app.keys_state.selected().and_then(|i| app.keys.get(i)) else {
+        return;
+    };
+    let text = match read_public_key(k) {
+        Ok(t) => t,
+        Err(e) => {
+            app.toast(format!("no public key to deploy: {e}"), true);
+            return;
+        }
+    };
+    // Refuse here, while no remote command exists yet — the user must never be one
+    // keypress away from running something built out of a hostile `.pub`.
+    let plan = match crate::os::deploy::plan(&text) {
+        Ok(p) => p,
+        Err(crate::os::deploy::DeployError::NotAPublicKey) => {
+            app.toast("not a public key line — nothing to deploy", true);
+            return;
+        }
+        Err(crate::os::deploy::DeployError::UnsafeBody) => {
+            app.toast(
+                "public key carries unsafe characters — refusing to deploy it",
+                true,
+            );
+            return;
+        }
+        Err(crate::os::deploy::DeployError::UnsupportedKeyType) => {
+            app.toast(
+                "not a deployable public key type — refusing to deploy it",
+                true,
+            );
+            return;
+        }
+    };
+    app.pending_deploy = Some(plan);
+    open_confirm(app, ConfirmAction::DeployKey);
+}
+
+/// #48 — run the confirmed deployment inline (TUI suspended) and report the outcome.
+fn execute_deploy(app: &mut App, terminal: &mut DefaultTerminal) -> Result<()> {
+    // Take the plan: one confirmation arms exactly one deployment.
+    let Some(plan) = app.pending_deploy.take() else {
+        return Ok(());
+    };
+    let Some(alias) = app
+        .key_host_ctx
+        .and_then(|i| app.hosts.get(i))
+        .map(|h| h.alias().to_string())
+    else {
+        // The host context vanished between arming and confirming; say so rather
+        // than returning silently after the user pressed `y`.
+        app.toast("no host in context — nothing was deployed", true);
+        return Ok(());
+    };
+    // `--` ends option parsing so an alias that starts with a dash can't become a
+    // flag (CWE-88), matching `build_ssh_args`.
+    let args = vec!["--".to_string(), alias.clone(), plan.snippet];
+
+    suspend_tui(terminal)?;
+    let status = crate::os::connect::run_inline(&crate::os::binaries::tools().ssh, &args, &[]);
+    restore_tui(terminal)?;
+    // A deployment that waited on a password prompt (TUI suspended) must not
+    // trigger a spurious idle auto-lock on the next tick (#14).
+    app.last_activity = Instant::now();
+
+    use crate::os::deploy::DeployOutcome;
+    match status {
+        Ok(s) => match crate::os::deploy::classify_exit(s.code()) {
+            DeployOutcome::Added => app.toast(format!("key deployed to {alias}"), false),
+            DeployOutcome::AlreadyPresent => {
+                app.toast(format!("key already present on {alias}"), false)
+            }
+            DeployOutcome::SshFailed => {
+                app.toast(format!("ssh: could not connect to {alias}"), true)
+            }
+            // A non-POSIX remote shell (a Windows OpenSSH server defaults to
+            // cmd.exe) cannot run the snippet — name that, it is the likeliest
+            // cause and the least guessable.
+            DeployOutcome::RemoteFailed(code) => app.toast(
+                format!(
+                    "remote command failed (exit {code}) — the remote shell may not be POSIX sh"
+                ),
+                true,
+            ),
+            DeployOutcome::Interrupted => app.toast("deploy interrupted", true),
+        },
+        Err(e) => app.toast(format!("could not launch ssh: {e}"), true),
+    }
+    Ok(())
 }
 
 fn set_identity_for_host(app: &mut App) {
@@ -4162,16 +4264,27 @@ fn handle_confirm(
 ) -> Result<()> {
     match key.code {
         KeyCode::Char('y') | KeyCode::Enter => {
-            // The overwrite-confirm runs the inline transfer on accept, so it needs the
-            // terminal (suspend/restore); every other action is terminal-free.
-            if let ConfirmAction::OverwriteTransfer { direction, name } = action {
-                close_overlay(app);
-                do_browser_transfer(app, terminal, direction, &name)?;
-            } else {
-                perform_confirm(app, action);
+            // The overwrite-confirm and the key deploy (#48) each run an inline child
+            // on accept, so they need the terminal (suspend/restore); every other
+            // action is terminal-free.
+            match action {
+                ConfirmAction::OverwriteTransfer { direction, name } => {
+                    close_overlay(app);
+                    do_browser_transfer(app, terminal, direction, &name)?;
+                }
+                ConfirmAction::DeployKey => {
+                    close_overlay(app);
+                    execute_deploy(app, terminal)?;
+                }
+                other => perform_confirm(app, other),
             }
         }
-        KeyCode::Char('n') | KeyCode::Esc => close_overlay(app),
+        KeyCode::Char('n') | KeyCode::Esc => {
+            // One confirmation arms exactly one deployment: a cancelled modal must
+            // not leave a validated plan parked on App (#48).
+            app.pending_deploy = None;
+            close_overlay(app);
+        }
         _ => {}
     }
     Ok(())
@@ -4228,9 +4341,9 @@ fn perform_confirm(app: &mut App, action: ConfirmAction) {
             app.screen = Screen::Vault;
             app.prev_screen = None;
         }
-        // Intercepted in `handle_confirm` (it needs the terminal to run the transfer);
-        // never reaches here, but keeps the match exhaustive without a panic path.
-        ConfirmAction::OverwriteTransfer { .. } => {}
+        // Intercepted in `handle_confirm` (they need the terminal to run an inline
+        // child); never reach here, but keep the match exhaustive without a panic path.
+        ConfirmAction::OverwriteTransfer { .. } | ConfirmAction::DeployKey => {}
     }
 }
 
@@ -6326,5 +6439,145 @@ mod tests {
                 secret.len()
             );
         }
+    }
+
+    // --- #48: public-key deployment guards (refuse BEFORE a command exists) ---
+
+    /// A `KeyInfo` backed by a scratch `.pub` file on disk. `pub_text` of `None`
+    /// models a private-key-only entry (no public half to deploy).
+    fn key_fixture(pub_text: Option<&str>) -> (crate::os::keys::KeyInfo, std::path::PathBuf) {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("sshm-deploy-{}-{}", std::process::id(), n));
+        std::fs::create_dir_all(&dir).unwrap();
+        let priv_path = dir.join("id_ed25519");
+        let pub_path = pub_text.map(|text| {
+            let p = dir.join("id_ed25519.pub");
+            std::fs::File::create(&p)
+                .unwrap()
+                .write_all(text.as_bytes())
+                .unwrap();
+            p
+        });
+        let info = crate::os::keys::KeyInfo {
+            path: priv_path,
+            pub_path,
+            bits: 256,
+            fingerprint: "SHA256:EXAMPLEfingerprint".into(),
+            comment: "me@laptop".into(),
+            key_type: "ED25519".into(),
+            has_private: true,
+            pair: crate::os::keys::PairStatus::Matched,
+        };
+        (info, dir)
+    }
+
+    /// An app sitting in the key manager with one key selected.
+    fn app_in_key_manager(pub_text: Option<&str>) -> (App, std::path::PathBuf) {
+        let mut app = app_fixture("Host web-prod\n    HostName 10.0.0.1\n");
+        let (info, dir) = key_fixture(pub_text);
+        app.keys = vec![info];
+        app.keys_state.select(Some(0));
+        app.screen = Screen::KeyManager;
+        (app, dir)
+    }
+
+    const CLEAN_PUB: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB1LtRcXaGCS5MFvHi1cJcHjuFF5jJyUpTXBrpEEXAMPLE me@laptop";
+
+    #[test]
+    fn deploy_opens_the_confirmation_for_a_clean_key_in_host_context() {
+        // given: the key manager opened FROM a host (K), a `.pub` present
+        let (mut app, dir) = app_in_key_manager(Some(CLEAN_PUB));
+        app.key_host_ctx = Some(0);
+        // when
+        deploy_selected_key(&mut app);
+        // then: the confirm modal is armed with the validated plan
+        assert_eq!(
+            app.screen,
+            Screen::Confirm(ConfirmAction::DeployKey),
+            "a clean key must reach the confirmation"
+        );
+        let plan = app
+            .pending_deploy
+            .as_ref()
+            .expect("the validated plan must be parked on App");
+        assert!(plan.line.ends_with("me@laptop"), "got: {}", plan.line);
+        assert!(!plan.comment_dropped);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deploy_refuses_without_a_host_context() {
+        // #48 AC4: opened from the list (no `K`), there is no host to deploy TO —
+        // same guard as `s` (set IdentityFile).
+        let (mut app, dir) = app_in_key_manager(Some(CLEAN_PUB));
+        app.key_host_ctx = None;
+        deploy_selected_key(&mut app);
+        assert_eq!(
+            app.screen,
+            Screen::KeyManager,
+            "no host context must not open the confirmation"
+        );
+        assert!(app.toast.is_error, "the refusal is a sticky error toast");
+        assert!(
+            app.pending_deploy.is_none(),
+            "nothing may be parked for a refused deploy"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deploy_refuses_a_key_without_a_public_half() {
+        // #48 AC5: a private-key-only entry has nothing to deploy.
+        let (mut app, dir) = app_in_key_manager(None);
+        app.key_host_ctx = Some(0);
+        deploy_selected_key(&mut app);
+        assert_eq!(app.screen, Screen::KeyManager);
+        assert!(app.toast.is_error);
+        assert!(app.pending_deploy.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deploy_refuses_an_unsafe_public_key_before_opening_the_modal() {
+        // #48 AC6: a hostile BODY must be refused outright — and crucially the
+        // refusal happens before the confirmation exists, so the user is never one
+        // keypress away from running it.
+        let (mut app, dir) = app_in_key_manager(Some("ssh-ed25519 AAAA'; rm -rf ~; echo ' me"));
+        app.key_host_ctx = Some(0);
+        deploy_selected_key(&mut app);
+        assert_eq!(
+            app.screen,
+            Screen::KeyManager,
+            "an unsafe key must not reach the confirmation"
+        );
+        assert!(app.toast.is_error, "the refusal is a sticky error toast");
+        assert!(
+            app.pending_deploy.is_none(),
+            "no command may be built for an unsafe key"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deploy_still_proceeds_when_only_the_comment_is_unsafe() {
+        // #48 AC6 (second half): the body is fine, so the deploy goes ahead with the
+        // comment dropped — and the plan says so, for the modal to show.
+        let (mut app, dir) = app_in_key_manager(Some(
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB1LtRcXaGCS5MFvHi1cJcHjuFF5jJyUpTXBrpEEXAMPLE evil'; id; echo '",
+        ));
+        app.key_host_ctx = Some(0);
+        deploy_selected_key(&mut app);
+        assert_eq!(app.screen, Screen::Confirm(ConfirmAction::DeployKey));
+        let plan = app.pending_deploy.as_ref().expect("plan must be parked");
+        assert!(plan.comment_dropped, "the modal must be able to say so");
+        assert!(
+            !plan.snippet.contains("id;"),
+            "the injected command must not survive: {}",
+            plan.snippet
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

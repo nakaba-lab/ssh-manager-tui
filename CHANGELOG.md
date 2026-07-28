@@ -12,18 +12,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - 鍵マネージャに ssh-agent パネルを追加: agent の稼働状態と保持鍵数、選択中の鍵が agent にロード済みかの表示、および Windows では ssh-agent サービスの状態を表示する。ロード済みの鍵は一覧に `agent` バッジが付く ([#49](https://github.com/nakaba-lab/ssh-manager-tui/issues/49))
-- 鍵マネージャのキー操作 `a`（agent にロード）/ `D`（agent からアンロード）。パスフレーズ付きの鍵は OpenSSH 自身がターミナルで尋ねる（sshm はパスフレーズを保持しない） ([#49](https://github.com/nakaba-lab/ssh-manager-tui/issues/49))
+- 鍵マネージャのキー操作 `a`（agent にロード）/ `U`（agent からアンロード）。パスフレーズ付きの鍵は OpenSSH 自身がターミナルで尋ねる（sshm はパスフレーズを保持しない） ([#49](https://github.com/nakaba-lab/ssh-manager-tui/issues/49))
 
 ### Changed
 
 - 鍵マネージャのフッターのラベルを短縮（`generate`→`gen`、`copy pub`→`copy`）。agent の 2 操作を足すと 80 桁端末で末尾のヒントが切れるため。完全な説明は `?` のヘルプ画面にある ([#49](https://github.com/nakaba-lab/ssh-manager-tui/issues/49))
+- 鍵マネージャで `D` を押すと、選択した公開鍵をリモートホストの `~/.ssh/authorized_keys` へ
+  配布できるようになった（Windows に存在しない `ssh-copy-id` 相当）。ホスト一覧で `K` を押して
+  開いた鍵マネージャから使い、配布先・鍵・指紋・付与されるコメントを確認モーダルで確かめてから
+  実行する。パスワード認証や初回のホスト鍵確認は通常どおり画面に出る。同じ鍵が既にあれば
+  追記せず「既にある」と表示し、`authorized_keys` の末尾に改行が無い場合も既存の行を壊さない。
+  公開鍵に安全でない文字が含まれる場合は配布を拒否し、コメント欄だけが該当する場合は
+  コメントを落として配布する。リモートのシェルが POSIX sh でない場合（Windows OpenSSH
+  サーバ等）は実行できず、その旨をエラーで示す（#48）。
 - 鍵マネージャの `p` で鍵のパスフレーズを追加・変更できるようになった（`ssh-keygen -p` をインライン実行し、パスフレーズは OpenSSH 自身が聴取する）。(#47)
 - 鍵生成ウィザードに「Passphrase: none / interactive」トグルを追加。`interactive` を選ぶとパスフレーズ付きの鍵を生成できる。(#47)
 - パスフレーズ変更後、その鍵を `IdentityFile` に使うホストの保存済みパスフレーズが古くなった場合に検出し、新しいパスフレーズ 1 回の入力でまとめて更新できるようになった（スキップ可）。(#47)
 
-### Changed
-
-- 鍵詳細ペインの `unverified` 表示の説明を「パスフレーズ無しでは検証できない（エラーではない）」に変更。パスフレーズで保護した鍵が壊れたように見える誤解を防ぐ。(#47)
 - ホスト一覧で `i` を押すと、選択ホストの実効設定（`ssh -G` の解決結果）を
   フィルタ・スクロール可能な画面で確認できる実効設定インスペクタを追加。ワイルドカードや
   `Match` があっても「実際に効く設定」が一目で分かる。`Match exec` を含む config
@@ -45,6 +50,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   表示され、閲覧専用（誤って別ファイルへ書き込まないよう、編集・削除は元ファイルのメインホストのみ）。
   同名エイリアスの重複は OpenSSH の先勝ちを `⊘` で明示する。チルダ・相対パス・glob（`config.d/*`）を
   OpenSSH 準拠で解決し、循環や深いネストも安全に打ち切る（#52）。
+
+### Changed
+
+- 鍵詳細ペインの `unverified` 表示の説明を「パスフレーズ無しでは検証できない（エラーではない）」に変更。パスフレーズで保護した鍵が壊れたように見える誤解を防ぐ。(#47)
 
 ### Security
 

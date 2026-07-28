@@ -38,12 +38,6 @@ const LIST_FOOTER: &[(&str, &str)] = &[
     ("?", "help"),
 ];
 
-/// Key-manager footer hints (must render within 80 columns). Promoted from an
-/// inline literal when the agent actions (#49) were added, so the 80-column
-/// guard actually covers the footer they lengthened.
-/// `generate`/`copy pub` are abbreviated so the two agent hints fit: the full
-/// footer was 87 cols, which clips on an 80-column terminal. `?` shows the
-/// unabbreviated list.
 /// SFTP browser footer hints (must render within 80 columns).
 const SFTP_BROWSER_FOOTER: &[(&str, &str)] = &[
     ("Tab", "pane"),
@@ -57,20 +51,22 @@ const SFTP_BROWSER_FOOTER: &[(&str, &str)] = &[
 
 /// Key-manager footer hints (must render within 80 columns).
 ///
-/// The agent actions (#49) pushed the full set to 94 cols, so `s set-id` moved
-/// to the help modal per the policy above: the detail pane *already* prints
-/// "Press 's' to set as IdentityFile for host X" exactly when it applies, and
-/// pressing `s` without a host context only toasts an error — so the footer slot
-/// bought nothing. `copy pub` shortens to `copy` (unambiguous here; the key
-/// manager has one copy action).
+/// This screen has the most actions in the app, so the full hint list does not
+/// fit: with deploy (#77) and the agent actions (#49) it reaches 98 cols. Per
+/// the policy above, the two most occasional keys moved to the help modal:
+///
+/// - `s set-id` — the detail pane *already* prints "Press 's' to set as
+///   IdentityFile for host X" exactly when it applies, and pressing it without a
+///   host context only toasts an error, so the footer slot bought nothing.
+/// - `g gen` — the empty-state text and the key-picker footer both advertise it.
 const KEY_MANAGER_FOOTER: &[(&str, &str)] = &[
     ("j/k", "move"),
-    ("g", "gen"),
-    ("p", "passphrase"),
+    ("p", "passphr"),
     ("y", "copy"),
+    ("D", "deploy"),
     ("d", "del"),
     ("a", "load"),
-    ("D", "unload"),
+    ("U", "unload"),
     ("Esc", "back"),
 ];
 
@@ -159,7 +155,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // Modal overlays on top of the base screen.
     match &app.screen {
         Screen::Help => help::draw(f, app, body_a),
-        Screen::Confirm(action) => confirm::draw(f, action.clone(), body_a),
+        Screen::Confirm(action) => confirm::draw(f, app, action.clone(), body_a),
         Screen::ActionMenu(idx) => confirm::draw_action_menu(f, app, *idx, body_a),
         Screen::GenerateKey { .. } => keys::draw_wizard(f, app, body_a),
         Screen::PickKey { .. } => keys::draw_picker(f, app, body_a),

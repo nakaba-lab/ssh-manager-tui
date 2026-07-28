@@ -265,6 +265,10 @@ pub enum ConfirmAction {
         direction: SftpDirection,
         name: String,
     },
+    /// Append the public key held in [`App::pending_deploy`] to the remote
+    /// `authorized_keys` (#48). Like `OverwriteTransfer`, accepting runs an inline
+    /// child, so it is dispatched where the terminal is reachable.
+    DeployKey,
     Quit,
 }
 
@@ -949,6 +953,11 @@ pub struct App {
     pub keys: Vec<KeyInfo>,
     pub keys_state: ListState,
     pub key_host_ctx: Option<usize>,
+    /// The validated public-key deployment awaiting confirmation (#48). Held on
+    /// `App` — not inside [`ConfirmAction`] — for the same reason as
+    /// [`App::pending_save`]: the confirm popup names the action, `App` carries
+    /// the payload.
+    pub pending_deploy: Option<crate::os::deploy::DeployPlan>,
     /// Last answer from the ssh-agent probe (#49). `Probing` until the first
     /// result lands; re-probed on entering the key manager and after load/unload.
     pub agent: agent::AgentSnapshot,
@@ -1075,6 +1084,7 @@ impl App {
             keys,
             keys_state: ListState::default(),
             key_host_ctx: None,
+            pending_deploy: None,
             agent: agent::AgentSnapshot::default(),
             agent_probe: None,
             gen_wizard: GenWizard::default(),
