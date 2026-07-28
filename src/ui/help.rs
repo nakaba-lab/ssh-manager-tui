@@ -68,6 +68,22 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
             lines.push(key("d", "delete entry"));
             lines.push(key("r", "reload"));
         }
+        Screen::Inspect => {
+            lines.push(section("Effective config (ssh -G)"));
+            lines.push(key("j / k", "move"));
+            lines.push(key("g / G", "top / bottom"));
+            lines.push(key("/", "filter (key / value)"));
+            lines.push(key("Esc", "clear filter, then back"));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  ssh -G normalizes keys and values, and adds compile-time",
+                Style::default().fg(theme::FAINT),
+            )));
+            lines.push(Line::from(Span::styled(
+                "  defaults — an approximation, not a diff.",
+                Style::default().fg(theme::FAINT),
+            )));
+        }
         Screen::Vault => {
             lines.push(section("Password vault"));
             lines.push(key("j / k", "move"));
@@ -77,6 +93,8 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
             lines.push(key("d", "delete secret"));
             lines.push(key("Space", "reveal / mask secrets"));
             lines.push(key("p", "toggle connect-time password auto-fill"));
+            lines.push(key("m", "change master password (re-encrypt vault)"));
+            lines.push(key("u", "upgrade vault KDF to current default"));
             lines.push(key("L", "lock vault now (forget master password)"));
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
@@ -131,6 +149,7 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
             lines.push(key("e / a", "edit / add host"));
             lines.push(key("d", "delete host"));
             lines.push(key("r / R", "refresh liveness (all / selected)"));
+            lines.push(key("i", "inspect effective config (ssh -G)"));
             lines.push(key("K", "key manager"));
             lines.push(key("H", "known hosts"));
             lines.push(key("P", "password vault"));

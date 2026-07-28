@@ -7,6 +7,7 @@ pub mod connect_override;
 pub mod diff;
 pub mod edit;
 pub mod help;
+pub mod inspect;
 pub mod keys;
 pub mod known_hosts;
 pub mod list;
@@ -60,9 +61,10 @@ const KEY_MANAGER_FOOTER: &[(&str, &str)] = &[
 ];
 
 /// Vault footer hints (must render within 80 columns). Like [`LIST_FOOTER`] this
-/// carries only the most-used keys: the password-auto-fill toggle (`p`) lives in
-/// the help modal, because listing it here put the footer at 93 cols — silently
-/// clipping `Esc back` on an 80-column console (found reviewing #47).
+/// carries only the most-used keys: the vault's occasional chords (`p` password
+/// auto-fill, `m` master password, `u` KDF upgrade) live in the help modal,
+/// because listing them here ran the footer past 100 cols — silently clipping
+/// `Esc back` on an 80-column console (found reviewing #47).
 const VAULT_FOOTER: &[(&str, &str)] = &[
     ("j/k", "move"),
     ("a", "add"),
@@ -74,8 +76,11 @@ const VAULT_FOOTER: &[(&str, &str)] = &[
     ("Esc", "back"),
 ];
 
-/// Every single-line footer, so the 80-column guard covers all of them rather
-/// than an allowlist that new screens silently escape (see `footers_fit_80_cols`).
+/// The footers the 80-column guard checks (see `footers_fit_80_cols`). These are
+/// the long ones — the screens whose hint lists actually grow. Shorter footers
+/// stay inline in [`draw_footer`]; if one of those gains hints, hoist it to a
+/// const and list it here rather than letting it escape the guard (the earlier
+/// two-entry version is how the Key-manager footer reached 82 cols unnoticed).
 #[cfg(test)]
 const ALL_FOOTERS: &[(&str, &[(&str, &str)])] = &[
     ("list", LIST_FOOTER),
@@ -92,6 +97,7 @@ fn base_screen(app: &App) -> Screen {
         | Screen::Confirm(_)
         | Screen::ActionMenu(_)
         | Screen::VaultUnlock
+        | Screen::VaultRekey
         | Screen::ConnectOverride { .. }
         | Screen::SftpTransfer
         | Screen::DiffPreview
@@ -129,6 +135,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Screen::Edit { .. } => edit::draw(f, app, body_a),
         Screen::KeyManager => keys::draw(f, app, body_a),
         Screen::KnownHosts => known_hosts::draw(f, app, body_a),
+        Screen::Inspect => inspect::draw(f, app, body_a),
         Screen::Vault => vault::draw(f, app, body_a),
         Screen::SftpBrowser => sftp::draw_browser(f, app, body_a),
         _ => list::draw(f, app, body_a),
@@ -153,6 +160,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Screen::DiffPreview => diff::draw(f, app, body_a),
         Screen::SftpTransfer => sftp::draw_transfer(f, app, body_a),
         Screen::VaultUnlock => vault::draw_unlock(f, app, body_a),
+        Screen::VaultRekey => vault::draw_rekey(f, app, body_a),
         Screen::VaultEntry { .. } => vault::draw_entry(f, app, body_a),
         Screen::PassphraseSync => keys::draw_passphrase_sync(f, app, body_a),
         Screen::PasswordConfirm { target, kinds, .. } => {
@@ -171,6 +179,7 @@ fn draw_title(f: &mut Frame, app: &App, base: &Screen, area: Rect) {
         Screen::Edit { editing: None } => "Add host",
         Screen::KeyManager => "Keys",
         Screen::KnownHosts => "Known hosts",
+        Screen::Inspect => "Inspect",
         Screen::Vault => "Passwords",
         Screen::SftpBrowser => "SFTP browser",
         _ => "SSH Manager",
@@ -184,6 +193,7 @@ fn draw_title(f: &mut Frame, app: &App, base: &Screen, area: Rect) {
         ),
         Screen::KeyManager => format!("  {} keys ", app.keys.len()),
         Screen::KnownHosts => format!("  {} entries ", app.known_hosts.len()),
+        Screen::Inspect => format!("  {} · ssh -G ", app.inspect_alias),
         Screen::Vault => format!(
             "  {} secrets ",
             app.vault.as_ref().map(|v| v.entries.len()).unwrap_or(0)
@@ -332,6 +342,12 @@ fn draw_footer(f: &mut Frame, app: &App, base: &Screen, area: Rect) {
             ("d", "delete"),
             ("Esc", "back"),
         ]),
+        (Screen::Inspect, a) if a.inspect_searching => {
+            widgets::footer_hints(&[("type", "filter"), ("Esc", "clear")])
+        }
+        (Screen::Inspect, _) => {
+            widgets::footer_hints(&[("j/k", "move"), ("/", "filter"), ("Esc", "back")])
+        }
         (Screen::Vault, _) => widgets::footer_hints(VAULT_FOOTER),
         (Screen::SftpBrowser, _) => widgets::footer_hints(SFTP_BROWSER_FOOTER),
         _ => widgets::footer_hints(&[("?", "help"), ("q", "quit")]),
