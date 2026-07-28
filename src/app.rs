@@ -1264,10 +1264,18 @@ impl App {
         rank_changed
     }
 
-    /// Start (or restart) an ssh-agent probe. Dropping any in-flight probe is
-    /// safe — its thread finishes and its result is discarded, so a burst of
-    /// reloads cannot pile up stale answers behind the newest one.
+    /// Start an ssh-agent probe, unless one is already in flight.
+    ///
+    /// The guard is not an optimisation. Dropping an `AgentProbe` only detaches
+    /// its thread — that thread stays blocked in `ssh-add -l` with no timeout.
+    /// Without the guard, holding `r` down (terminal autorepeat) against a
+    /// wedged agent — the very situation this panel exists to explain — would
+    /// pin one thread and one `ssh-add` process per repeat for the rest of the
+    /// session.
     pub fn refresh_agent(&mut self) {
+        if self.agent_probe.is_some() {
+            return;
+        }
         self.agent.status = agent::AgentStatus::Probing;
         self.agent_probe = Some(agent::AgentProbe::spawn());
     }
@@ -1289,13 +1297,23 @@ impl App {
                 self.agent = snapshot;
                 true
             }
+            // The probe closed its channel without ever sending (its thread
+            // died). Fall back to Unavailable rather than leaving the panel on
+            // "checking…" until the user happens to press `r`.
+            None if disconnected && self.agent.status == agent::AgentStatus::Probing => {
+                self.agent.status = agent::AgentStatus::Unavailable;
+                true
+            }
             _ => false,
         }
     }
 
-    /// How the selected key stands relative to the agent (#49).
+    /// How the selected key stands relative to the agent (#49). The key's
+    /// [`PairStatus`](crate::os::keys::PairStatus) is part of the decision: a
+    /// mismatched pair means the fingerprint we hold is not the one the agent
+    /// would report for this private key.
     pub fn key_agent_state(&self, key: &KeyInfo) -> agent::KeyAgentState {
-        agent::key_state(&self.agent.status, &key.fingerprint)
+        agent::key_state(&self.agent.status, &key.fingerprint, key.pair)
     }
 
     /// Drain completed SFTP browse-session ops into the browser state (no-op when

@@ -1513,6 +1513,10 @@ fn agent_load_key(app: &mut App, terminal: &mut DefaultTerminal) -> Result<()> {
 
 /// Remove the selected key from the ssh-agent (#49). Needs no input, but goes
 /// through the same inline path so both directions report failures identically.
+///
+/// The `has_private` guard from [`agent_load_key`] is deliberately absent:
+/// `ssh-add -d` wants the *public* half and falls back from `<path>` to
+/// `<path>.pub`, so a public-only entry unloads fine. Do not add the guard.
 fn agent_unload_key(app: &mut App, terminal: &mut DefaultTerminal) -> Result<()> {
     let Some(key) = app.keys_state.selected().and_then(|i| app.keys.get(i)) else {
         return Ok(());
@@ -1530,20 +1534,45 @@ fn run_agent_command(
     success: &str,
 ) -> Result<()> {
     suspend_tui(terminal)?;
+    // The empty env is deliberate: `ssh-add` must NOT receive the askpass bundle
+    // (`arm_connect`'s `SSH_ASKPASS*` / `SSHM_ASKPASS_CHANNEL`), so the
+    // passphrase prompt falls to the console and the vault channel stays out of
+    // reach. Do not "helpfully" pass `os_tokens()` here.
     let status = run_inline(&tools().ssh_add, args, &[]);
     restore_tui(terminal)?;
+    // A long inline prompt (TUI suspended, no keypresses) must not make the next
+    // on_tick spuriously idle-auto-lock the vault (#14). This is the most likely
+    // site to trip it: a passphrase prompt is exactly when a user walks off to
+    // look one up.
+    app.last_activity = Instant::now();
     match status {
         Ok(status) if status.success() => app.toast(success, false),
-        Ok(status) => {
-            // Non-zero: wrong passphrase, no agent, key not in the agent. The
-            // real diagnosis was printed to the console while we were suspended.
-            let code = status.code().unwrap_or(-1);
-            app.toast(format!("ssh-add failed (exit {code})"), true);
-        }
+        // `ssh-add`'s own stderr is not readable: `restore_tui` re-enters the
+        // alternate screen and clears it before this toast renders. So decode
+        // the code into words here rather than pointing at a console the user
+        // cannot see.
+        Ok(status) => app.toast(describe_ssh_add_failure(status.code()), true),
         Err(e) => app.toast(format!("ssh-add could not run: {e}"), true),
     }
     app.refresh_agent();
     Ok(())
+}
+
+/// Turn an `ssh-add` exit code into something a user can act on.
+///
+/// On Windows `code()` is never `None`; a Ctrl+C at the passphrase prompt (which
+/// `InlineInterruptGuard` deliberately lets kill the child) surfaces as
+/// `STATUS_CONTROL_C_EXIT`, which would otherwise render as the bare integer
+/// -1073741510.
+fn describe_ssh_add_failure(code: Option<i32>) -> String {
+    const STATUS_CONTROL_C_EXIT: i32 = 0xC000013Au32 as i32;
+    match code {
+        Some(STATUS_CONTROL_C_EXIT) => "ssh-add cancelled".to_string(),
+        Some(1) => "ssh-add refused: wrong passphrase, or key not in the agent".to_string(),
+        Some(2) => "no ssh-agent reachable".to_string(),
+        Some(code) => format!("ssh-add failed (exit {code})"),
+        None => "ssh-add was terminated".to_string(),
+    }
 }
 
 fn copy_public_key(app: &mut App) {

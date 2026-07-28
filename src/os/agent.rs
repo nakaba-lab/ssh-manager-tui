@@ -17,7 +17,7 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread::JoinHandle;
 
 use super::binaries::tools;
-use super::keys::parse_fingerprint_line;
+use super::keys::{PairStatus, parse_fingerprint_line};
 
 /// What the ssh-agent is doing, as far as we could tell.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -55,10 +55,15 @@ pub enum KeyAgentState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceState {
     Running,
+    /// Stopped. Note this is ALSO what a **disabled** service reports: `sc
+    /// query` does not surface the start type, so the two are indistinguishable
+    /// here — which is why the UI advice has to cover both.
     Stopped,
+    /// Paused — a stable state, not a transition.
+    Paused,
     /// A transitional state (start/stop pending).
     Transitioning,
-    /// No `STATE` line found — service absent, or `sc.exe` failed.
+    /// No usable `STATE` line — service absent, or the query could not be made.
     Unknown,
 }
 
@@ -93,12 +98,19 @@ pub fn parse_loaded_fingerprints(stdout: &str) -> HashSet<String> {
 
 /// Decide how a key stands relative to the agent. `key_fingerprint` is
 /// [`super::keys::KeyInfo::fingerprint`], which is **empty** when it could not
-/// be read.
-pub fn key_state(status: &AgentStatus, key_fingerprint: &str) -> KeyAgentState {
-    // Checked before the agent state: with no fingerprint we cannot decide
-    // membership even against a healthy agent, and reporting `NotLoaded` there
-    // would be a false negative on exactly the keys most likely to be loaded.
-    if key_fingerprint.is_empty() {
+/// be read; `pair` is that key's [`PairStatus`].
+pub fn key_state(status: &AgentStatus, key_fingerprint: &str, pair: PairStatus) -> KeyAgentState {
+    // Both guards run before the agent state: neither case can be decided even
+    // against a perfectly healthy agent, and answering `NotLoaded` would be a
+    // false negative on exactly the keys most likely to be loaded.
+    //
+    // - No fingerprint: nothing to compare.
+    // - Mismatched: the fingerprint we hold is the `.pub` file's, and
+    //   `Mismatched` is the verdict that this `.pub` is NOT the private key's
+    //   public half. Loading the key puts its *real* fingerprint in the agent,
+    //   which we never saw — so a comparison would say `not loaded` forever,
+    //   including immediately after a load the UI reported as successful.
+    if key_fingerprint.is_empty() || pair == PairStatus::Mismatched {
         return KeyAgentState::Unknown;
     }
     match status {
@@ -115,11 +127,18 @@ pub fn key_state(status: &AgentStatus, key_fingerprint: &str) -> KeyAgentState {
 
 /// Parse `sc.exe query ssh-agent` output into a [`ServiceState`].
 ///
-/// Reads the **numeric** token of the `STATE` line (`STATE : 4  RUNNING`), not
-/// the trailing label: on a localized Windows the label is translated (e.g.
-/// `実行中`), so matching on it would break outside English. Kept free of
-/// `#[cfg(windows)]` so it is unit-testable on every platform (the spawn that
-/// feeds it is the Windows-only part).
+/// Reads the **numeric** token of the `STATE` line (`STATE : 4  RUNNING`) and
+/// ignores the trailing word, so no wording change — locale or otherwise — can
+/// mislead it.
+///
+/// The line is still *located* by its ASCII field name, which is the one
+/// unverified assumption here: `sc.exe` is understood to emit ASCII field names
+/// (unlike `net start` / `Get-Service`, which do translate), but this repo's CI
+/// has no Windows box to confirm it on. If that ever proved false the result is
+/// `Unknown` — an honest "don't know", not a wrong state.
+///
+/// Kept free of `#[cfg(windows)]` so it is unit-testable on every platform (the
+/// spawn that feeds it is the Windows-only part).
 pub fn parse_service_state(sc_stdout: &str) -> ServiceState {
     for line in sc_stdout.lines() {
         let Some((label, rest)) = line.split_once(':') else {
@@ -141,7 +160,8 @@ pub fn parse_service_state(sc_stdout: &str) -> ServiceState {
         return match code {
             1 => ServiceState::Stopped,
             4 => ServiceState::Running,
-            2 | 3 | 5 | 6 | 7 => ServiceState::Transitioning,
+            7 => ServiceState::Paused,
+            2 | 3 | 5 | 6 => ServiceState::Transitioning,
             _ => ServiceState::Unknown,
         };
     }
@@ -220,13 +240,23 @@ impl AgentProbe {
     /// Non-blocking. Returns the snapshot if one has arrived, and `true` once
     /// the channel has closed (the probe finished and the caller may drop this).
     pub fn drain(&self) -> (Option<AgentSnapshot>, bool) {
-        let mut latest = None;
-        loop {
-            match self.rx.try_recv() {
-                Ok(snapshot) => latest = Some(snapshot),
-                Err(TryRecvError::Empty) => return (latest, false),
-                Err(TryRecvError::Disconnected) => return (latest, true),
-            }
+        drain_channel(&self.rx)
+    }
+}
+
+/// The draining half of [`AgentProbe::drain`], split out so the concurrent
+/// contract can be tested against a plain channel with no thread involved.
+///
+/// Order matters: a value must survive being read in the same call that sees
+/// `Disconnected`, which is the normal case here — the probe sends once and
+/// drops its sender immediately.
+fn drain_channel(rx: &Receiver<AgentSnapshot>) -> (Option<AgentSnapshot>, bool) {
+    let mut latest = None;
+    loop {
+        match rx.try_recv() {
+            Ok(snapshot) => latest = Some(snapshot),
+            Err(TryRecvError::Empty) => return (latest, false),
+            Err(TryRecvError::Disconnected) => return (latest, true),
         }
     }
 }
@@ -234,8 +264,20 @@ impl AgentProbe {
 /// Run the probe commands and compose a snapshot. Blocking — always called on a
 /// worker thread, never on the UI thread.
 fn probe_now() -> AgentSnapshot {
+    // The service is queried FIRST, deliberately. `ssh-add -l` against a wedged
+    // agent can block indefinitely, and that is exactly the situation this panel
+    // exists to explain — so the cheap, always-terminating answer (and the
+    // `Start-Service` advice that follows from it) must not sit behind it.
+    let service = query_service_state();
     let output = Command::new(&tools().ssh_add)
         .arg("-l")
+        // Ask for SHA256 explicitly rather than relying on the default: the
+        // fingerprints we compare against come from `ssh-keygen -l` elsewhere,
+        // and if either binary's default ever differs (a PATH-fallback build on
+        // Windows) we would collect MD5 here and silently report every key as
+        // not loaded.
+        .arg("-E")
+        .arg("sha256")
         .stdin(Stdio::null())
         .output();
     let (exit, stdout) = match &output {
@@ -243,22 +285,35 @@ fn probe_now() -> AgentSnapshot {
         // `ssh-add` is absent or unrunnable — Unavailable, not NotRunning.
         Err(_) => (None, std::borrow::Cow::Borrowed("")),
     };
-    let service = query_service_state();
     snapshot_from(exit, &stdout, service.as_deref())
 }
 
-/// Capture `sc.exe query ssh-agent` output. `None` off Windows (no such
-/// service) and when `sc.exe` cannot be run at all.
+/// Capture `sc.exe query ssh-agent` output. `None` only where the question does
+/// not apply (non-Windows, or the System32 anchor could not be resolved).
+///
+/// `sc.exe` is resolved to its absolute System32 path via `GetSystemDirectoryW`,
+/// never spawned by bare name — the same CWE-426 hardening `secure_fs`'s
+/// `icacls_path()` applies, and for the same reason: this runs every time the
+/// key manager opens, so a planted `sc.exe` next to a portable `sshm.exe` (Rust
+/// searches the executable's own directory before System32) would execute in the
+/// user's session on every probe. If the anchor cannot be resolved we skip the
+/// query rather than trust the search path.
 #[cfg(windows)]
 fn query_service_state() -> Option<String> {
-    let output = Command::new("sc.exe")
+    let sc = super::binaries::system_directory()?.join("sc.exe");
+    let output = Command::new(sc)
         .args(["query", "ssh-agent"])
         .stdin(Stdio::null())
-        .output()
-        .ok()?;
-    // sc.exe reports a missing service via a non-zero exit AND prints no STATE
-    // line, so the parser handles both; take stdout either way.
-    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+        .output();
+    match output {
+        // sc.exe reports a missing service via a non-zero exit AND prints no
+        // STATE line, so the parser handles both; take stdout either way.
+        Ok(output) => Some(String::from_utf8_lossy(&output.stdout).into_owned()),
+        // On Windows the service exists as a concept even when we failed to ask
+        // about it, so report `Unknown` rather than collapsing to `None` — that
+        // would render identically to non-Windows and hide the failure.
+        Err(_) => Some(String::new()),
+    }
 }
 
 #[cfg(not(windows))]
@@ -339,6 +394,7 @@ mod tests {
         let state = key_state(
             &status,
             "SHA256:AAAAxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            PairStatus::Matched,
         );
         assert_eq!(state, KeyAgentState::Loaded);
     }
@@ -346,11 +402,55 @@ mod tests {
     #[test]
     fn key_state_reports_not_loaded_when_the_agent_lacks_the_fingerprint() {
         let status = status_from_exit(Some(0), TWO_KEYS);
-        let state = key_state(&status, "SHA256:ZZZZnotloadedzzzzzzzzzzzzzzzzzzzzzzzzzzz");
+        let state = key_state(
+            &status,
+            "SHA256:ZZZZnotloadedzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+            PairStatus::Matched,
+        );
         assert_eq!(state, KeyAgentState::NotLoaded);
     }
 
     // --- AC4: an unreadable fingerprint is Unknown, never a false "not loaded" ---
+
+    #[test]
+    fn key_state_reports_unknown_when_the_pair_is_mismatched() {
+        // B49 regression: the fingerprint we hold comes from the `.pub` file,
+        // but `Mismatched` is precisely the verdict "this `.pub` is NOT the
+        // private key's public half". `ssh-add <priv>` therefore loads a key
+        // whose real fingerprint we never saw, and comparing against the `.pub`
+        // would report `not loaded` forever — even right after a load that the
+        // UI just reported as succeeding.
+        let status = status_from_exit(Some(0), TWO_KEYS);
+        let state = key_state(
+            &status,
+            "SHA256:AAAAxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            PairStatus::Mismatched,
+        );
+        assert_eq!(state, KeyAgentState::Unknown);
+    }
+
+    #[test]
+    fn key_state_still_decides_membership_for_a_verified_pair() {
+        // The Mismatched guard must not swallow the normal case.
+        let status = status_from_exit(Some(0), TWO_KEYS);
+        assert_eq!(
+            key_state(
+                &status,
+                "SHA256:AAAAxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+                PairStatus::Matched
+            ),
+            KeyAgentState::Loaded
+        );
+        // A private-key-only entry has no pair to verify and must still work.
+        assert_eq!(
+            key_state(
+                &status,
+                "SHA256:ZZZZnotloadedzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+                PairStatus::NotApplicable
+            ),
+            KeyAgentState::NotLoaded
+        );
+    }
 
     #[test]
     fn key_state_reports_unknown_for_a_key_whose_fingerprint_could_not_be_read() {
@@ -358,7 +458,10 @@ mod tests {
         // legacy PEM). Reporting NotLoaded there would be a false negative: the
         // key may well be in the agent.
         let status = status_from_exit(Some(0), TWO_KEYS);
-        assert_eq!(key_state(&status, ""), KeyAgentState::Unknown);
+        assert_eq!(
+            key_state(&status, "", PairStatus::Unverified),
+            KeyAgentState::Unknown
+        );
     }
 
     #[test]
@@ -366,6 +469,7 @@ mod tests {
         let state = key_state(
             &AgentStatus::NotRunning,
             "SHA256:AAAAxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            PairStatus::Matched,
         );
         assert_eq!(state, KeyAgentState::NoAgent);
     }
@@ -375,6 +479,7 @@ mod tests {
         let state = key_state(
             &AgentStatus::Probing,
             "SHA256:AAAAxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            PairStatus::Matched,
         );
         assert_eq!(state, KeyAgentState::NoAgent);
     }
@@ -394,16 +499,41 @@ SERVICE_NAME: ssh-agent
     }
 
     #[test]
-    fn parse_service_state_ignores_a_localized_state_label() {
-        // B49 regression: on Japanese Windows sc.exe translates the trailing
-        // label, so matching "RUNNING" as text would report the service stopped
-        // on every non-English install. Only the numeric 4 is contractual.
-        let localized = "\
+    fn parse_service_state_ignores_whatever_follows_the_numeric_token() {
+        // We read the number and ignore the trailing word entirely, so the
+        // parser cannot be broken by that word changing — whether by locale or
+        // by a future sc.exe wording. Matching "RUNNING" as text would be a
+        // gratuitous dependency on it.
+        let translated_value = "\
 SERVICE_NAME: ssh-agent
         TYPE               : 20  WIN32_SHARE_PROCESS
         STATE              : 4  実行中
         WIN32_EXIT_CODE    : 0  (0x0)";
-        assert_eq!(parse_service_state(localized), ServiceState::Running);
+        assert_eq!(parse_service_state(translated_value), ServiceState::Running);
+    }
+
+    #[test]
+    fn parse_service_state_reports_unknown_if_the_field_name_is_not_ascii_state() {
+        // KNOWN LIMIT, pinned deliberately rather than papered over. We locate
+        // the line by its ASCII field name, so a hypothetical sc.exe that also
+        // translated its field names would yield Unknown — the row reads
+        // "unknown", which is honest, rather than a confidently wrong state.
+        //
+        // Observed sc.exe emits ASCII field names (unlike `net start` /
+        // Get-Service, which do translate their output), so this is not
+        // believed to be reachable — but it is unverified from this repo's CI,
+        // which has no Windows box, let alone a localized one. A real ja-JP
+        // `sc query ssh-agent` capture should replace this assumption.
+        let translated_field = "        状態              : 4  実行中";
+        assert_eq!(parse_service_state(translated_field), ServiceState::Unknown);
+    }
+
+    #[test]
+    fn parse_service_state_reports_paused_as_its_own_state() {
+        // ssh-agent advertises PAUSABLE, and paused is a *stable* state — so it
+        // must not render as the "starting/stopping…" animation forever.
+        let paused = "        STATE              : 7  PAUSED";
+        assert_eq!(parse_service_state(paused), ServiceState::Paused);
     }
 
     #[test]
@@ -430,6 +560,46 @@ SERVICE_NAME: ssh-agent
     // --- AC5/AC6: the ssh-add argument contract ---
 
     // --- AC9/AC10: snapshot composition, and the platform-scoped service row ---
+
+    // --- probe plumbing: the concurrent contract, tested without a thread ---
+
+    #[test]
+    fn drain_channel_keeps_the_last_value_even_when_the_sender_is_gone() {
+        // The probe sends once and immediately drops its sender, so `try_recv`
+        // can yield the value and then `Disconnected` within one drain. Losing
+        // the value there would strand the UI on "checking…" forever.
+        let (tx, rx) = mpsc::channel();
+        let snapshot = snapshot_from(Some(0), TWO_KEYS, None);
+        tx.send(snapshot.clone()).unwrap();
+        drop(tx);
+        let (got, disconnected) = drain_channel(&rx);
+        assert_eq!(got, Some(snapshot));
+        assert!(disconnected, "sender dropped, so the probe is finished");
+    }
+
+    #[test]
+    fn drain_channel_reports_nothing_while_the_probe_is_still_running() {
+        let (tx, rx) = mpsc::channel::<AgentSnapshot>();
+        let (got, disconnected) = drain_channel(&rx);
+        assert_eq!(got, None);
+        assert!(
+            !disconnected,
+            "sender alive, so the probe is still in flight"
+        );
+        drop(tx);
+    }
+
+    #[test]
+    fn drain_channel_reports_disconnect_when_the_probe_died_without_sending() {
+        // A panicking probe thread closes the channel with no value. The caller
+        // must be able to tell this apart from "still running" so it can fall
+        // back to Unavailable instead of showing "checking…" indefinitely.
+        let (tx, rx) = mpsc::channel::<AgentSnapshot>();
+        drop(tx);
+        let (got, disconnected) = drain_channel(&rx);
+        assert_eq!(got, None);
+        assert!(disconnected);
+    }
 
     #[test]
     fn snapshot_from_combines_the_agent_and_service_answers() {

@@ -60,12 +60,17 @@ detail ペイン下部に `section_header` で **独立したブロック**を�
   | プローブ中 | `checking…` | `—` |
   | agent 稼働・鍵あり | `running (N keys)` | `loaded` / `not loaded` |
   | agent 稼働・鍵なし | `running (no keys)` | `not loaded` |
-  | agent 未起動 | `not running` ＋案内文 | `—` |
-  | `ssh-add` 解決不可 | `unavailable` | `—` |
-  | fingerprint 不明な鍵 | （agent 状態は出る） | `unknown` |
+  | agent 未起動 | `not running` | `—` |
+  | `ssh-add` が 0/1/2 以外で終了・起動不可 | `unavailable` | `—` |
+  | fingerprint 不明・pair 不一致の鍵 | （agent 状態は出る） | `unknown` |
 
-- **サービス停止時の案内**（Windows のみ・2 行）: `管理者権限で Start-Service ssh-agent を実行してください`。sshm は起動を代行しない。
-- **非 Windows**: `service` 行を出さない（`#[cfg(windows)]`）。
+  **判定の優先順位**: `this key` は fingerprint 不明／pair 不一致を **agent 状態より先に**見る。したがって「agent 未起動 ＋ fingerprint 不明」は `—` ではなく `unknown` になる（どちらも「分からない」だが、鍵側の理由の方が具体的なため）。
+
+- **サービス行の案内**（Windows のみ・`service` の値で決まる。`status` ではない）:
+  - `stopped or disabled` → `Set-Service -StartupType Automatic` → `Start-Service` の **2 行**（素の Windows は ssh-agent を無効で出荷し、`sc query` は無効も `STOPPED` と報告するため片方だけでは失敗する）。
+  - `status = not running` かつ `service = running` → 昇格の食い違いを疑う 1 行（サービスは動いているのに到達できない典型）。
+  - sshm は起動を代行しない（昇格が要るため）。
+- **非 Windows**: `service` 行を出さない。実装は `#[cfg(windows)]` ではなく **`AgentSnapshot::service: Option<_>` が `None`** になることで抑止する（cfg で囲うと `parse_service_state` のテストが Linux CI で 1 件も走らなくなるため。ランタイム判定の方が単体テスト可能）。
 - **レスポンシブ**: 既存 `responsive_split(area, 45, 55)` をそのまま使う。縦積み（90 桁未満）でも agent ブロックは detail 内の最下部に収まる。
 - **フッターは 80 桁以内**（`footers_fit_80_cols` が門番）。`a load`・`D unload` の 2 つを足すと **87 桁**になり 80 桁端末で末尾のヒントが黙って切れたため、`generate`→`gen`・`copy pub`→`copy` に短縮して 78 桁に収めた。完全なラベルは `?`（ヘルプ画面）が持つ。**フッターは `KEY_MANAGER_FOOTER` 定数に切り出した** — インラインのリテラルのままだと 80 桁ガードの対象外で、この回帰が素通りする。
 

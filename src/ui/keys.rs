@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Clear, List, ListItem, Paragraph, Wrap};
 
 use crate::app::App;
-use crate::os::agent::{AgentStatus, KeyAgentState, ServiceState};
+use crate::os::agent::{AgentSnapshot, AgentStatus, KeyAgentState, ServiceState};
 use crate::os::keys::{KeyType, PairStatus};
 
 use super::theme;
@@ -16,6 +16,31 @@ use super::widgets::{
     centered, input_line, kv_line, kv_line_colored, modal_block, panel, responsive_split,
     section_header,
 };
+
+/// Advice lines for the current agent/service pairing. Empty when there is
+/// nothing useful to say.
+fn service_advice(snapshot: &AgentSnapshot) -> Vec<&'static str> {
+    match (&snapshot.status, snapshot.service) {
+        // Stock Windows ships ssh-agent *disabled*, and `sc query` reports a
+        // disabled service as plain STOPPED — indistinguishable from stopped.
+        // Advising only `Start-Service` would therefore fail outright ("Cannot
+        // start service ssh-agent") for the single most common case, so both
+        // steps are given.
+        (_, Some(ServiceState::Stopped)) => vec![
+            "As Administrator: Set-Service ssh-agent -StartupType Automatic",
+            "then: Start-Service ssh-agent",
+        ],
+        // A running service we cannot reach almost always means sshm and the
+        // agent are in different security contexts — the classic symptom of
+        // launching one of them elevated.
+        (AgentStatus::NotRunning, Some(ServiceState::Running)) => {
+            vec![
+                "Service is running but unreachable — is sshm elevated and the agent not (or vice versa)?",
+            ]
+        }
+        _ => Vec::new(),
+    }
+}
 
 pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
     if app.keys.is_empty() {
@@ -160,7 +185,10 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
         }
         AgentStatus::Running(fps) => (format!("running ({} keys)", fps.len()), theme::UP),
         AgentStatus::NotRunning => ("not running".to_string(), theme::DOWN),
-        AgentStatus::Unavailable => ("unavailable (no ssh-add)".to_string(), theme::DOWN),
+        // Deliberately not "no ssh-add": any exit code outside 0/1/2 lands here
+        // too (OpenSSH's fatal() exits 255), so naming a missing binary would
+        // send the user down the wrong path in those cases.
+        AgentStatus::Unavailable => ("unavailable".to_string(), theme::DOWN),
     };
     lines.push(kv_line_colored("status", status_text, status_color));
 
@@ -168,7 +196,8 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
     if let Some(service) = app.agent.service {
         let (text, color) = match service {
             ServiceState::Running => ("running", theme::UP),
-            ServiceState::Stopped => ("stopped", theme::DOWN),
+            ServiceState::Stopped => ("stopped or disabled", theme::DOWN),
+            ServiceState::Paused => ("paused", theme::WARN),
             ServiceState::Transitioning => ("starting/stopping…", theme::CHECKING),
             ServiceState::Unknown => ("unknown", theme::DIM),
         };
@@ -185,12 +214,11 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
     };
     lines.push(kv_line_colored("this key", key_text.to_string(), key_color));
 
-    // Only actionable advice, and only when acting is possible: starting the
-    // service needs elevation, so we tell the user the command rather than
-    // silently failing to run it ourselves.
-    if app.agent.service == Some(ServiceState::Stopped) {
+    // Actionable advice only. Starting the service needs elevation, so we print
+    // the command rather than silently failing to run it ourselves.
+    for advice in service_advice(&app.agent) {
         lines.push(Line::from(Span::styled(
-            "  Run `Start-Service ssh-agent` as Administrator",
+            format!("  {advice}"),
             Style::default().fg(theme::FAINT),
         )));
     }
