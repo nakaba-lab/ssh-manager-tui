@@ -600,11 +600,16 @@ fn pin_block(rows: &[ClassifiedKey], existing: &[KnownHostEntry]) -> Option<PinB
     // unauthenticated raw key beside it bypasses the CA's revocation control
     // exactly the way a sidecar key bypasses a pin. A `@revoked` line is the
     // administrator declaring distrust of this host's key material, which is
-    // not something a scan may quietly work around (#46 round 6). A wildcard
-    // entry is deliberately NOT one of these — the trust gate ignores it, so
-    // treating it as a decision would leave the user unable to create the exact
-    // pin the gate wants.
-    let has_decision = existing.iter().any(|e| !e.is_pattern());
+    // not something a scan may quietly work around (#46 round 6).
+    //
+    // MARKER lines count even when the host field is a PATTERN: `@cert-authority
+    // *.example.com` is the form people actually write, and OpenSSH honours it
+    // for this host (#46 round 7). Only a marker-free wildcard is excused — the
+    // trust gate ignores those, so treating one as a decision would leave the
+    // user unable to create the exact pin the gate wants.
+    let has_decision = existing
+        .iter()
+        .any(|e| e.marker.is_some() || !e.is_pattern());
     has_decision.then_some(PinBlocked::AlreadyPinned)
 }
 
@@ -731,6 +736,19 @@ fn open_keyscan(app: &mut App, host_idx: usize) {
         app.toast(msg, true);
         return;
     }
+    // Checked BEFORE the pin target is resolved: a lossy list usually also
+    // fails to resolve, and the generic "could not resolve" toast would mask
+    // the actionable reason (#46 round 7).
+    if rc.known_hosts_list_lossy {
+        app.toast(
+            format!(
+                "can't scan {alias}: a known_hosts path contains repeated spaces or a tab, \
+                 which this build cannot split reliably — pin manually"
+            ),
+            true,
+        );
+        return;
+    }
     let Some(pin_target) = keyscan_pin_target(&rc) else {
         app.toast(
             format!("could not resolve a known_hosts file for {alias}"),
@@ -756,19 +774,6 @@ fn open_keyscan(app: &mut App, host_idx: usize) {
             format!(
                 "can't scan {alias}: ssh reports a known_hosts path this build can't resolve \
                  (unexpanded ~ or %) — pin manually or use an absolute path"
-            ),
-            true,
-        );
-        return;
-    }
-    // Same reason, different cause: the file list could not be split back into
-    // paths without losing where the boundaries were, so neither the pins we
-    // can see nor the file we would write to can be trusted (#46 round 6).
-    if rc.known_hosts_list_lossy {
-        app.toast(
-            format!(
-                "can't scan {alias}: a known_hosts path contains repeated spaces or a tab, \
-                 which this build cannot split reliably — pin manually"
             ),
             true,
         );
@@ -5457,6 +5462,11 @@ mod tests {
         for line in [
             "@cert-authority db.example ssh-rsa CAKEY",
             "@revoked db.example ssh-rsa OLDEVIL",
+            // WILDCARD markers count too — `@cert-authority *.example` is the
+            // form people actually write, and OpenSSH honours it for this host
+            // (#46 round 7). Only a marker-FREE wildcard is excused.
+            "@cert-authority *.example ssh-rsa CAKEY",
+            "@revoked *.example ssh-rsa OLDEVIL",
         ] {
             let existing = kh_entries(&[line]);
             // when — the scan returns an unrelated key, so no row is Revoked

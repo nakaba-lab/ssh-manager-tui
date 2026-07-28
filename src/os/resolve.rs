@@ -75,32 +75,21 @@ fn split_quoted_paths(s: &str) -> Vec<String> {
 }
 
 /// True when [`split_quoted_paths`] would discard information about where the
-/// path boundaries were: `ssh -G` separates entries with exactly ONE space and
-/// preserves whitespace inside a path, so a run of two-or-more (or any tab) is
-/// part of a filename that the split cannot put back (#46 round 6).
-/// Quoted segments are exempt — those carry their own boundaries.
-fn splitting_loses_information(value: &str) -> bool {
-    let mut in_quotes = false;
-    let mut run = 0usize;
-    for c in value.trim().chars() {
-        match c {
-            '"' => {
-                in_quotes = !in_quotes;
-                run = 0;
-            }
-            c if c.is_whitespace() && !in_quotes => {
-                if c != ' ' {
-                    return true; // a tab is never a separator ssh emitted
-                }
-                run += 1;
-                if run > 1 {
-                    return true;
-                }
-            }
-            _ => run = 0,
-        }
-    }
-    false
+/// path boundaries were.
+///
+/// `ssh -G` separates entries with exactly ONE space and preserves whitespace
+/// inside a path, so the split is lossless exactly when re-joining the pieces
+/// with single spaces reproduces the value byte for byte. Asking the splitter
+/// itself is the point: a hand-written scanner is a SECOND model of the split,
+/// and the two disagreed — the previous one exempted quoted segments (which
+/// `split_quoted_paths` only honours at the start of a token) and ran on a
+/// trimmed value, so a stray `"` or a trailing run slipped past it while the
+/// splitter still mangled the path (#46 round 7).
+///
+/// Must be given the RAW value: leading and trailing runs are as unrecoverable
+/// as interior ones.
+fn splitting_loses_information(raw: &str) -> bool {
+    split_quoted_paths(raw).join(" ") != raw
 }
 
 fn strip_one_quote(s: &str) -> String {
@@ -118,11 +107,20 @@ fn strip_one_quote(s: &str) -> String {
 pub fn parse_ssh_g_output(dump: &str) -> ResolvedConfig {
     let mut rc = ResolvedConfig::default();
     for line in dump.lines() {
-        let line = line.trim();
+        // Trailing whitespace is NOT trimmed here: a known-hosts path may end
+        // in a space or tab, and that byte is exactly what decides whether the
+        // list can be split back into paths (#46 round 7). Only a CRLF's `\r`
+        // is dropped, since it is never part of a value.
+        let line = line.trim_start().trim_end_matches('\r');
         let Some((key, val)) = line.split_once(char::is_whitespace) else {
             continue;
         };
-        let val = val.trim();
+        // `raw` is the value with NOTHING trimmed — `split_once` consumed
+        // exactly the one separator space `ssh -G` emits, so any whitespace
+        // still attached belongs to a path. `val` is the trimmed form every
+        // other option wants.
+        let raw = val;
+        let val = raw.trim();
         if val.is_empty() {
             continue;
         }
@@ -139,12 +137,12 @@ pub fn parse_ssh_g_output(dump: &str) -> ResolvedConfig {
                 rc.proxy_command = Some(val.to_string())
             }
             "userknownhostsfile" => {
-                rc.known_hosts_list_lossy |= splitting_loses_information(val);
-                rc.user_known_hosts_files = split_quoted_paths(val);
+                rc.known_hosts_list_lossy |= splitting_loses_information(raw);
+                rc.user_known_hosts_files = split_quoted_paths(raw);
             }
             "globalknownhostsfile" => {
-                rc.known_hosts_list_lossy |= splitting_loses_information(val);
-                rc.global_known_hosts_files = split_quoted_paths(val);
+                rc.known_hosts_list_lossy |= splitting_loses_information(raw);
+                rc.global_known_hosts_files = split_quoted_paths(raw);
             }
             _ => {}
         }
@@ -619,12 +617,45 @@ mod tests {
             "userknownhostsfile /c/Users/First Last/.ssh/known_hosts",
             "userknownhostsfile none",
             "userknownhostsfile /home/me/my none dir/known_hosts",
+            // a literal quote is not a separator: `ssh -G` splices quotes away
+            // and only ever emits single-space separators
+            "userknownhostsfile /d/kh1 /d/q\"p/kh",
+            // CRLF output (Windows) must not flag every line
+            "userknownhostsfile /d/kh1\r",
         ] {
             assert!(
                 !parse_ssh_g_output(ok).known_hosts_list_lossy,
                 "should not be lossy: {ok}"
             );
         }
+    }
+
+    #[test]
+    fn known_hosts_list_lossy_catches_runs_the_trim_used_to_eat() {
+        // given — a path ENDING in whitespace. Trimming the value before
+        // testing it deleted the very bytes that decide splittability, so the
+        // list silently lost its last path's tail (#46 round 7).
+        for lossy in [
+            "userknownhostsfile /d/kh1 /d/kh2  ",
+            "userknownhostsfile /d/kh1 /d/kh2\t",
+            // ...and a leading run, for the same reason
+            "userknownhostsfile  /d/kh1",
+        ] {
+            assert!(
+                parse_ssh_g_output(lossy).known_hosts_list_lossy,
+                "should be lossy: {lossy:?}"
+            );
+        }
+
+        // given — a stray literal quote followed by a real run. The previous
+        // scanner toggled an in-quotes state on any `"` and stopped noticing
+        // runs, while the splitter (which only honours a quote at the START of
+        // a token) still mangled the path.
+        let masked = "userknownhostsfile /d/kh1 /d/q\"p  /d/s/kh";
+        assert!(
+            parse_ssh_g_output(masked).known_hosts_list_lossy,
+            "a quote must not mask a later run"
+        );
     }
 
     #[test]
