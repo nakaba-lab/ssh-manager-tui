@@ -222,10 +222,11 @@ remove, `Enter` commit, `Esc` revert the field.
 | Key | Action |
 |-----|--------|
 | `j` / `k`, `↓` / `↑`, `Home` / `End` | move |
-| `g` | generate a key (Ed25519 / RSA-4096 wizard) |
+| `g` | generate a key (Ed25519 / RSA-4096 wizard; passphrase: none or interactive) |
+| `p` | add / change the key's passphrase (`ssh-keygen -p`, prompts inline; offers to update stored vault passphrases) |
 | `y` | copy the public key |
 | `s` | set as the `IdentityFile` of the host you opened from (`K`) |
-| `p` | **deploy the public key** to the host you opened from (`K`) — appends it to the remote `~/.ssh/authorized_keys` after a confirmation (the `ssh-copy-id` equivalent) |
+| `D` | **deploy the public key** to the host you opened from (`K`) — appends it to the remote `~/.ssh/authorized_keys` after a confirmation (the `ssh-copy-id` equivalent) |
 | `d` | delete the key pair (with confirm) · `r` rescan · `Esc` back |
 
 > Deployment runs one `ssh` round trip with the TUI suspended, so password

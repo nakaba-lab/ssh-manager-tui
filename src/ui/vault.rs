@@ -21,7 +21,7 @@ fn masked(secret: &str) -> String {
 /// Render a masked secret as an editable input line. `cursor` is a byte offset
 /// into `value`; it is mapped onto the (multi-byte) bullet string so the caret
 /// lands in the right cell.
-fn masked_input(value: &str, cursor: usize, editing: bool) -> Line<'static> {
+pub(super) fn masked_input(value: &str, cursor: usize, editing: bool) -> Line<'static> {
     let dots = "•".repeat(value.chars().count());
     if !editing {
         // Unfocused fields are rendered with this field's value but a *foreign*

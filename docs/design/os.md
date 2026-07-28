@@ -2,7 +2,7 @@
 title: os 領域 設計
 area: os
 status: active
-relatedIssues: [43, 48, 52, 65]
+relatedIssues: [43, 47, 48, 52, 65]
 updated: 2026-07-27
 ---
 
@@ -20,7 +20,7 @@ updated: 2026-07-27
 |-----------|------|
 | `connect.rs` | `ssh`/`sftp` の起動（保存済みは `ssh <alias>`、override 時のみフラグ発行）・`wt.exe` 新規タブ |
 | `sftp.rs` | `ls -l` 一覧パース ＋ ライブ `SftpSession` browse ワーカー（短命 `sftp -b`・circuit-breaker） |
-| `keys.rs` | `~/.ssh` 再帰探索（最初のヘッダ行のみ sniff）・フィンガープリントで公開/秘密をペアリング |
+| `keys.rs` | `~/.ssh` 再帰探索（最初のヘッダ行のみ sniff）・フィンガープリントで公開/秘密をペアリング・鍵生成（パスフレーズなし/対話）・パスフレーズ変更の引数構築（`change_passphrase_args`） |
 | `deploy.rs`（#48） | 公開鍵のリモート配布（ssh-copy-id 相当）の**純粋部**＝`.pub` 行の検証／リモート sh スニペット組み立て／終了コードの意味づけ。プロセス起動そのものは `update.rs` の既存インライン経路（`suspend_tui`→`run_inline`→`restore_tui`）が担い、本モジュールは I/O を持たない |
 | `known_hosts.rs` | 解析・内容アドレスでの削除（`.old` バックアップ） |
 | `liveness.rs` | ワーカースレッドプールで TCP 到達性プローブ・`mpsc` 報告・`App::hosts` index キー |
@@ -69,6 +69,8 @@ sequenceDiagram
 - **config を接続の真実源に**: 保存済みは `ssh <alias>` で OpenSSH に config を読ませる（ProxyJump/forwards/IdentityFile が自動適用）。
 - **秘密鍵本体を読まない**: 鍵ペアリングは公開フィンガープリント照合のみ。暗号化 PEM は `Unverified`（エラーにしない）。
 - **liveness index キーの脆さ**: ホスト追加/削除で index がずれるため `rebuild_hosts()` が liveness マップをクリアし再プローブ。
+- **パスフレーズ操作は引数ビルダーと実行を分離**（#47）: `change_passphrase_args`／`generate_key_args`（いずれも純粋・`OsString` を返すのでパスを lossy 変換しない）を `keys.rs` に置き、実行は `update.rs` の `run_ssh_keygen_inline`（`suspend_tui` → `run_inline` → `restore_tui` → `describe_exit`）が一手に担う（os 層の ratatui 非依存を維持）。現在/新パスフレーズは **OpenSSH 自身が対話聴取**し、sshm は値を保持も中継もしない（コマンドラインにも載らない）。`generate_key` も同じビルダーを通し、非対話（`-N ""`/`-q`）と対話（両フラグを省く）の差分をビルダー 1 箇所に閉じる。
+- **鍵ユーザーの逆引きは config 射影で行う**（#47）: `hosts_using_key` は純粋関数で、`ssh -G` を全ホスト分 spawn する案は起動遅延と副作用（`Match exec` の再実行）を招くため採らない。**照合規則は接続時オートフィルと一致させる**（非 glob パターン全走査・Windows のパス畳み込み・IdentityFile 未宣言時の既定 identity）＝ずれると陳腐化の取りこぼしになる。詳細は [security.md](./security.md)。
 - **`resolve_full` は型付き経路と生ダンプ取得を共有し、パースだけ分ける（#43）**: `run_ssh_g` の subprocess 実行部（500ms タイムアウト・stdin null・kill-on-timeout・`--` センチネル＋先頭ダッシュ拒否）を生ダンプ取得として括り出し、型付き `parse_ssh_g_output`（抽出サブセット）と `resolve_full` 用の全 key/value パース（順序保持）が同じダンプを読む。インスペクタは「書いた値」との由来比較をせず `ssh -G` の正規化出力をそのまま近似として見せる（キー小文字化・値正規化・コンパイル時デフォルト混入があるため、単純比較は誤分類する＝Issue #43 リスク#2）。ratatui 非依存を維持し、パース分割はヘッドレステスト可能。
 - **公開鍵配布は「純粋なスニペット組み立て」と「既存インライン実行」に分ける（#48）**: `deploy.rs` は I/O を持たず `plan()`（`.pub` 行 → 検証済み `DeployPlan`＝本体・追記行・コメント破棄フラグ・リモート sh スニペット）と `classify_exit()`（終了コード → `DeployOutcome`）だけを提供し、ヘッドレスにユニットテストする。実行は `execute_sftp_transfer` と同じインライン経路（`suspend_tui`→`run_inline`→`restore_tui`）を使う。**バックグラウンドワーカー案（`BatchMode=yes`）を採らない**のは、鍵をまだ配っていないホスト＝この機能が要る当の場面では対話的パスワード認証（と初回の host-key TOFU 確認）が必要で、非対話実行はほぼ必ず失敗するため。**ハイブリッド案（非対話で試して失敗したら対話で再実行）**も、Issue のリスク欄が挙げる「1 往復」方針に反し失敗分類の分岐が増えるため不採用。
 - **結果の判別は stdout ではなく終了コードで運ぶ（#48）**: インライン実行は stdio を子に継承するため親プロセスは出力を読めない。そこでスニペット側が「追記した＝0／既にあった＝3」を終了コードで返し、`classify_exit` が `Added`/`AlreadyPresent`/`SshFailed`（255＝ssh 自身の失敗）/`RemoteFailed`（その他）/`Interrupted`（終了コード無し）に写す。重複判定は `grep -qF` に**コメントを除いた `<algo> <blob>` 本体**を渡すので、リモート側のコメントが違っても・オプション前置きが付いていても同じ鍵とみなす（`authorized_keys` の全文検索であり行構造は解釈しない＝コメントアウトされた行にも一致しうる近似。ssh-copy-id と同程度の割り切り）。

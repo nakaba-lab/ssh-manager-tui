@@ -174,6 +174,12 @@ pub enum Screen {
     VaultEntry {
         editing: Option<usize>,
     },
+    /// Bulk vault-passphrase update modal (Issue #47), offered after a successful
+    /// `ssh-keygen -p` when stored `Passphrase` entries reference the changed key
+    /// (they now hold the OLD passphrase). One typed passphrase is upserted into
+    /// every affected entry. The affected hosts + typed secret live in
+    /// [`App::passphrase_sync`].
+    PassphraseSync,
     /// Change the master password, or upgrade the vault's KDF parameters (#44). A
     /// modal overlay over [`Screen::Vault`]; the mode and typed passwords live off
     /// the `Screen` enum on [`App::vault_rekey`] (a unit variant here), so no
@@ -437,7 +443,9 @@ pub struct GenWizard {
     pub filename_cursor: usize,
     pub comment: String,
     pub comment_cursor: usize,
-    pub field: usize, // 0 = type, 1 = filename, 2 = comment
+    /// Passphrase mode for the new key (Issue #47).
+    pub passphrase: keys::GenPassphrase,
+    pub field: usize, // 0 = type, 1 = filename, 2 = comment, 3 = passphrase
 }
 
 impl Default for GenWizard {
@@ -448,6 +456,7 @@ impl Default for GenWizard {
             filename_cursor: "id_ed25519".len(),
             comment: String::new(),
             comment_cursor: 0,
+            passphrase: keys::GenPassphrase::NoPassphrase,
             field: 0,
         }
     }
@@ -574,6 +583,33 @@ impl std::fmt::Debug for VaultEntryForm {
             .field("secret", &"***")
             .field("note", &self.note)
             .field("field", &self.field)
+            .field("cursor", &self.cursor)
+            .finish()
+    }
+}
+
+/// Bulk vault-passphrase update form (modal over the key manager, Issue #47).
+/// The typed secret is scrubbed on drop and redacted in `Debug`, mirroring
+/// [`VaultEntryForm`].
+#[derive(Default, Clone)]
+pub struct PassphraseSyncForm {
+    /// Host aliases whose vault `Passphrase` entries reference the changed key.
+    pub hosts: Vec<String>,
+    pub secret: String,
+    pub cursor: usize,
+}
+
+impl Drop for PassphraseSyncForm {
+    fn drop(&mut self) {
+        self.secret.zeroize();
+    }
+}
+
+impl std::fmt::Debug for PassphraseSyncForm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PassphraseSyncForm")
+            .field("hosts", &self.hosts)
+            .field("secret", &"***")
             .field("cursor", &self.cursor)
             .finish()
     }
@@ -952,6 +988,12 @@ pub struct App {
     pub vault: Option<Vault>,
     pub vault_state: ListState,
     pub vault_unlock: VaultUnlock,
+    /// Bulk vault-passphrase update modal state (Issue #47).
+    pub passphrase_sync: PassphraseSyncForm,
+    /// Set when a passphrase change wants to sync the vault but it is locked:
+    /// the changed key's path, resumed by `submit_vault_unlock` after a
+    /// successful unlock (Esc on the unlock prompt clears it = skip).
+    pub passphrase_sync_pending: Option<std::path::PathBuf>,
     pub vault_rekey: VaultRekey,
     pub vault_entry: VaultEntryForm,
     /// When true, secrets are shown in the clear instead of masked.
@@ -1054,6 +1096,8 @@ impl App {
             vault: None,
             vault_state: ListState::default(),
             vault_unlock: VaultUnlock::default(),
+            passphrase_sync: PassphraseSyncForm::default(),
+            passphrase_sync_pending: None,
             vault_rekey: VaultRekey::default(),
             vault_entry: VaultEntryForm::default(),
             vault_reveal: false,
@@ -1550,11 +1594,13 @@ impl App {
         self.vault = None;
         self.vault_reveal = false;
         self.confirmed_password_targets.clear();
-        // Scrub any typed-but-unsaved secret in the entry/unlock/rekey forms too
-        // (all Drop-zeroize when replaced), so a lock leaves nothing behind.
+        // Scrub any typed-but-unsaved secret in the entry/unlock/rekey/sync forms
+        // too (all Drop-zeroize when replaced), so a lock leaves nothing behind.
         self.vault_entry = VaultEntryForm::default();
         self.vault_unlock = VaultUnlock::default();
         self.vault_rekey = VaultRekey::default();
+        self.passphrase_sync = PassphraseSyncForm::default();
+        self.passphrase_sync_pending = None;
         // A locked vault must not keep auto-filling an already-open browser: disarm
         // its session (drops + zeroizes the held SftpArm secrets).
         if let Some(b) = self.sftp_browser.as_mut() {
@@ -1580,6 +1626,7 @@ impl App {
                     | Screen::VaultEntry { .. }
                     | Screen::VaultRekey
                     | Screen::PasswordConfirm { .. }
+                    | Screen::PassphraseSync
             ) {
                 self.screen = Screen::List;
                 self.prev_screen = None;
