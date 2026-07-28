@@ -37,7 +37,7 @@ use crate::os::keys::{generate_key, read_public_key};
 use crate::os::keyscan::{
     KeyscanEvent, KeyscanSession, PinClass, ScannedKey, classify_key, pinned_lines,
 };
-use crate::os::known_hosts::{KnownHostEntry, append_entries, known_hosts_path, remove_entry};
+use crate::os::known_hosts::{KnownHostEntry, append_entries, remove_entry};
 use crate::os::resolve::{
     ResolvedConfig, has_match_exec, has_unresolvable_known_hosts_file, is_host_known,
     is_none_file_list, matching_known_entries, primary_known_hosts_file,
@@ -595,10 +595,17 @@ fn pin_block(rows: &[ClassifiedKey], existing: &[KnownHostEntry]) -> Option<PinB
     if rows.iter().any(|r| r.class.poisons_result()) {
         return Some(PinBlocked::Contradicted);
     }
-    let has_pin = existing
-        .iter()
-        .any(|e| e.marker.is_none() && !e.is_pattern());
-    has_pin.then_some(PinBlocked::AlreadyPinned)
+    // Any EXISTING TRUST DECISION blocks, not just a plain pin: a
+    // `@cert-authority` delegation is an active trust path, and dropping an
+    // unauthenticated raw key beside it bypasses the CA's revocation control
+    // exactly the way a sidecar key bypasses a pin. A `@revoked` line is the
+    // administrator declaring distrust of this host's key material, which is
+    // not something a scan may quietly work around (#46 round 6). A wildcard
+    // entry is deliberately NOT one of these — the trust gate ignores it, so
+    // treating it as a decision would leave the user unable to create the exact
+    // pin the gate wants.
+    let has_decision = existing.iter().any(|e| !e.is_pattern());
+    has_decision.then_some(PinBlocked::AlreadyPinned)
 }
 
 /// Pure key dispatch for the scan modal:
@@ -663,8 +670,11 @@ fn keyscan_pin_target(rc: &ResolvedConfig) -> Option<std::path::PathBuf> {
     // all. A list that resolves to nothing (`UserKnownHostsFile none`) means ssh
     // reads no user file for this host, so writing to the default would be a
     // no-op that still reports success — refuse instead (#46 final review).
+    // An empty list means `ssh -G` told us nothing about where ssh reads, so
+    // the default path is a guess that is NOT in the read set `known_hosts_files`
+    // built — a pin there would be invisible to our own checks. Refuse instead.
     if rc.user_known_hosts_files.is_empty() {
-        return known_hosts_path();
+        return None;
     }
     primary_known_hosts_file(&rc.user_known_hosts_files)
 }
@@ -746,6 +756,19 @@ fn open_keyscan(app: &mut App, host_idx: usize) {
             format!(
                 "can't scan {alias}: ssh reports a known_hosts path this build can't resolve \
                  (unexpanded ~ or %) — pin manually or use an absolute path"
+            ),
+            true,
+        );
+        return;
+    }
+    // Same reason, different cause: the file list could not be split back into
+    // paths without losing where the boundaries were, so neither the pins we
+    // can see nor the file we would write to can be trusted (#46 round 6).
+    if rc.known_hosts_list_lossy {
+        app.toast(
+            format!(
+                "can't scan {alias}: a known_hosts path contains repeated spaces or a tab, \
+                 which this build cannot split reliably — pin manually"
             ),
             true,
         );
@@ -5404,15 +5427,11 @@ mod tests {
     }
 
     #[test]
-    fn keyscan_still_pins_when_only_wildcard_or_marker_entries_match() {
-        // given — only a wildcard entry and a @revoked line match this host.
-        // Neither is a genuine per-host pin (`is_host_known` rejects both), so
-        // the host is effectively unpinned and must stay pinnable — otherwise
-        // the user can never create the exact pin the trust gate wants.
-        let existing = kh_entries(&[
-            "*.example ssh-ed25519 WILDKEY",
-            "@revoked db.example ssh-rsa OLDEVIL",
-        ]);
+    fn keyscan_still_pins_when_only_a_wildcard_entry_matches() {
+        // given — only a wildcard entry matches. The trust gate ignores
+        // wildcards, so the host is effectively unpinned and must stay pinnable
+        // — otherwise the user can never create the exact pin the gate wants.
+        let existing = kh_entries(&["*.example ssh-ed25519 WILDKEY"]);
         // when — the scan returns a key of an unrelated type
         let next = keyscan_apply_event(
             KeyScanModal::Scanning,
@@ -5429,6 +5448,38 @@ mod tests {
             keyscan_handle_key(&next, KeyCode::Char('y'), "db.example"),
             KeyScanAction::Close(vec!["db.example ecdsa-sha2-nistp256 FRESH".to_string()])
         );
+    }
+
+    #[test]
+    fn keyscan_appends_nothing_beside_a_marker_entry() {
+        // given — the host has no plain pin, but the administrator HAS made a
+        // trust decision about it: a CA delegation, or a revocation.
+        for line in [
+            "@cert-authority db.example ssh-rsa CAKEY",
+            "@revoked db.example ssh-rsa OLDEVIL",
+        ] {
+            let existing = kh_entries(&[line]);
+            // when — the scan returns an unrelated key, so no row is Revoked
+            let next = keyscan_apply_event(
+                KeyScanModal::Scanning,
+                KeyscanEvent::Keys(vec![scanned("ecdsa-sha2-nistp256", "FRESH")]),
+                &existing,
+            );
+            let KeyScanModal::Results { rows, blocked } = &next else {
+                panic!("expected Results, got {next:?}");
+            };
+            assert_eq!(rows[0].class, PinClass::New, "{line}");
+            // then — pinning is refused. Dropping a raw key beside a CA
+            // delegation bypasses the CA's revocation control the same way a
+            // sidecar key bypasses a pin; beside a revocation it quietly works
+            // around a distrust the administrator declared (#46 round 6).
+            assert_eq!(*blocked, Some(PinBlocked::AlreadyPinned), "{line}");
+            assert_eq!(
+                keyscan_handle_key(&next, KeyCode::Char('y'), "db.example"),
+                KeyScanAction::Close(vec![]),
+                "{line}"
+            );
+        }
     }
 
     #[test]

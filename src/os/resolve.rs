@@ -25,6 +25,18 @@ pub struct ResolvedConfig {
     pub proxy_command: Option<String>,
     pub user_known_hosts_files: Vec<String>,
     pub global_known_hosts_files: Vec<String>,
+    /// True when a known-hosts file list could NOT be split back into paths
+    /// without losing information: the raw `ssh -G` value contained a run of
+    /// two-or-more whitespace characters, or a tab.
+    ///
+    /// `ssh -G` prints the list separated by exactly one space and does NOT
+    /// collapse whitespace inside a path (verified against OpenSSH 9.6p1), so a
+    /// longer run is content — but [`split_quoted_paths`] splits on any
+    /// whitespace and drops empties, which discards where the boundaries were.
+    /// Readers merely lose entries (fail-safe); the keyscan writer would pick a
+    /// wrong file while believing it had the whole picture, so it refuses to
+    /// scan when this is set (#46 round 6).
+    pub known_hosts_list_lossy: bool,
 }
 
 /// Split a possibly-quoted space-separated path list (as `ssh -G` emits for
@@ -62,6 +74,35 @@ fn split_quoted_paths(s: &str) -> Vec<String> {
     out
 }
 
+/// True when [`split_quoted_paths`] would discard information about where the
+/// path boundaries were: `ssh -G` separates entries with exactly ONE space and
+/// preserves whitespace inside a path, so a run of two-or-more (or any tab) is
+/// part of a filename that the split cannot put back (#46 round 6).
+/// Quoted segments are exempt — those carry their own boundaries.
+fn splitting_loses_information(value: &str) -> bool {
+    let mut in_quotes = false;
+    let mut run = 0usize;
+    for c in value.trim().chars() {
+        match c {
+            '"' => {
+                in_quotes = !in_quotes;
+                run = 0;
+            }
+            c if c.is_whitespace() && !in_quotes => {
+                if c != ' ' {
+                    return true; // a tab is never a separator ssh emitted
+                }
+                run += 1;
+                if run > 1 {
+                    return true;
+                }
+            }
+            _ => run = 0,
+        }
+    }
+    false
+}
+
 fn strip_one_quote(s: &str) -> String {
     let t = s.trim();
     if t.len() >= 2 && t.starts_with('"') && t.ends_with('"') {
@@ -97,8 +138,14 @@ pub fn parse_ssh_g_output(dump: &str) -> ResolvedConfig {
             "proxycommand" if !val.eq_ignore_ascii_case("none") => {
                 rc.proxy_command = Some(val.to_string())
             }
-            "userknownhostsfile" => rc.user_known_hosts_files = split_quoted_paths(val),
-            "globalknownhostsfile" => rc.global_known_hosts_files = split_quoted_paths(val),
+            "userknownhostsfile" => {
+                rc.known_hosts_list_lossy |= splitting_loses_information(val);
+                rc.user_known_hosts_files = split_quoted_paths(val);
+            }
+            "globalknownhostsfile" => {
+                rc.known_hosts_list_lossy |= splitting_loses_information(val);
+                rc.global_known_hosts_files = split_quoted_paths(val);
+            }
             _ => {}
         }
     }
@@ -548,6 +595,36 @@ mod tests {
             "/home/me/.ssh/known_hosts".into(),
             "/etc/ssh/ssh_known_hosts".into()
         ]));
+    }
+
+    #[test]
+    fn known_hosts_list_lossy_is_flagged_for_unsplittable_paths() {
+        // given / when / then — `ssh -G` separates entries with ONE space and
+        // keeps whitespace inside a path, so a longer run (or a tab) is content
+        // our splitter cannot put back
+        for lossy in [
+            "userknownhostsfile /d/known_hosts /d/kh  2",
+            "userknownhostsfile /d/known  hosts",
+            "userknownhostsfile /d/a\tb/known_hosts",
+            "globalknownhostsfile /etc/ssh/a  b",
+        ] {
+            assert!(
+                parse_ssh_g_output(lossy).known_hosts_list_lossy,
+                "should be lossy: {lossy}"
+            );
+        }
+        // and ordinary configurations must NOT be flagged
+        for ok in [
+            "userknownhostsfile /root/.ssh/known_hosts /root/.ssh/known_hosts2",
+            "userknownhostsfile /c/Users/First Last/.ssh/known_hosts",
+            "userknownhostsfile none",
+            "userknownhostsfile /home/me/my none dir/known_hosts",
+        ] {
+            assert!(
+                !parse_ssh_g_output(ok).known_hosts_list_lossy,
+                "should not be lossy: {ok}"
+            );
+        }
     }
 
     #[test]
