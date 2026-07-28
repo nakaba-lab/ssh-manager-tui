@@ -58,6 +58,8 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
             lines.push(key("y", "copy public key"));
             lines.push(key("s", "set as IdentityFile for host in context"));
             lines.push(key("d", "delete key (private + public)"));
+            lines.push(key("a", "load key into ssh-agent (ssh-add)"));
+            lines.push(key("D", "unload key from ssh-agent (ssh-add -d)"));
             lines.push(key("r", "rescan"));
         }
         Screen::KnownHosts => {

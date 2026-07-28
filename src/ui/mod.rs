@@ -37,6 +37,23 @@ const LIST_FOOTER: &[(&str, &str)] = &[
     ("?", "help"),
 ];
 
+/// Key-manager footer hints (must render within 80 columns). Promoted from an
+/// inline literal when the agent actions (#49) were added, so the 80-column
+/// guard actually covers the footer they lengthened.
+/// `generate`/`copy pub` are abbreviated so the two agent hints fit: the full
+/// footer was 87 cols, which clips on an 80-column terminal. `?` shows the
+/// unabbreviated list.
+const KEY_MANAGER_FOOTER: &[(&str, &str)] = &[
+    ("j/k", "move"),
+    ("g", "gen"),
+    ("y", "copy"),
+    ("s", "set-id"),
+    ("d", "delete"),
+    ("a", "load"),
+    ("D", "unload"),
+    ("Esc", "back"),
+];
+
 /// SFTP browser footer hints (must render within 80 columns).
 const SFTP_BROWSER_FOOTER: &[(&str, &str)] = &[
     ("Tab", "pane"),
@@ -284,14 +301,7 @@ fn draw_footer(f: &mut Frame, app: &App, base: &Screen, area: Rect) {
             ("Ctrl-S", "save"),
             ("Esc", "back"),
         ]),
-        (Screen::KeyManager, _) => widgets::footer_hints(&[
-            ("j/k", "move"),
-            ("g", "generate"),
-            ("y", "copy pub"),
-            ("s", "set-id"),
-            ("d", "delete"),
-            ("Esc", "back"),
-        ]),
+        (Screen::KeyManager, _) => widgets::footer_hints(KEY_MANAGER_FOOTER),
         (Screen::KnownHosts, a) if a.kh_searching => {
             widgets::footer_hints(&[("type", "filter"), ("Esc", "clear")])
         }
@@ -368,6 +378,13 @@ mod tests {
             widgets::footer_hints(SFTP_BROWSER_FOOTER).width() <= 80,
             "sftp browser footer is {} cols",
             widgets::footer_hints(SFTP_BROWSER_FOOTER).width()
+        );
+        // #49: the agent actions (`a`/`D`) lengthened this footer, which was an
+        // inline literal and so escaped this guard entirely.
+        assert!(
+            widgets::footer_hints(KEY_MANAGER_FOOTER).width() <= 80,
+            "key manager footer is {} cols",
+            widgets::footer_hints(KEY_MANAGER_FOOTER).width()
         );
     }
 }

@@ -8,10 +8,14 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Clear, List, ListItem, Paragraph, Wrap};
 
 use crate::app::App;
+use crate::os::agent::{AgentStatus, KeyAgentState, ServiceState};
 use crate::os::keys::{KeyType, PairStatus};
 
 use super::theme;
-use super::widgets::{centered, input_line, modal_block, panel, responsive_split};
+use super::widgets::{
+    centered, input_line, kv_line, kv_line_colored, modal_block, panel, responsive_split,
+    section_header,
+};
 
 pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
     if app.keys.is_empty() {
@@ -64,6 +68,18 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
                         .add_modifier(Modifier::BOLD),
                 ));
             }
+            // Agent membership badge (#49), built like the `mismatch` badge
+            // above: plain text in a theme colour, never a glyph — the list
+            // width maths stays predictable and no terminal has to have the
+            // font for it.
+            if app.key_agent_state(k) == KeyAgentState::Loaded {
+                spans.push(Span::styled(
+                    "  agent",
+                    Style::default()
+                        .fg(theme::ACCENT)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
             ListItem::new(Line::from(spans))
         })
         .collect();
@@ -86,12 +102,7 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
     };
 
     let mut lines: Vec<Line> = Vec::new();
-    let mut kv = |key: &str, v: String| {
-        lines.push(Line::from(vec![
-            Span::styled(format!("{key:>14}  "), Style::default().fg(theme::DIM)),
-            Span::styled(v, Style::default().fg(theme::TEXT)),
-        ]));
-    };
+    let mut kv = |key: &str, v: String| lines.push(kv_line(key, v));
     kv("name", k.name());
     kv("type", k.key_type.clone());
     kv("bits", k.bits.to_string());
@@ -132,10 +143,56 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
         )),
         PairStatus::NotApplicable => None,
     } {
-        lines.push(Line::from(vec![
-            Span::styled(format!("{:>14}  ", "pair"), Style::default().fg(theme::DIM)),
-            Span::styled(text, Style::default().fg(color)),
-        ]));
+        lines.push(kv_line_colored("pair", text.to_string(), color));
+    }
+
+    // --- ssh-agent block (#49) ---
+    // Kept as its own section rather than folded into the key/value list above:
+    // `status` and `service` describe the agent, not this key, and mixing the
+    // two scopes in one column reads as if the agent were a property of the key.
+    lines.push(Line::from(""));
+    lines.push(section_header("ssh-agent"));
+
+    let (status_text, status_color) = match &app.agent.status {
+        AgentStatus::Probing => ("checking…".to_string(), theme::CHECKING),
+        AgentStatus::Running(fps) if fps.is_empty() => {
+            ("running (no keys)".to_string(), theme::WARN)
+        }
+        AgentStatus::Running(fps) => (format!("running ({} keys)", fps.len()), theme::UP),
+        AgentStatus::NotRunning => ("not running".to_string(), theme::DOWN),
+        AgentStatus::Unavailable => ("unavailable (no ssh-add)".to_string(), theme::DOWN),
+    };
+    lines.push(kv_line_colored("status", status_text, status_color));
+
+    // Absent off Windows, where there is no ssh-agent service to report on.
+    if let Some(service) = app.agent.service {
+        let (text, color) = match service {
+            ServiceState::Running => ("running", theme::UP),
+            ServiceState::Stopped => ("stopped", theme::DOWN),
+            ServiceState::Transitioning => ("starting/stopping…", theme::CHECKING),
+            ServiceState::Unknown => ("unknown", theme::DIM),
+        };
+        lines.push(kv_line_colored("service", text.to_string(), color));
+    }
+
+    let (key_text, key_color) = match app.key_agent_state(k) {
+        KeyAgentState::Loaded => ("loaded", theme::UP),
+        KeyAgentState::NotLoaded => ("not loaded", theme::DIM),
+        // The key's fingerprint could not be read, so we genuinely do not know —
+        // saying "not loaded" here would be a confident lie.
+        KeyAgentState::Unknown => ("unknown (no fingerprint)", theme::WARN),
+        KeyAgentState::NoAgent => ("—", theme::DIM),
+    };
+    lines.push(kv_line_colored("this key", key_text.to_string(), key_color));
+
+    // Only actionable advice, and only when acting is possible: starting the
+    // service needs elevation, so we tell the user the command rather than
+    // silently failing to run it ourselves.
+    if app.agent.service == Some(ServiceState::Stopped) {
+        lines.push(Line::from(Span::styled(
+            "  Run `Start-Service ssh-agent` as Administrator",
+            Style::default().fg(theme::FAINT),
+        )));
     }
 
     if let Some(ctx) = app.key_host_ctx.and_then(|i| app.hosts.get(i)) {

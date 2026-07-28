@@ -52,6 +52,7 @@ detail ペイン下部に `section_header` で **独立したブロック**を�
 ```
 
 - **一覧のバッジ**: 既存の `mismatch` バッジと同じ作り（`Span::styled` のテキスト＋`theme` 色）で `agent` を出す。グリフではなくテキストにするのは既存踏襲＋幅計算の安定のため。
+- **行は `widgets::kv_line_colored` で組む**: 値が「判定」を担う行（`pair`・`status`・`service`・`this key`）は色付き、素の行は `kv_line`。両者は同一実装（`kv_line` が委譲）なので、ラベル列（14 桁）の桁揃えが 1 箇所定義になる。
 - **状態設計**（このブロックが空/不明/エラーを集約する）:
 
   | 状態 | `status` 行 | `this key` 行 |
@@ -65,7 +66,8 @@ detail ペイン下部に `section_header` で **独立したブロック**を�
 
 - **サービス停止時の案内**（Windows のみ・2 行）: `管理者権限で Start-Service ssh-agent を実行してください`。sshm は起動を代行しない。
 - **非 Windows**: `service` 行を出さない（`#[cfg(windows)]`）。
-- **レスポンシブ**: 既存 `responsive_split(area, 45, 55)` をそのまま使う。縦積み（90 桁未満）でも agent ブロックは detail 内の最下部に収まる。フッターは 80 桁以内を維持（`footers_fit_80_cols` テストが門番）。フッターへ足すヒントは `a load · D unload` の 2 つのみ。
+- **レスポンシブ**: 既存 `responsive_split(area, 45, 55)` をそのまま使う。縦積み（90 桁未満）でも agent ブロックは detail 内の最下部に収まる。
+- **フッターは 80 桁以内**（`footers_fit_80_cols` が門番）。`a load`・`D unload` の 2 つを足すと **87 桁**になり 80 桁端末で末尾のヒントが黙って切れたため、`generate`→`gen`・`copy pub`→`copy` に短縮して 78 桁に収めた。完全なラベルは `?`（ヘルプ画面）が持つ。**フッターは `KEY_MANAGER_FOOTER` 定数に切り出した** — インラインのリテラルのままだと 80 桁ガードの対象外で、この回帰が素通りする。
 
 ## 主要な設計判断（現行の理由）
 

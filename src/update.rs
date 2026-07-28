@@ -25,6 +25,7 @@ use crate::config::SshConfig;
 use crate::config::diff;
 use crate::config::model::HostView;
 use crate::error::ConfigError;
+use crate::os::agent;
 use crate::os::askpass::{
     AskpassListener, DeclineReason, Outcome, arm_connect, os_tokens, resolved_identity,
 };
@@ -39,6 +40,7 @@ use crate::os::resolve::{
 };
 use crate::os::sftp::{SftpOp, SftpSession, remote_join, remote_parent, sftp_quote, stage_batch};
 use crate::os::ssh_dir;
+use crate::os::tools;
 use crate::os::vault::{
     self, MatchedKinds, Secret, SecretKind, Vault, VaultEntry, match_vault_kinds,
 };
@@ -56,7 +58,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent, terminal: &mut DefaultTerminal) 
         Screen::List => handle_list(app, key, terminal)?,
         Screen::Edit { editing } => handle_edit(app, key, editing)?,
         Screen::DiffPreview => handle_diff_preview(app, key),
-        Screen::KeyManager => handle_keys(app, key)?,
+        Screen::KeyManager => handle_keys(app, key, terminal)?,
         Screen::KnownHosts => handle_known_hosts(app, key),
         Screen::Help => handle_help(app, key),
         Screen::Confirm(action) => handle_confirm(app, key, action, terminal)?,
@@ -334,6 +336,9 @@ fn handle_list(app: &mut App, key: KeyEvent, terminal: &mut DefaultTerminal) -> 
         KeyCode::Char('K') => {
             app.key_host_ctx = app.selected_host();
             app.screen = Screen::KeyManager;
+            // Probe on entry so the agent badges are current without the user
+            // having to ask; the result lands via the per-tick drain (#49).
+            app.refresh_agent();
         }
         KeyCode::Char('H') => {
             // Reload so the indices used for deletion are fresh at open time.
@@ -1455,7 +1460,7 @@ fn commit_pending_save(app: &mut App) {
 // S3 — key manager
 // ---------------------------------------------------------------------------
 
-fn handle_keys(app: &mut App, key: KeyEvent) -> Result<()> {
+fn handle_keys(app: &mut App, key: KeyEvent, terminal: &mut DefaultTerminal) -> Result<()> {
     match key.code {
         KeyCode::Esc => app.screen = Screen::List,
         KeyCode::Char('?') => open_overlay(app, Screen::Help),
@@ -1476,12 +1481,68 @@ fn handle_keys(app: &mut App, key: KeyEvent) -> Result<()> {
                 open_confirm(app, ConfirmAction::RemoveKey(sel));
             }
         }
+        KeyCode::Char('a') => agent_load_key(app, terminal)?,
+        KeyCode::Char('D') => agent_unload_key(app, terminal)?,
         KeyCode::Char('r') => {
             app.reload_keys();
+            app.refresh_agent();
             app.toast("keys reloaded", false);
         }
         _ => {}
     }
+    Ok(())
+}
+
+/// Load the selected key into the ssh-agent (#49).
+///
+/// Runs `ssh-add` inline with the TUI suspended, exactly like the `ssh`/`sftp`
+/// paths: an encrypted key's passphrase prompt then goes to the real terminal
+/// and OpenSSH reads it directly. sshm never sees, stores, or relays the
+/// passphrase.
+fn agent_load_key(app: &mut App, terminal: &mut DefaultTerminal) -> Result<()> {
+    let Some(key) = app.keys_state.selected().and_then(|i| app.keys.get(i)) else {
+        return Ok(());
+    };
+    if !key.has_private {
+        app.toast("no private key file to load", true);
+        return Ok(());
+    }
+    let args = agent::load_args(&key.private_path());
+    run_agent_command(app, terminal, &args, "key loaded into agent")
+}
+
+/// Remove the selected key from the ssh-agent (#49). Needs no input, but goes
+/// through the same inline path so both directions report failures identically.
+fn agent_unload_key(app: &mut App, terminal: &mut DefaultTerminal) -> Result<()> {
+    let Some(key) = app.keys_state.selected().and_then(|i| app.keys.get(i)) else {
+        return Ok(());
+    };
+    let args = agent::unload_args(&key.private_path());
+    run_agent_command(app, terminal, &args, "key removed from agent")
+}
+
+/// Shared inline `ssh-add` runner: suspend, run, restore, then re-probe so the
+/// badge reflects the new reality rather than the pre-command snapshot.
+fn run_agent_command(
+    app: &mut App,
+    terminal: &mut DefaultTerminal,
+    args: &[String],
+    success: &str,
+) -> Result<()> {
+    suspend_tui(terminal)?;
+    let status = run_inline(&tools().ssh_add, args, &[]);
+    restore_tui(terminal)?;
+    match status {
+        Ok(status) if status.success() => app.toast(success, false),
+        Ok(status) => {
+            // Non-zero: wrong passphrase, no agent, key not in the agent. The
+            // real diagnosis was printed to the console while we were suspended.
+            let code = status.code().unwrap_or(-1);
+            app.toast(format!("ssh-add failed (exit {code})"), true);
+        }
+        Err(e) => app.toast(format!("ssh-add could not run: {e}"), true),
+    }
+    app.refresh_agent();
     Ok(())
 }
 
