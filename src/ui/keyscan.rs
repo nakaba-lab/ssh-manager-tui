@@ -30,6 +30,16 @@ pub fn verify_hint() -> &'static str {
     "Verify against a trusted source (server console / provider docs) before pinning."
 }
 
+/// Where an approved pin lands — the destination FILE and the host token it is
+/// recorded under. Both matter: the file is variable (the host's effective
+/// `UserKnownHostsFile`), and the token is not always the scanned target —
+/// `HostKeyAlias` records one pin that covers every host sharing that alias, so
+/// showing only `host:port` understates how far approving here reaches
+/// (#46 round 13).
+pub fn pin_destination(lookup_key: &str, target: &std::path::Path) -> String {
+    format!("Pins are written as {lookup_key} in {}", target.display())
+}
+
 /// Randomart columns per row (each block is ~19 cols wide; 3 fit in 80).
 const ART_COLS: usize = 3;
 
@@ -174,10 +184,8 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(theme::WARN),
         )));
     } else if matches!(ks.modal, KeyScanModal::Results { .. }) {
-        // The pin target is variable (the host's effective UserKnownHostsFile),
-        // so name it rather than leaving the user to guess where `y` writes.
         tail.push(Line::from(Span::styled(
-            format!("Pins are written to {}", ks.pin_target.display()),
+            pin_destination(&ks.lookup_key, &ks.pin_target),
             dim,
         )));
     }
@@ -279,6 +287,27 @@ mod tests {
         // then — the reminder is what is kept (AC8 is not optional)
         assert_eq!(fitted.len(), 1);
         assert_eq!(fitted[0].to_string(), verify_hint());
+    }
+
+    #[test]
+    fn pin_destination_names_the_host_token_not_just_the_file() {
+        // given — a host whose pins are recorded under a lookup key that is NOT
+        // the scanned target: `HostKeyAlias shared-pool` makes one pin cover
+        // every host that shares the alias, so showing only the file left the
+        // user unable to see how far the approval reaches (#46 round 13)
+        let line = pin_destination(
+            "shared-pool",
+            std::path::Path::new("/home/u/.ssh/known_hosts"),
+        );
+        // then — both the host token written and the destination file are shown
+        assert!(
+            line.contains("shared-pool"),
+            "destination must name the host token written, got: {line}"
+        );
+        assert!(
+            line.contains("/home/u/.ssh/known_hosts"),
+            "destination must name the file written, got: {line}"
+        );
     }
 
     #[test]

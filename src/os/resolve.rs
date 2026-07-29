@@ -345,14 +345,21 @@ pub fn known_hosts_paths_are_ambiguous(files: &[String]) -> bool {
                 .is_some_and(|d| !d.as_os_str().is_empty() && d.is_dir())
     };
     // Ambiguity is about what a join would SWALLOW, not about its first word:
-    // if any word inside the run is a real file on its own, "separate paths" is
-    // a legitimate reading and joining would hide that file's pins. Only
+    // if the run contains a real file, "separate paths" is a legitimate reading
+    // and joining would hide that file's pins. The swallowed file is any
+    // CONTIGUOUS SUB-RUN, not just a single word — a genuine known_hosts path
+    // may itself contain a space, so `ssh -G` reports it as several words and a
+    // word-level test never sees it (#46 round 13). Sub-runs are STRICT (the
+    // whole run is excluded): joining a run onto itself swallows nothing. Only
     // REGULAR files count — a directory holds no entries, so a sibling account
     // directory must not make the space-bearing Windows home ambiguous.
     let is_file = |p: &str| std::fs::metadata(p).is_ok_and(|m| m.is_file());
+    let swallows_a_file = |i: usize, j: usize| {
+        (i..=j).any(|k| (k..=j).any(|l| (k, l) != (i, j) && is_file(&expanded[k..=l].join(" "))))
+    };
     (0..expanded.len()).any(|i| {
         (i + 1..expanded.len())
-            .any(|j| joinable(&expanded[i..=j].join(" ")) && (i..=j).any(|k| is_file(&expanded[k])))
+            .any(|j| joinable(&expanded[i..=j].join(" ")) && swallows_a_file(i, j))
     })
 }
 
@@ -658,6 +665,32 @@ mod tests {
         std::fs::create_dir_all(swallow.parent().unwrap()).unwrap();
         std::fs::write(&swallow, "").unwrap();
         // then — ambiguous: f3 is a real file the join would swallow
+        assert!(known_hosts_paths_are_ambiguous(&list));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ambiguity_covers_a_swallow_of_a_multi_word_path() {
+        // given — the genuine pin lives in a path that ITSELF contains a space,
+        // so `ssh -G` reports it as two words. Asking whether any single WORD is
+        // a file missed this: none of the words is a file on its own, yet the
+        // join swallows the real (multi-word) file and its pins (#46 round 13,
+        // reproduced end-to-end against real OpenSSH).
+        let dir = std::env::temp_dir().join(format!("sshm-swallow4-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = |n: &str| dir.join(n).to_str().unwrap().to_string();
+        std::fs::write(dir.join("kh"), "").unwrap();
+        // the genuine, space-bearing pin file; `team` is absent on purpose
+        std::fs::write(dir.join("my hosts"), "h ssh-ed25519 GENUINE\n").unwrap();
+        let list = vec![f("kh"), f("team"), f("my"), "hosts".to_string()];
+        assert!(!known_hosts_paths_are_ambiguous(&list));
+
+        // when — a file named "<team> <my> hosts" exists, so the reader joins
+        // words 1..=3 and the genuine "<dir>/my hosts" disappears
+        let swallow = std::path::PathBuf::from(format!("{} {} hosts", f("team"), f("my")));
+        std::fs::create_dir_all(swallow.parent().unwrap()).unwrap();
+        std::fs::write(&swallow, "").unwrap();
+        // then — ambiguous: a CONTIGUOUS SUB-RUN of the join is a real file
         assert!(known_hosts_paths_are_ambiguous(&list));
         let _ = std::fs::remove_dir_all(&dir);
     }
