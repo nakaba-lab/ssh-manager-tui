@@ -26,9 +26,19 @@ pub fn keyscan_footer() -> &'static [(&'static str, &'static str)] {
 /// The verification reminder shown in EVERY modal state (#46 AC8): direct
 /// the user to verify the fingerprints against a trusted source (server
 /// console / provider docs) before pinning.
+/// Must fit an 80-column modal's INNER width (80 − 2 border columns): this
+/// `Paragraph` clips horizontally instead of wrapping, and at 80 columns the
+/// previous 80-character wording lost its last two characters. `fit_body`
+/// guarantees the hint survives VERTICAL trimming; nothing guarantees it
+/// horizontally, so the text itself has to fit (#46 round 17).
 pub fn verify_hint() -> &'static str {
-    "Verify against a trusted source (server console / provider docs) before pinning."
+    "Verify against a trusted source (server console / vendor docs) before pinning."
 }
+
+/// Inner width of a modal on the project's 80-column floor terminal. Only the
+/// test asserts on it — the constraint lives in the wording, not in the drawing.
+#[cfg(test)]
+const HINT_MAX_COLS: usize = 78;
 
 /// Where an approved pin lands — the destination FILE and the host token it is
 /// recorded under. Both matter: the file is variable (the host's effective
@@ -344,6 +354,22 @@ mod tests {
         assert!(
             hint.contains("trusted source"),
             "hint must name a trusted source to check against, got: {hint}"
+        );
+    }
+
+    #[test]
+    fn keyscan_verify_hint_fits_an_80_col_modal() {
+        // given — the project's 80-column floor terminal, whose modal has 78
+        // inner columns once the block borders are drawn
+        // when / then — the AC8 reminder must fit HORIZONTALLY: this widget
+        // clips rather than wraps, and `fit_body` only protects it from being
+        // trimmed vertically, so an over-long wording silently loses its tail
+        // (#46 round 17 — the previous 80-char text rendered as "…before pinnin")
+        let hint = verify_hint();
+        assert!(
+            hint.chars().count() <= HINT_MAX_COLS,
+            "AC8 hint is {} cols, must fit {HINT_MAX_COLS}: {hint}",
+            hint.chars().count()
         );
     }
 }

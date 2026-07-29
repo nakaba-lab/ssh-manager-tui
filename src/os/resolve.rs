@@ -146,8 +146,12 @@ pub fn parse_ssh_g_output(dump: &str) -> ResolvedConfig {
             "proxycommand" if !val.eq_ignore_ascii_case("none") => {
                 rc.proxy_command = Some(val.to_string())
             }
-            // `ssh -G` omits `knownhostscommand` entirely when unset, and
-            // prints `none` when explicitly disabled.
+            // `ssh -G` omits `knownhostscommand` entirely both when unset and
+            // when explicitly set to `none` (verified against OpenSSH 9.6p1),
+            // so the `none` arm below is belt-and-braces for other builds. The
+            // unreached branch is the EXEMPTION, so a wrong guess here fails
+            // safe: an unexpected value is treated as a live external trust
+            // source and the scan is refused.
             "knownhostscommand" if !val.eq_ignore_ascii_case("none") => {
                 rc.has_external_trust_source = true;
             }
