@@ -339,7 +339,9 @@ pub fn matching_known_entries(lookup_key: &str, files: &[String]) -> Vec<KnownHo
 /// missed a genuine path that itself contains a space (#46 round 13); and
 /// testing only the sub-runs INSIDE a joined run missed a genuine file
 /// straddling its right edge (#46 round 14). All three are the same failure —
-/// a real file our reading does not produce — so that is what is tested. Only REGULAR files count: a directory holds no entries, so a sibling
+/// a real file our reading does not produce — so that is what is tested.
+///
+/// Only REGULAR files count: a directory holds no entries, so a sibling
 /// account directory must not make the space-bearing Windows home ambiguous.
 pub fn known_hosts_paths_are_ambiguous(files: &[String]) -> bool {
     let expanded: Vec<String> = files.iter().map(|p| expand_known_hosts_path(p)).collect();

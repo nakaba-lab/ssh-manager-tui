@@ -731,8 +731,14 @@ fn keyscan_preconditions(
     }
     if rc.known_hosts_list_lossy {
         return Err(format!(
-            "can't scan {alias}: a known_hosts path contains repeated spaces or a tab, which \
-             this build cannot split reliably — pin manually"
+            // Describe the CONDITION, not one instance of it: this fires whenever
+            // the splitter cannot round-trip ssh's raw value, which includes a
+            // trailing space and an unmatched leading quote as well as repeated
+            // spaces and tabs. Naming only the latter sends the user hunting for
+            // characters their config does not contain (#46 round 16).
+            "can't scan {alias}: ssh reports a known_hosts path this build cannot split back \
+             into file names without losing bytes (a repeated space, a tab, a trailing space \
+             or an unmatched quote) — pin manually"
         ));
     }
     let lists = known_hosts_file_lists(rc);

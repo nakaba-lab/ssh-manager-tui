@@ -48,7 +48,7 @@ sequenceDiagram
     KS-->>W: 「host keytype base64」行
     W->>KG: owner-private 一時ファイル経由でフィンガープリント+randomart
     KG-->>W: SHA256 + randomart ブロック
-    W-->>UI: drain_keyscan（tick）→ keyscan_apply_event が New/AlreadyTrusted/Changed に分類
+    W-->>UI: drain_keyscan（tick）→ keyscan_apply_event が New/AlreadyTrusted/Changed/Revoked に分類
     UI->>KH: [y] 承認時のみ append_entries（New のみ・ホストトークンは tofu_lookup_key に正規化）
 ```
 
