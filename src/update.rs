@@ -750,8 +750,10 @@ fn keyscan_preconditions(
     // write to are a guess.
     if lists.iter().any(|l| known_hosts_paths_are_ambiguous(l)) {
         return Err(format!(
-            "can't scan {alias}: the known_hosts paths ssh reports can be read more than one \
-             way (a file name contains a space) — pin manually"
+            "can't scan {alias}: ssh reports its known_hosts files space-separated and \
+             unquoted, and here the words split more than one way — a file on disk matches \
+             a different split than the one we would use, so a real pin could be missed. \
+             Pin manually"
         ));
     }
     let lookup_key =
@@ -940,10 +942,21 @@ fn handle_keyscan(app: &mut App, key: KeyEvent) {
                 // write landed (#46 final review). Writing to a file ssh does
                 // not read for this host is the failure this feature keeps
                 // re-learning, and it looks exactly like success from here.
-                // Re-resolving after the write is safe now that
-                // `primary_known_hosts_file` refuses an unreliably-reconstructed
-                // target: no stray file exists to join the read set, and a
-                // first pin's file (absent at open) is picked up (#46 round 5).
+                // Resolution happens AFTER the write because a first pin's file
+                // does not exist at open time and would drop out of the read set,
+                // producing a false failure (#46 round 5).
+                //
+                // LIMIT (accepted, documented in docs/design/security.md): this
+                // check re-reads through the SAME greedy join that chose the
+                // target, so it cannot detect a target that is itself a bad
+                // guess. When ssh's first known_hosts file does not exist yet
+                // and a regular file named `"<fileA> <fileB>"` was already
+                // planted in its directory, the write lands in that file and
+                // this check confirms it (#46 round 15, reproduced). It is not
+                // an escalation — creating entries in that directory already
+                // lets the attacker create `<fileA>` itself, which OpenSSH
+                // would trust outright — so the claim to fix is the coverage
+                // claim, not the write path.
                 let seen = matching_entries_in_lists(&lookup_key, &ks_files);
                 let visible = lines.iter().all(|line| {
                     let mut f = line.split_whitespace().skip(1);

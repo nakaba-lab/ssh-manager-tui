@@ -40,10 +40,15 @@ pub fn verify_hint() -> &'static str {
 /// Two lines, not one: `Paragraph` clips rather than wraps here, so a single
 /// line makes each fact hostage to the other's length — a long lookup key
 /// pushed the file name off the right edge entirely (#46 round 14).
+///
+/// The name comes FIRST so the destination file is the survivor: `fit_body`
+/// trims the tail from the front, and the file is the more load-bearing fact —
+/// it is what lets the user spot an implausible write target before pressing
+/// `y` (#46 round 15).
 pub fn pin_destination(lookup_key: &str, target: &std::path::Path) -> [String; 2] {
     [
-        format!("Pins are written to {}", target.display()),
-        format!("  recorded under the name {lookup_key}"),
+        format!("Pins are recorded as {lookup_key}"),
+        format!("  and written to {}", target.display()),
     ]
 }
 
@@ -310,16 +315,19 @@ mod tests {
         // long lookup key on a shared line pushes the file off the right edge
         // and the user is left with neither fact (#46 round 14)
         assert!(
-            lines[0].contains("/home/u/.ssh/known_hosts"),
-            "first line must name the file written, got: {lines:?}"
+            lines[0].contains("shared-pool"),
+            "first line must name the host token written, got: {lines:?}"
         );
         assert!(
-            lines[1].contains("shared-pool"),
-            "second line must name the host token written, got: {lines:?}"
-        );
-        assert!(
-            !lines[0].contains("shared-pool"),
+            !lines[0].contains("/home/u/.ssh/known_hosts"),
             "the file must not share a clippable line with the token, got: {lines:?}"
+        );
+        // and the FILE is last, so the tail's front-trim keeps it: it is what
+        // lets the user spot an implausible write target before pressing `y`
+        // (#46 round 15)
+        assert!(
+            lines[1].contains("/home/u/.ssh/known_hosts"),
+            "last line must name the file written, got: {lines:?}"
         );
     }
 
