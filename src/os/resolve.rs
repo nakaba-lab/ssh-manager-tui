@@ -321,8 +321,9 @@ pub fn matching_known_entries(lookup_key: &str, files: &[String]) -> Vec<KnownHo
         .collect()
 }
 
-/// True when the reported words could be read as EITHER separate paths OR one
-/// space-bearing path, because both exist on disk.
+/// True when our reading of the reported words would DROP a real file — i.e.
+/// the words can be read as EITHER separate paths OR one space-bearing path,
+/// and the greedy reading loses a file that exists on disk.
 ///
 /// `coalesce_existing_paths` resolves that ambiguity greedily, joining the
 /// longest run that exists — so a file literally named `"<pathA> <pathB>"`
@@ -330,36 +331,36 @@ pub fn matching_known_entries(lookup_key: &str, files: &[String]) -> Vec<KnownHo
 /// while the write still lands in a file ssh reads (#46 round 11, reproduced
 /// end-to-end). The reader can afford the greedy guess (it only loses entries);
 /// the writer cannot, so it refuses when the input is ambiguous at all.
+///
+/// The question is asked DIRECTLY — "does either partition drop a file?" —
+/// rather than by reasoning about one run at a time. Run-local rules were wrong
+/// twice: a word-level swallow test missed a genuine path that itself contains
+/// a space (#46 round 13), and testing only the sub-runs INSIDE a joined run
+/// missed a genuine file straddling its right edge (#46 round 14). Both are the
+/// same failure — a real file our reading does not produce — so that is what is
+/// tested. Only REGULAR files count: a directory holds no entries, so a sibling
+/// account directory must not make the space-bearing Windows home ambiguous.
 pub fn known_hosts_paths_are_ambiguous(files: &[String]) -> bool {
     let expanded: Vec<String> = files.iter().map(|p| expand_known_hosts_path(p)).collect();
-    // A run is JOINABLE under either coalescing predicate in use: the readers
-    // join when the joined path exists; the writer also joins when its parent
-    // directory exists (a first pin names a file that does not exist yet).
-    // Both must be considered, or an attacker picks whichever the checker
-    // ignores (#46 round 12).
-    let joinable = |p: &str| {
+    // Both coalescing predicates in use must be checked: the readers join when
+    // the joined path exists; the writer also joins when its parent directory
+    // exists (a first pin names a file that does not exist yet). Checking only
+    // one lets an attacker pick whichever partition the checker ignores
+    // (#46 round 12).
+    let reader = coalesce_existing_paths(&expanded, |p| std::path::Path::new(p).exists());
+    let writer = coalesce_existing_paths(&expanded, |p| {
         let path = std::path::Path::new(p);
         path.exists()
             || path
                 .parent()
                 .is_some_and(|d| !d.as_os_str().is_empty() && d.is_dir())
-    };
-    // Ambiguity is about what a join would SWALLOW, not about its first word:
-    // if the run contains a real file, "separate paths" is a legitimate reading
-    // and joining would hide that file's pins. The swallowed file is any
-    // CONTIGUOUS SUB-RUN, not just a single word — a genuine known_hosts path
-    // may itself contain a space, so `ssh -G` reports it as several words and a
-    // word-level test never sees it (#46 round 13). Sub-runs are STRICT (the
-    // whole run is excluded): joining a run onto itself swallows nothing. Only
-    // REGULAR files count — a directory holds no entries, so a sibling account
-    // directory must not make the space-bearing Windows home ambiguous.
+    });
     let is_file = |p: &str| std::fs::metadata(p).is_ok_and(|m| m.is_file());
-    let swallows_a_file = |i: usize, j: usize| {
-        (i..=j).any(|k| (k..=j).any(|l| (k, l) != (i, j) && is_file(&expanded[k..=l].join(" "))))
-    };
-    (0..expanded.len()).any(|i| {
-        (i + 1..expanded.len())
-            .any(|j| joinable(&expanded[i..=j].join(" ")) && swallows_a_file(i, j))
+    (0..expanded.len()).any(|k| {
+        (k..expanded.len()).any(|l| {
+            let candidate = expanded[k..=l].join(" ");
+            is_file(&candidate) && (!reader.contains(&candidate) || !writer.contains(&candidate))
+        })
     })
 }
 
@@ -691,6 +692,35 @@ mod tests {
         std::fs::create_dir_all(swallow.parent().unwrap()).unwrap();
         std::fs::write(&swallow, "").unwrap();
         // then — ambiguous: a CONTIGUOUS SUB-RUN of the join is a real file
+        assert!(known_hosts_paths_are_ambiguous(&list));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ambiguity_covers_a_swallow_that_overlaps_the_genuine_path() {
+        // given — the same shape as round 13, except the attacker's file
+        // OVERLAPS the genuine multi-word path instead of containing it. Asking
+        // "is some sub-run of the joined run a file" only looked INSIDE the run,
+        // so a genuine file straddling the run's right edge stayed invisible
+        // while coalescing destroyed it just the same (#46 round 14, reproduced
+        // end-to-end against real OpenSSH).
+        let dir = std::env::temp_dir().join(format!("sshm-swallow5-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = |n: &str| dir.join(n).to_str().unwrap().to_string();
+        std::fs::write(dir.join("kh"), "").unwrap();
+        // the genuine, space-bearing pin file spans words 2..=3; `team` is absent
+        let genuine = std::path::PathBuf::from(format!("{} {}", f("my"), f("hosts")));
+        std::fs::create_dir_all(genuine.parent().unwrap()).unwrap();
+        std::fs::write(&genuine, "h ssh-ed25519 GENUINE\n").unwrap();
+        let list = vec![f("kh"), f("team"), f("my"), f("hosts")];
+        assert!(!known_hosts_paths_are_ambiguous(&list));
+
+        // when — the attacker's file spans words 1..=2, overlapping (not
+        // containing) the genuine 2..=3
+        let swallow = std::path::PathBuf::from(format!("{} {}", f("team"), f("my")));
+        std::fs::create_dir_all(swallow.parent().unwrap()).unwrap();
+        std::fs::write(&swallow, "").unwrap();
+        // then — ambiguous: our reading no longer yields the genuine file at all
         assert!(known_hosts_paths_are_ambiguous(&list));
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -36,8 +36,15 @@ pub fn verify_hint() -> &'static str {
 /// `HostKeyAlias` records one pin that covers every host sharing that alias, so
 /// showing only `host:port` understates how far approving here reaches
 /// (#46 round 13).
-pub fn pin_destination(lookup_key: &str, target: &std::path::Path) -> String {
-    format!("Pins are written as {lookup_key} in {}", target.display())
+///
+/// Two lines, not one: `Paragraph` clips rather than wraps here, so a single
+/// line makes each fact hostage to the other's length — a long lookup key
+/// pushed the file name off the right edge entirely (#46 round 14).
+pub fn pin_destination(lookup_key: &str, target: &std::path::Path) -> [String; 2] {
+    [
+        format!("Pins are written to {}", target.display()),
+        format!("  recorded under the name {lookup_key}"),
+    ]
 }
 
 /// Randomart columns per row (each block is ~19 cols wide; 3 fit in 80).
@@ -184,10 +191,9 @@ pub fn draw(f: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(theme::WARN),
         )));
     } else if matches!(ks.modal, KeyScanModal::Results { .. }) {
-        tail.push(Line::from(Span::styled(
-            pin_destination(&ks.lookup_key, &ks.pin_target),
-            dim,
-        )));
+        for line in pin_destination(&ks.lookup_key, &ks.pin_target) {
+            tail.push(Line::from(Span::styled(line, dim)));
+        }
     }
     tail.push(Line::from(Span::styled(
         verify_hint(),
@@ -295,18 +301,25 @@ mod tests {
         // the scanned target: `HostKeyAlias shared-pool` makes one pin cover
         // every host that shares the alias, so showing only the file left the
         // user unable to see how far the approval reaches (#46 round 13)
-        let line = pin_destination(
+        let lines = pin_destination(
             "shared-pool",
             std::path::Path::new("/home/u/.ssh/known_hosts"),
         );
-        // then — both the host token written and the destination file are shown
+        // then — both the host token written and the destination file are shown,
+        // and on SEPARATE lines: this widget clips instead of wrapping, so a
+        // long lookup key on a shared line pushes the file off the right edge
+        // and the user is left with neither fact (#46 round 14)
         assert!(
-            line.contains("shared-pool"),
-            "destination must name the host token written, got: {line}"
+            lines[0].contains("/home/u/.ssh/known_hosts"),
+            "first line must name the file written, got: {lines:?}"
         );
         assert!(
-            line.contains("/home/u/.ssh/known_hosts"),
-            "destination must name the file written, got: {line}"
+            lines[1].contains("shared-pool"),
+            "second line must name the host token written, got: {lines:?}"
+        );
+        assert!(
+            !lines[0].contains("shared-pool"),
+            "the file must not share a clippable line with the token, got: {lines:?}"
         );
     }
 
