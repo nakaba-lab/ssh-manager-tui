@@ -737,8 +737,8 @@ fn keyscan_preconditions(
             // spaces and tabs. Naming only the latter sends the user hunting for
             // characters their config does not contain (#46 round 16).
             "can't scan {alias}: ssh reports a known_hosts path this build cannot split back \
-             into file names without losing bytes (a repeated space, a tab, a trailing space \
-             or an unmatched quote) — pin manually"
+             into file names without losing bytes (e.g. a repeated space, a tab, a leading or \
+             trailing space, an unmatched quote) — pin manually"
         ));
     }
     let lists = known_hosts_file_lists(rc);
