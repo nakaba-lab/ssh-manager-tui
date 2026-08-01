@@ -52,6 +52,9 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
             // Fold completed host-key scans into the scan modal (#46; no-op
             // while the modal is closed).
             update::drain_keyscan(app);
+            // Pick up a finished ssh-agent probe (no-op when none is in flight),
+            // so the key manager's badges settle without blocking the draw.
+            app.drain_agent();
             update::tick_clipboard(app);
             last_tick = Instant::now();
         }

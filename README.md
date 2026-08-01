@@ -181,6 +181,7 @@ sshm --help          print help and exit
 | `O` | connect with **ad-hoc overrides** (user / port / identity / jump …) |
 | `o` | open the per-host action menu |
 | `c` | copy the `ssh` command to the clipboard |
+| `i` | **inspect the effective config** (`ssh -G` resolution for the host) |
 | `e` / `a` | edit / add a host |
 | `d` | delete the host (with confirm) |
 | `r` / `R` | refresh liveness for all / the selected host |
@@ -221,10 +222,20 @@ remove, `Enter` commit, `Esc` revert the field.
 | Key | Action |
 |-----|--------|
 | `j` / `k`, `↓` / `↑`, `Home` / `End` | move |
-| `g` | generate a key (Ed25519 / RSA-4096 wizard) |
+| `g` | generate a key (Ed25519 / RSA-4096 wizard; passphrase: none or interactive) |
+| `p` | add / change the key's passphrase (`ssh-keygen -p`, prompts inline; offers to update stored vault passphrases) |
 | `y` | copy the public key |
 | `s` | set as the `IdentityFile` of the host you opened from (`K`) |
+| `D` | **deploy the public key** to the host you opened from (`K`) — appends it to the remote `~/.ssh/authorized_keys` after a confirmation (the `ssh-copy-id` equivalent) |
 | `d` | delete the key pair (with confirm) · `r` rescan · `Esc` back |
+
+> Deployment runs one `ssh` round trip with the TUI suspended, so password
+> authentication and a first-time host-key prompt appear as usual. The snippet it
+> runs is POSIX `sh`, and it is sent as-is — unlike `ssh-copy-id`, which wraps its
+> payload in `exec sh -c` to survive a non-POSIX login shell. So a remote whose
+> default shell is `cmd.exe`/PowerShell (Windows OpenSSH), `csh` or `tcsh` will
+> reject it, and sshm reports the non-zero exit rather than half-applying
+> anything. An existing entry is detected and not appended twice.
 
 ### known_hosts
 

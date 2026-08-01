@@ -11,10 +11,11 @@ title: 設計書
 | 領域 | ファイル | 状態 | 最終更新 |
 |------|---------|------|---------|
 | アーキテクチャ（全体構成） | [architecture.md](./architecture.md) | active | 2026-07-14 |
-| config（無損失往復） | [config.md](./config.md) | draft | 2026-07-14 |
+| config（無損失往復） | [config.md](./config.md) | active | 2026-07-15 |
 | os（外部連携） | [os.md](./os.md) | draft | 2026-07-14 |
-| security（vault 暗号・askpass・信頼境界） | [security.md](./security.md) | draft | 2026-07-14 |
-| ui（TUI 画面） | [ui.md](./ui.md) | draft | 2026-07-14 |
+| security（vault 暗号・askpass・信頼境界） | [security.md](./security.md) | active | 2026-07-15 |
+| ui（TUI 画面） | [ui.md](./ui.md) | active | 2026-07-15 |
+| includes（Include 展開・read-only・#52） | [includes.md](./includes.md) | active | 2026-07-15 |
 
 > 領域を追加したら、`docs/design/<領域>.md` を必須 frontmatter 付きで作り、この表に 1 行足す（索引の更新は領域ファイルの追加・削除時のみ）。追加候補の例: `cross-cutting`（エラーハンドリング・ログ・トランザクション境界）。draft の領域は実装の現状に合わせて確定し `status: active` にする。
 

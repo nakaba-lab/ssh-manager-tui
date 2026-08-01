@@ -15,21 +15,21 @@ pub const VAULT_IDLE_LOCK: Duration = Duration::from_secs(15 * 60);
 
 use crate::config::SshConfig;
 use crate::config::diff::DiffLine;
-use crate::config::model::HostView;
+use crate::config::model::{HostView, parse_sshm_tags};
 use crate::os::connect::{ConnectOverrides, Protocol};
 use crate::os::history::History;
 use crate::os::keys::KeyInfo;
 use crate::os::keyscan::{KeyscanSession, PinClass, ScannedKey};
 use crate::os::known_hosts::{HostSpec, KnownHostEntry};
 use crate::os::liveness::{Liveness, LivenessProbe, ProbeTarget};
-use crate::os::resolve::ResolvedConfig;
+use crate::os::resolve::{ResolvedConfig, has_match_exec};
 use crate::os::sftp::{RemoteEntry, SftpEvent, SftpSession};
 use crate::os::vault::{MatchedKinds, SecretKind, Vault, match_vault_kinds};
-use crate::os::{self, keys, known_hosts};
+use crate::os::{self, agent, keys, known_hosts};
 
 /// Ordered labels of the edit-form fields. Indices are referenced by name in
 /// [`FormIdx`].
-pub const FIELD_LABELS: [&str; 10] = [
+pub const FIELD_LABELS: [&str; 12] = [
     "Host (alias / patterns)",
     "HostName",
     "User",
@@ -40,6 +40,8 @@ pub const FIELD_LABELS: [&str; 10] = [
     "RemoteForward",
     "DynamicForward",
     "Extra options (Key Value)",
+    "Tags (comma-separated)",
+    "Description",
 ];
 
 /// Symbolic indices into the edit form's `fields` vector.
@@ -54,6 +56,10 @@ pub mod form_idx {
     pub const REMOTE_FWD: usize = 7;
     pub const DYNAMIC_FWD: usize = 8;
     pub const EXTRAS: usize = 9;
+    // #45: host metadata persisted as `# sshm:` comments (single-line fields,
+    // appended after EXTRAS so the existing indices never shift).
+    pub const TAGS: usize = 10;
+    pub const DESCRIPTION: usize = 11;
 }
 
 /// Field indices that hold a list of rows rather than a single value.
@@ -125,6 +131,12 @@ pub enum Screen {
     DiffPreview,
     KeyManager,
     KnownHosts,
+    /// Effective-config inspector (#43): a full-screen, filterable/scrollable view
+    /// of a host's `ssh -G` resolution. A base screen (like [`Screen::KnownHosts`]),
+    /// NOT a modal overlay; all state lives on `App` (`inspect_*`). Esc → List. The
+    /// `ssh -G` resolve runs once at open time (see `update::open_inspect`), never
+    /// per-draw, and is refused for configs that could trigger a `Match exec`.
+    Inspect,
     Help,
     Confirm(ConfirmAction),
     ActionMenu(usize),
@@ -163,6 +175,18 @@ pub enum Screen {
     VaultEntry {
         editing: Option<usize>,
     },
+    /// Bulk vault-passphrase update modal (Issue #47), offered after a successful
+    /// `ssh-keygen -p` when stored `Passphrase` entries reference the changed key
+    /// (they now hold the OLD passphrase). One typed passphrase is upserted into
+    /// every affected entry. The affected hosts + typed secret live in
+    /// [`App::passphrase_sync`].
+    PassphraseSync,
+    /// Change the master password, or upgrade the vault's KDF parameters (#44). A
+    /// modal overlay over [`Screen::Vault`]; the mode and typed passwords live off
+    /// the `Screen` enum on [`App::vault_rekey`] (a unit variant here), so no
+    /// plaintext password is ever cloned or formatted through `Screen`'s derived
+    /// `Debug`/`Clone`.
+    VaultRekey,
     /// One-time **password** consent modal, shown before arming a stored password
     /// the first time the resolved `<user@host>` is targeted this session — from
     /// either the connect path or the SFTP browser launch (see `origin`). Carries
@@ -308,6 +332,10 @@ pub enum ConfirmAction {
         direction: SftpDirection,
         name: String,
     },
+    /// Append the public key held in [`App::pending_deploy`] to the remote
+    /// `authorized_keys` (#48). Like `OverwriteTransfer`, accepting runs an inline
+    /// child, so it is dispatched where the terminal is reachable.
+    DeployKey,
     Quit,
 }
 
@@ -482,7 +510,9 @@ pub struct GenWizard {
     pub filename_cursor: usize,
     pub comment: String,
     pub comment_cursor: usize,
-    pub field: usize, // 0 = type, 1 = filename, 2 = comment
+    /// Passphrase mode for the new key (Issue #47).
+    pub passphrase: keys::GenPassphrase,
+    pub field: usize, // 0 = type, 1 = filename, 2 = comment, 3 = passphrase
 }
 
 impl Default for GenWizard {
@@ -493,6 +523,7 @@ impl Default for GenWizard {
             filename_cursor: "id_ed25519".len(),
             comment: String::new(),
             comment_cursor: 0,
+            passphrase: keys::GenPassphrase::NoPassphrase,
             field: 0,
         }
     }
@@ -531,6 +562,64 @@ impl std::fmt::Debug for VaultUnlock {
     }
 }
 
+/// Which rekey operation the [`Screen::VaultRekey`] modal is performing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RekeyMode {
+    /// Change the master password: current + new + confirm fields.
+    #[default]
+    ChangePassword,
+    /// Upgrade the vault's KDF parameters, keeping the same password: only the
+    /// current-password field is shown (re-deriving the key needs the plaintext,
+    /// which the unlocked vault does not retain).
+    UpgradeKdf,
+}
+
+/// Master-password change / KDF-upgrade modal state. Held off the `Screen` enum
+/// (which derives `Debug`/`Clone`) so the typed passwords are never cloned or
+/// formatted through it; each field scrubs on drop and is redacted in `Debug`.
+#[derive(Default, Clone)]
+pub struct VaultRekey {
+    pub mode: RekeyMode,
+    pub current: String,
+    pub new: String,
+    pub confirm: String,
+    /// Focused field: 0 = current, 1 = new, 2 = confirm. `UpgradeKdf` uses only 0.
+    pub field: usize,
+    pub cursor: usize,
+}
+
+impl VaultRekey {
+    /// Focusable field count for the current mode (3 for a password change, 1 for
+    /// a KDF-only upgrade).
+    pub fn field_count(&self) -> usize {
+        match self.mode {
+            RekeyMode::ChangePassword => 3,
+            RekeyMode::UpgradeKdf => 1,
+        }
+    }
+}
+
+impl Drop for VaultRekey {
+    fn drop(&mut self) {
+        self.current.zeroize();
+        self.new.zeroize();
+        self.confirm.zeroize();
+    }
+}
+
+impl std::fmt::Debug for VaultRekey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VaultRekey")
+            .field("mode", &self.mode)
+            .field("current", &"***")
+            .field("new", &"***")
+            .field("confirm", &"***")
+            .field("field", &self.field)
+            .field("cursor", &self.cursor)
+            .finish()
+    }
+}
+
 /// Add/edit form for a single vault entry (modal over the vault list). The typed
 /// secret is scrubbed on drop and redacted in `Debug`.
 #[derive(Default, Clone)]
@@ -561,6 +650,33 @@ impl std::fmt::Debug for VaultEntryForm {
             .field("secret", &"***")
             .field("note", &self.note)
             .field("field", &self.field)
+            .field("cursor", &self.cursor)
+            .finish()
+    }
+}
+
+/// Bulk vault-passphrase update form (modal over the key manager, Issue #47).
+/// The typed secret is scrubbed on drop and redacted in `Debug`, mirroring
+/// [`VaultEntryForm`].
+#[derive(Default, Clone)]
+pub struct PassphraseSyncForm {
+    /// Host aliases whose vault `Passphrase` entries reference the changed key.
+    pub hosts: Vec<String>,
+    pub secret: String,
+    pub cursor: usize,
+}
+
+impl Drop for PassphraseSyncForm {
+    fn drop(&mut self) {
+        self.secret.zeroize();
+    }
+}
+
+impl std::fmt::Debug for PassphraseSyncForm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PassphraseSyncForm")
+            .field("hosts", &self.hosts)
+            .field("secret", &"***")
             .field("cursor", &self.cursor)
             .finish()
     }
@@ -828,6 +944,17 @@ fn friendly_sftp_error(msg: &str, auth_failure: bool) -> String {
     }
 }
 
+/// Source of a host in the flattened [`App::hosts`] list. A `Main` host lives in
+/// the editable main config (indexed into `config.items`); an `Included` host is
+/// a **read-only** projection from an `Include`d file (indexed into
+/// [`App::included`]). Only `Main` reaches the surgical writer, so the type makes
+/// an included host structurally uneditable (#52).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostRef {
+    Main(usize),
+    Included(usize),
+}
+
 pub struct App {
     pub should_quit: bool,
     pub screen: Screen,
@@ -836,8 +963,17 @@ pub struct App {
     // --- config domain ---
     pub config: SshConfig,
     pub hosts: Vec<HostView>,
-    /// `config.items` index for each entry in `hosts`.
-    pub host_items: Vec<usize>,
+    /// Source (main-config item index, or read-only include) for each `hosts`
+    /// entry. `hosts` lists main hosts first, then read-only included hosts.
+    pub host_items: Vec<HostRef>,
+    /// Read-only hosts expanded from `Include`d files (#52), forming the tail of
+    /// `hosts`. Rebuilt by [`App::rebuild_hosts`]; never written back.
+    pub included: Vec<crate::config::includes::IncludedHost>,
+    /// The default `~/.ssh/config` — the file `ssh -G` reads no matter what
+    /// `--config` loaded — scanned as a second root by [`App::ssh_g_exec_risk`]
+    /// (#65). `None` when there is no home directory, and in tests, which must not
+    /// depend on the developer's real config.
+    pub default_config_root: Option<std::path::PathBuf>,
 
     // --- S1 list ---
     pub focus: ListFocus,
@@ -887,6 +1023,16 @@ pub struct App {
     pub keys: Vec<KeyInfo>,
     pub keys_state: ListState,
     pub key_host_ctx: Option<usize>,
+    /// The validated public-key deployment awaiting confirmation (#48). Held on
+    /// `App` — not inside [`ConfirmAction`] — for the same reason as
+    /// [`App::pending_save`]: the confirm popup names the action, `App` carries
+    /// the payload.
+    pub pending_deploy: Option<crate::os::deploy::DeployPlan>,
+    /// Last answer from the ssh-agent probe (#49). `Probing` until the first
+    /// result lands; re-probed on entering the key manager and after load/unload.
+    pub agent: agent::AgentSnapshot,
+    /// In-flight agent probe, drained per tick. `None` when idle.
+    pub agent_probe: Option<agent::AgentProbe>,
     pub gen_wizard: GenWizard,
     /// Selection state for the IdentityFile key picker modal.
     pub pick_key_state: ListState,
@@ -899,6 +1045,16 @@ pub struct App {
     pub kh_search: String,
     pub kh_searching: bool,
 
+    // --- #43 effective-config inspector (see Screen::Inspect) ---
+    /// Alias whose `ssh -G` resolution is shown (for the breadcrumb).
+    pub inspect_alias: String,
+    /// The resolved `ssh -G` key/value pairs, in emission order. Loaded once at
+    /// open time (never recomputed per-draw).
+    pub inspect_rows: Vec<(String, String)>,
+    pub inspect_state: ListState,
+    pub inspect_search: String,
+    pub inspect_searching: bool,
+
     // --- O3 action menu ---
     pub menu_sel: usize,
 
@@ -907,6 +1063,13 @@ pub struct App {
     pub vault: Option<Vault>,
     pub vault_state: ListState,
     pub vault_unlock: VaultUnlock,
+    /// Bulk vault-passphrase update modal state (Issue #47).
+    pub passphrase_sync: PassphraseSyncForm,
+    /// Set when a passphrase change wants to sync the vault but it is locked:
+    /// the changed key's path, resumed by `submit_vault_unlock` after a
+    /// successful unlock (Esc on the unlock prompt clears it = skip).
+    pub passphrase_sync_pending: Option<std::path::PathBuf>,
+    pub vault_rekey: VaultRekey,
     pub vault_entry: VaultEntryForm,
     /// When true, secrets are shown in the clear instead of masked.
     pub vault_reveal: bool,
@@ -967,6 +1130,8 @@ impl App {
             config,
             hosts: Vec::new(),
             host_items: Vec::new(),
+            included: Vec::new(),
+            default_config_root: crate::config::default_config_path().ok(),
             focus: ListFocus::Hosts,
             list_state: TableState::default(),
             detail_scroll: 0,
@@ -990,6 +1155,9 @@ impl App {
             keys,
             keys_state: ListState::default(),
             key_host_ctx: None,
+            pending_deploy: None,
+            agent: agent::AgentSnapshot::default(),
+            agent_probe: None,
             gen_wizard: GenWizard::default(),
             pick_key_state: ListState::default(),
             pick_jump_state: ListState::default(),
@@ -997,10 +1165,18 @@ impl App {
             kh_state: ListState::default(),
             kh_search: String::new(),
             kh_searching: false,
+            inspect_alias: String::new(),
+            inspect_rows: Vec::new(),
+            inspect_state: ListState::default(),
+            inspect_search: String::new(),
+            inspect_searching: false,
             menu_sel: 0,
             vault: None,
             vault_state: ListState::default(),
             vault_unlock: VaultUnlock::default(),
+            passphrase_sync: PassphraseSyncForm::default(),
+            passphrase_sync_pending: None,
+            vault_rekey: VaultRekey::default(),
             vault_entry: VaultEntryForm::default(),
             vault_reveal: false,
             has_vault_file: crate::os::vault::default_path()
@@ -1044,9 +1220,26 @@ impl App {
     /// Liveness is keyed by host index, which can shift when hosts are added or
     /// removed, so clear it here; callers re-probe afterwards.
     pub fn rebuild_hosts(&mut self) {
-        let views = self.config.host_views();
-        self.host_items = views.iter().map(|(i, _)| *i).collect();
-        self.hosts = views.into_iter().map(|(_, v)| v).collect();
+        // Read-only expansion of `Include`d files (#52): re-expand so the list
+        // reflects the current main file. Main hosts come first (editable), then
+        // the read-only included hosts as the tail of `hosts`.
+        self.included = self.expand_includes().hosts;
+
+        let main_views = self.config.host_views();
+        let total = main_views.len() + self.included.len();
+        let mut hosts = Vec::with_capacity(total);
+        let mut host_items = Vec::with_capacity(total);
+        for (item_index, view) in main_views {
+            host_items.push(HostRef::Main(item_index));
+            hosts.push(view);
+        }
+        for (k, inc) in self.included.iter().enumerate() {
+            host_items.push(HostRef::Included(k));
+            hosts.push(inc.view.clone());
+        }
+        self.hosts = hosts;
+        self.host_items = host_items;
+
         self.liveness.clear();
         self.rtt.clear();
         // A host edit can change what a confirmed target resolves to, so the
@@ -1054,6 +1247,111 @@ impl App {
         self.confirmed_password_targets.clear();
         self.refilter();
         self.clamp_selection();
+    }
+
+    /// Expand the main config's `Include` directives (read-only, #52). Relative
+    /// includes resolve against the main config's directory (OpenSSH's `~/.ssh`);
+    /// `home` only drives tilde expansion, so a missing home must not skip
+    /// expansion of relative/absolute includes.
+    fn expand_includes(&self) -> crate::config::includes::Expansion {
+        self.expand_includes_of(&self.config)
+    }
+
+    /// [`App::expand_includes`] for an arbitrary document — used by the safety
+    /// gate, which expands each config as it exists **on disk** (what `ssh -G`
+    /// reads) rather than the in-memory projection. Relative includes resolve
+    /// against that document's own directory.
+    fn expand_includes_of(&self, cfg: &SshConfig) -> crate::config::includes::Expansion {
+        let home = dirs::home_dir().unwrap_or_default();
+        let base_dir = cfg
+            .path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| home.join(".ssh"));
+        crate::config::includes::expand(cfg, &base_dir, &home)
+    }
+
+    /// Why running `ssh -G` on this config could **execute** a `Match exec`
+    /// predicate, or `None` when it is safe to run (#65). The single gate shared by
+    /// every `ssh -G` caller — connect-time autofill, the SFTP arm, and the
+    /// effective-config inspector (#43) — so those paths can never disagree about
+    /// what counts as risky.
+    ///
+    /// Risky means: the main file carries a `Match exec`; **or** any `Include`d
+    /// file `ssh -G` would read carries one (#52); **or** the config uses an
+    /// include form we cannot follow (block-nested / quote-spliced / past
+    /// `MAX_DEPTH`), which **fails safe** — un-scannable is treated as unsafe
+    /// rather than assumed clean. A plain, scannable `Include` is NOT a risk by
+    /// itself, so the common `config.d/*` setup keeps autofill and the inspector.
+    ///
+    /// Everything is re-read at call time — each root config **and** its includes —
+    /// so an externally edited config is re-scanned before each use (all three
+    /// callers are off the hot path). What `ssh -G` reads is the file **on disk**,
+    /// so that is what gets expanded; the in-memory render is scanned too, purely
+    /// as a belt-and-braces over-block for unsaved edits.
+    ///
+    /// Two roots are scanned: the document sshm loaded **and** the default
+    /// `~/.ssh/config` when `--config <path>` made those differ — production never
+    /// passes `-F`, so `ssh -G` reads the default one regardless of what sshm
+    /// loaded. The system-wide config (`/etc/ssh/ssh_config`) is deliberately out
+    /// of scope: it is root-owned, outside this threat model.
+    ///
+    /// Residual race: a config can be rewritten between this scan and `ssh -G`
+    /// starting. That is inherent to any out-of-process gate; this only narrows it.
+    pub fn ssh_g_exec_risk(&self) -> Option<&'static str> {
+        use crate::config::includes::{ReadOutcome, read_config_text};
+        const MAIN: &str = "host config uses `Match exec` — ssh -G would run it; skipped";
+        const DEFAULT_ROOT: &str = "~/.ssh/config uses `Match exec` — ssh -G would run it; skipped";
+        const INCLUDED: &str = "an included file uses `Match exec` — ssh -G would run it; skipped";
+        const UNVERIFIABLE: &str =
+            "config uses an `Include` form we can't verify — skipped for safety";
+
+        // Unsaved in-memory edits: an over-block only, since ssh -G reads the disk.
+        if has_match_exec(&self.config.render()) {
+            return Some(MAIN);
+        }
+        let mut roots = vec![self.config.path.clone()];
+        if let Some(default) = &self.default_config_root
+            && *default != self.config.path
+        {
+            roots.push(default.clone());
+        }
+        for (i, root) in roots.into_iter().enumerate() {
+            // Name the right file when the verdict comes from the default config a
+            // `--config` session never showed the user.
+            let main_reason = if i == 0 { MAIN } else { DEFAULT_ROOT };
+            let text = match read_config_text(&root) {
+                ReadOutcome::Text(t) => t,
+                ReadOutcome::Missing => continue, // ssh cannot read it either
+                ReadOutcome::Unscannable => return Some(UNVERIFIABLE),
+            };
+            if has_match_exec(&text) {
+                return Some(main_reason);
+            }
+            let expansion = self.expand_includes_of(&crate::config::parser::parse(root, &text));
+            if expansion.texts.iter().any(|t| has_match_exec(t)) {
+                return Some(INCLUDED);
+            }
+            if expansion.blind_spot {
+                return Some(UNVERIFIABLE);
+            }
+        }
+        None
+    }
+
+    /// Whether connect-time secret **autofill must be withheld** because `ssh -G`
+    /// could execute a predicate (see [`App::ssh_g_exec_risk`]).
+    pub fn autofill_config_unsafe(&self) -> bool {
+        self.ssh_g_exec_risk().is_some()
+    }
+
+    /// Sticky toast shown when an `Include`d host's edit/delete is refused — it is
+    /// read-only in sshm and its source file must be edited directly (#52).
+    pub fn toast_included_readonly(&mut self) {
+        self.toast(
+            "included host is read-only — edit its source file directly",
+            true,
+        );
     }
 
     /// The shared connect-time **candidacy** predicate: which secret kinds a host
@@ -1106,12 +1404,8 @@ impl App {
         let mut scored: Vec<(usize, u32)> = Vec::new();
         let mut buf = Vec::new();
         for (i, h) in self.hosts.iter().enumerate() {
-            let hay = format!(
-                "{} {} {}",
-                h.patterns.join(" "),
-                h.host_name.as_deref().unwrap_or(""),
-                h.user.as_deref().unwrap_or("")
-            );
+            // #45: tags fold into the fuzzy haystack (patterns/HostName/User/tags).
+            let hay = h.search_haystack();
             let hs = Utf32Str::new(&hay, &mut buf);
             if let Some(score) = pattern.score(hs, &mut matcher) {
                 scored.push((i, score));
@@ -1328,6 +1622,58 @@ impl App {
         rank_changed
     }
 
+    /// Start an ssh-agent probe, unless one is already in flight.
+    ///
+    /// The guard is not an optimisation. Dropping an `AgentProbe` only detaches
+    /// its thread — that thread stays blocked in `ssh-add -l` with no timeout.
+    /// Without the guard, holding `r` down (terminal autorepeat) against a
+    /// wedged agent — the very situation this panel exists to explain — would
+    /// pin one thread and one `ssh-add` process per repeat for the rest of the
+    /// session.
+    pub fn refresh_agent(&mut self) {
+        if self.agent_probe.is_some() {
+            return;
+        }
+        self.agent.status = agent::AgentStatus::Probing;
+        self.agent_probe = Some(agent::AgentProbe::spawn());
+    }
+
+    /// Drain the in-flight agent probe (#49). Called per tick, like
+    /// [`drain_liveness`](Self::drain_liveness), so the UI thread never blocks
+    /// on `ssh-add`. Returns true if the snapshot changed (so the caller
+    /// redraws).
+    pub fn drain_agent(&mut self) -> bool {
+        let Some(probe) = &self.agent_probe else {
+            return false;
+        };
+        let (snapshot, disconnected) = probe.drain();
+        if disconnected {
+            self.agent_probe = None;
+        }
+        match snapshot {
+            Some(snapshot) if snapshot != self.agent => {
+                self.agent = snapshot;
+                true
+            }
+            // The probe closed its channel without ever sending (its thread
+            // died). Fall back to Unavailable rather than leaving the panel on
+            // "checking…" until the user happens to press `r`.
+            None if disconnected && self.agent.status == agent::AgentStatus::Probing => {
+                self.agent.status = agent::AgentStatus::Unavailable;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// How the selected key stands relative to the agent (#49). The key's
+    /// [`PairStatus`](crate::os::keys::PairStatus) is part of the decision: a
+    /// mismatched pair means the fingerprint we hold is not the one the agent
+    /// would report for this private key.
+    pub fn key_agent_state(&self, key: &KeyInfo) -> agent::KeyAgentState {
+        agent::key_state(&self.agent.status, &key.fingerprint, key.pair)
+    }
+
     /// Drain completed SFTP browse-session ops into the browser state (no-op when
     /// not browsing). Called per tick, like [`drain_liveness`](Self::drain_liveness),
     /// so the UI thread never blocks on a remote op. Returns true if anything
@@ -1378,10 +1724,13 @@ impl App {
         self.vault = None;
         self.vault_reveal = false;
         self.confirmed_password_targets.clear();
-        // Scrub any typed-but-unsaved secret in the entry/unlock forms too (both
-        // Drop-zeroize when replaced), so a lock leaves nothing behind.
+        // Scrub any typed-but-unsaved secret in the entry/unlock/rekey/sync forms
+        // too (all Drop-zeroize when replaced), so a lock leaves nothing behind.
         self.vault_entry = VaultEntryForm::default();
         self.vault_unlock = VaultUnlock::default();
+        self.vault_rekey = VaultRekey::default();
+        self.passphrase_sync = PassphraseSyncForm::default();
+        self.passphrase_sync_pending = None;
         // A locked vault must not keep auto-filling an already-open browser: disarm
         // its session (drops + zeroizes the held SftpArm secrets).
         if let Some(b) = self.sftp_browser.as_mut() {
@@ -1403,7 +1752,11 @@ impl App {
             // excludes it — don't "fix" the apparent asymmetry.
             if matches!(
                 self.screen,
-                Screen::Vault | Screen::VaultEntry { .. } | Screen::PasswordConfirm { .. }
+                Screen::Vault
+                    | Screen::VaultEntry { .. }
+                    | Screen::VaultRekey
+                    | Screen::PasswordConfirm { .. }
+                    | Screen::PassphraseSync
             ) {
                 self.screen = Screen::List;
                 self.prev_screen = None;
@@ -1469,6 +1822,34 @@ impl App {
             self.kh_state.select(Some(sel.min(len - 1)));
         }
     }
+
+    /// Indices into `inspect_rows` matching the current `inspect_search`
+    /// (case-insensitive substring over the key OR the value). Identity when the
+    /// search is empty. Mirrors [`kh_filtered`](Self::kh_filtered). (#43)
+    pub fn inspect_filtered(&self) -> Vec<usize> {
+        if self.inspect_search.is_empty() {
+            return (0..self.inspect_rows.len()).collect();
+        }
+        let needle = self.inspect_search.to_lowercase();
+        self.inspect_rows
+            .iter()
+            .enumerate()
+            .filter(|(_, (key, val))| {
+                key.to_lowercase().contains(&needle) || val.to_lowercase().contains(&needle)
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    pub fn clamp_inspect_selection(&mut self) {
+        let len = self.inspect_filtered().len();
+        if len == 0 {
+            self.inspect_state.select(None);
+        } else {
+            let sel = self.inspect_state.selected().unwrap_or(0);
+            self.inspect_state.select(Some(sel.min(len - 1)));
+        }
+    }
 }
 
 /// Build an edit form from a host view (or defaults for an "add new" form).
@@ -1512,6 +1893,11 @@ pub fn form_from_view(view: &HostView) -> EditForm {
         .iter()
         .map(|(k, v)| format!("{k} {v}"))
         .collect();
+    // #45: tags edited as a single comma-separated line; description as one line.
+    set_single(&mut fields[form_idx::TAGS], &view.tags.join(", "));
+    if let Some(v) = &view.description {
+        set_single(&mut fields[form_idx::DESCRIPTION], v);
+    }
 
     EditForm {
         fields,
@@ -1569,6 +1955,9 @@ pub fn view_from_form(form: &EditForm) -> HostView {
         remote_forwards: rows(&f[form_idx::REMOTE_FWD]),
         dynamic_forwards: rows(&f[form_idx::DYNAMIC_FWD]),
         extras,
+        // #45: tags reuse the sshm:tags grammar (parse_sshm_tags); desc is one line.
+        tags: parse_sshm_tags(&f[form_idx::TAGS].value),
+        description: opt(&f[form_idx::DESCRIPTION].value),
     }
 }
 
@@ -2333,6 +2722,72 @@ mod tests {
             app.pick_jump_self_alias(&PickOrigin::Edit { editing: None }),
             ""
         );
+    }
+
+    #[test]
+    fn search_matches_host_by_tag() {
+        // #45 AC7: typing a tag name in the `/` search matches the tagged host
+        // via the existing fuzzy filter (tags folded into the haystack), even
+        // though the tag appears in neither the alias nor the HostName.
+        let mut app = app_fixture(
+            "# sshm:tags prod,db\nHost web\n  HostName 1.1.1.1\n\nHost mail\n  HostName 2.2.2.2\n",
+        );
+        app.search = "prod".to_string();
+        app.refilter();
+        let matched: Vec<&str> = app.filtered.iter().map(|&i| app.hosts[i].alias()).collect();
+        assert_eq!(matched, vec!["web"]);
+    }
+
+    #[test]
+    fn inspect_filtered_matches_key_or_value_case_insensitively() {
+        // #43: the effective-config inspector filters by a case-insensitive
+        // substring over BOTH the key and the value, mirroring `kh_filtered`.
+        let mut app = app_fixture("Host a\n  HostName 1.2.3.4\n");
+        app.inspect_rows = vec![
+            ("hostname".to_string(), "10.0.0.5".to_string()),
+            ("user".to_string(), "deploy".to_string()),
+            ("port".to_string(), "2222".to_string()),
+        ];
+
+        // Empty search = identity (every row shown).
+        app.inspect_search.clear();
+        assert_eq!(app.inspect_filtered(), vec![0, 1, 2]);
+
+        // Match on the key (case-insensitive).
+        app.inspect_search = "USER".to_string();
+        assert_eq!(app.inspect_filtered(), vec![1]);
+
+        // Match on the value.
+        app.inspect_search = "10.0".to_string();
+        assert_eq!(app.inspect_filtered(), vec![0]);
+
+        // No match = empty.
+        app.inspect_search = "zzz".to_string();
+        assert!(app.inspect_filtered().is_empty());
+    }
+
+    #[test]
+    fn clamp_inspect_selection_shrinks_to_last_row_or_none() {
+        // #43: when the filter narrows below the current selection, the
+        // selection must clamp to the new last index (or clear when empty).
+        let mut app = app_fixture("Host a\n  HostName 1.2.3.4\n");
+        app.inspect_rows = vec![
+            ("hostname".to_string(), "10.0.0.5".to_string()),
+            ("user".to_string(), "deploy".to_string()),
+            ("port".to_string(), "2222".to_string()),
+        ];
+
+        // Select the last row, then narrow the filter to a single match: the
+        // selection clamps to the new last index (0).
+        app.inspect_state.select(Some(2));
+        app.inspect_search = "user".to_string();
+        app.clamp_inspect_selection();
+        assert_eq!(app.inspect_state.selected(), Some(0));
+
+        // A filter matching nothing clears the selection.
+        app.inspect_search = "zzz".to_string();
+        app.clamp_inspect_selection();
+        assert_eq!(app.inspect_state.selected(), None);
     }
 
     #[test]

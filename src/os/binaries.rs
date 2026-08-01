@@ -12,6 +12,11 @@ use std::sync::OnceLock;
 pub struct SshTools {
     pub ssh: PathBuf,
     pub ssh_keygen: PathBuf,
+    /// Resolved `ssh-add`, used to inspect and mutate the ssh-agent (#49).
+    /// Preferred from System32 OpenSSH on Windows for the same reason as `ssh`:
+    /// a Git/MSYS `ssh-add` may address a different agent than the `ssh` we
+    /// connect with, which would make the "loaded" badge describe the wrong one.
+    pub ssh_add: PathBuf,
     /// Resolved `ssh-keyscan` (retained for a future "scan host key" action).
     #[allow(dead_code)]
     pub ssh_keyscan: PathBuf,
@@ -71,6 +76,7 @@ fn resolve() -> SshTools {
         return SshTools {
             ssh,
             ssh_keygen: base.join("ssh-keygen.exe"),
+            ssh_add: base.join("ssh-add.exe"),
             ssh_keyscan: base.join("ssh-keyscan.exe"),
             sftp: base.join("sftp.exe"),
             is_system32: true,
@@ -84,6 +90,7 @@ fn resolve() -> SshTools {
     SshTools {
         ssh: PathBuf::from("ssh"),
         ssh_keygen: PathBuf::from("ssh-keygen"),
+        ssh_add: PathBuf::from("ssh-add"),
         ssh_keyscan: PathBuf::from("ssh-keyscan"),
         sftp: PathBuf::from("sftp"),
         is_system32: false,
@@ -95,6 +102,7 @@ fn resolve() -> SshTools {
     SshTools {
         ssh: PathBuf::from("ssh"),
         ssh_keygen: PathBuf::from("ssh-keygen"),
+        ssh_add: PathBuf::from("ssh-add"),
         ssh_keyscan: PathBuf::from("ssh-keyscan"),
         sftp: PathBuf::from("sftp"),
         is_system32: true,
@@ -119,10 +127,33 @@ pub fn find_wt() -> Option<PathBuf> {
     Some(PathBuf::from("wt.exe"))
 }
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
+    #[test]
+    fn ssh_add_is_resolved_alongside_ssh_not_from_bare_path() {
+        // #49: `ssh-add` must inherit the same System32-preference as `ssh`.
+        // Resolving it from the bare PATH would let a Git/MSYS ssh-add talk to a
+        // different agent than the System32 `ssh` we actually connect with, so
+        // the "loaded" badge would describe an agent the connection never uses.
+        let t = tools();
+        assert_eq!(
+            t.ssh_add.file_stem().and_then(|s| s.to_str()),
+            Some("ssh-add"),
+            "ssh_add should resolve to an ssh-add binary, got {:?}",
+            t.ssh_add
+        );
+        assert_eq!(
+            t.ssh_add.parent(),
+            t.ssh.parent(),
+            "ssh-add must come from the same directory as ssh ({:?} vs {:?})",
+            t.ssh_add,
+            t.ssh
+        );
+    }
+
+    #[cfg(windows)]
     #[test]
     fn system_directory_ignores_a_tampered_systemroot_env() {
         // The auto-fill trust anchor (is_system32) must resolve System32 via the

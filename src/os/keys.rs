@@ -6,11 +6,14 @@
 //! KEY-----`); the body is never read. Listing uses `ssh-keygen -l -f <file>`.
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::io::{self, BufRead, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use super::binaries::{ssh_dir, tools};
+use crate::config::model::HostView;
+use crate::os::vault::{SecretKind, Vault};
 
 /// How many directory levels to descend when discovering keys. The root
 /// (`~/.ssh`) is level 0, so the deepest files found live `MAX_DEPTH - 1`
@@ -355,22 +358,14 @@ pub fn generate_key(key_type: KeyType, out_path: &Path, comment: &str) -> io::Re
         std::fs::create_dir_all(parent)?;
     }
 
-    let mut cmd = Command::new(&tools().ssh_keygen);
-    cmd.arg("-t");
-    match key_type {
-        KeyType::Ed25519 => {
-            cmd.arg("ed25519");
-        }
-        KeyType::Rsa4096 => {
-            cmd.arg("rsa").arg("-b").arg("4096");
-        }
-    }
-    cmd.arg("-f").arg(out_path);
-    cmd.arg("-C").arg(comment);
-    cmd.arg("-N").arg("");
-    cmd.arg("-q");
-
-    let out = cmd.output()?;
+    let out = Command::new(&tools().ssh_keygen)
+        .args(generate_key_args(
+            key_type,
+            out_path,
+            comment,
+            GenPassphrase::NoPassphrase,
+        ))
+        .output()?;
     if out.status.success() {
         Ok(())
     } else {
@@ -379,6 +374,132 @@ pub fn generate_key(key_type: KeyType, out_path: &Path, comment: &str) -> io::Re
             String::from_utf8_lossy(&out.stderr).trim()
         )))
     }
+}
+
+/// Passphrase mode for key generation (Issue #47).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenPassphrase {
+    NoPassphrase,
+    Interactive,
+}
+
+/// Pure arg builder for `ssh-keygen -p` (passphrase add/change). See CLAUDE.md layering.
+/// The current/new passphrases are prompted by ssh-keygen itself — never passed
+/// as arguments, so no secret ever appears on a command line.
+pub fn change_passphrase_args(private_key: &Path) -> Vec<OsString> {
+    vec!["-p".into(), "-f".into(), private_key.as_os_str().to_owned()]
+}
+
+/// Pure arg builder for key generation; `generate_key` and the interactive path share it.
+/// `NoPassphrase` keeps the captured non-interactive shape (`-N "" -q`);
+/// `Interactive` omits both so ssh-keygen prompts on the inherited console.
+pub fn generate_key_args(
+    key_type: KeyType,
+    out_path: &Path,
+    comment: &str,
+    passphrase: GenPassphrase,
+) -> Vec<OsString> {
+    let mut args: Vec<OsString> = match key_type {
+        KeyType::Ed25519 => vec!["-t".into(), "ed25519".into()],
+        KeyType::Rsa4096 => vec!["-t".into(), "rsa".into(), "-b".into(), "4096".into()],
+    };
+    args.extend([
+        "-f".into(),
+        out_path.as_os_str().to_owned(),
+        "-C".into(),
+        comment.into(),
+    ]);
+    if passphrase == GenPassphrase::NoPassphrase {
+        args.extend(["-N".into(), "".into(), "-q".into()]);
+    }
+    args
+}
+
+/// Identity files OpenSSH tries when a host declares no `IdentityFile` of its
+/// own. A host on the defaults still auto-fills its passphrase at connect time,
+/// so its stored secret goes stale like any other — leaving them out would miss
+/// the most common config of all (`Host x` with just a `HostName`).
+const DEFAULT_IDENTITY_FILES: &[&str] = &[
+    "id_rsa",
+    "id_ecdsa",
+    "id_ecdsa_sk",
+    "id_ed25519",
+    "id_ed25519_sk",
+    "id_dsa",
+];
+
+/// Expand a leading `~/` against `home`; anything else is taken verbatim.
+fn expand_tilde(raw: &str, home: &Path) -> PathBuf {
+    match raw.strip_prefix("~/") {
+        Some(rest) => home.join(rest),
+        None => PathBuf::from(raw),
+    }
+}
+
+/// Whether two key paths name the same file. Windows folds case and treats
+/// `/`≡`\`, so a hand-written lower-case `c:\users\…` config entry really does
+/// reach the same key — the connect-time auto-fill already compares this way
+/// (`askpass::paths_equal`), and a stricter rule here would detect nothing while
+/// the stale secret kept being served.
+fn same_key_path(a: &Path, b: &Path) -> bool {
+    fn norm(p: &Path) -> String {
+        let s = p.to_string_lossy();
+        if cfg!(windows) {
+            s.replace('\\', "/").to_ascii_lowercase()
+        } else {
+            s.into_owned()
+        }
+    }
+    norm(a) == norm(b)
+}
+
+/// The vault lookup keys of every host that uses `key_path` — i.e. each non-glob
+/// pattern of a matching `Host` line, not just its first (alias). This mirrors
+/// how the connect-time auto-fill resolves secrets (`vault::match_vault_kinds`
+/// and `update::gather_secrets` both scan all patterns), so a secret registered
+/// under a secondary name is detected here exactly when it would be served
+/// there. Glob patterns are skipped: they can never equal a vault entry's host.
+/// Pure.
+pub fn hosts_using_key(key_path: &Path, home: &Path, hosts: &[HostView]) -> Vec<String> {
+    let uses_key = |h: &HostView| {
+        if h.identity_files.is_empty() {
+            // No IdentityFile declared — OpenSSH falls back to the defaults in
+            // ~/.ssh, so this host uses `key_path` iff it is one of them.
+            let ssh_dir = home.join(".ssh");
+            return DEFAULT_IDENTITY_FILES
+                .iter()
+                .any(|name| same_key_path(&ssh_dir.join(name), key_path));
+        }
+        h.identity_files
+            .iter()
+            .any(|id| same_key_path(&expand_tilde(id, home), key_path))
+    };
+    hosts
+        .iter()
+        .filter(|h| uses_key(h))
+        .flat_map(|h| h.patterns.iter())
+        .filter(|pat| !pat.contains(['*', '?', '!']))
+        .map(|pat| pat.to_string())
+        .collect()
+}
+
+/// `hosts_using_key` ∩ the lookup keys that actually have a vault `Passphrase`
+/// entry — the hosts whose stored secret just went stale. Pure.
+pub fn stale_passphrase_hosts(
+    key_path: &Path,
+    home: &Path,
+    hosts: &[HostView],
+    vault: &Vault,
+) -> Vec<String> {
+    hosts_using_key(key_path, home, hosts)
+        .into_iter()
+        .filter(|host| {
+            vault
+                .entries
+                .iter()
+                .any(|e| e.kind == SecretKind::Passphrase && e.host == *host)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -615,6 +736,289 @@ mod tests {
         );
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- Issue #47: passphrase add/change (`ssh-keygen -p`) + vault pairing ---
+
+    use crate::config::model::HostView;
+    use crate::os::vault::{SecretKind, Vault, VaultEntry};
+    use std::ffi::OsString;
+
+    fn os_args(args: &[&str]) -> Vec<OsString> {
+        args.iter().map(OsString::from).collect()
+    }
+
+    fn host_view(alias: &str, identity_files: &[&str]) -> HostView {
+        host_view_multi(&[alias], identity_files)
+    }
+
+    /// A `Host` line with several patterns (`Host prod prod-old`), which the
+    /// connect-time auto-fill treats as several vault lookup keys.
+    fn host_view_multi(patterns: &[&str], identity_files: &[&str]) -> HostView {
+        HostView {
+            patterns: patterns.iter().map(|s| s.to_string()).collect(),
+            identity_files: identity_files.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// change_passphrase_args — 秘密鍵パスから `-p -f <path>` を組み立てる
+    #[test]
+    fn change_passphrase_args_builds_p_f_path() {
+        // given
+        let key = Path::new("/home/u/.ssh/id_ed25519");
+
+        // when
+        let args = change_passphrase_args(key);
+
+        // then
+        assert_eq!(args, os_args(&["-p", "-f", "/home/u/.ssh/id_ed25519"]));
+    }
+
+    /// generate_key_args — NoPassphrase の ed25519 は `-N ""` と `-q` を含む
+    #[test]
+    fn generate_key_args_no_passphrase_ed25519_includes_n_empty_and_q() {
+        // given
+        let out = Path::new("/tmp/k/id_ed25519");
+
+        // when
+        let args = generate_key_args(
+            KeyType::Ed25519,
+            out,
+            "me@host",
+            GenPassphrase::NoPassphrase,
+        );
+
+        // then
+        assert_eq!(
+            args,
+            os_args(&[
+                "-t",
+                "ed25519",
+                "-f",
+                "/tmp/k/id_ed25519",
+                "-C",
+                "me@host",
+                "-N",
+                "",
+                "-q",
+            ])
+        );
+    }
+
+    /// generate_key_args — NoPassphrase の rsa4096 は `-b 4096` も含む
+    #[test]
+    fn generate_key_args_no_passphrase_rsa4096_includes_b_4096() {
+        // given
+        let out = Path::new("/tmp/k/id_rsa");
+
+        // when
+        let args = generate_key_args(
+            KeyType::Rsa4096,
+            out,
+            "me@host",
+            GenPassphrase::NoPassphrase,
+        );
+
+        // then
+        assert_eq!(
+            args,
+            os_args(&[
+                "-t",
+                "rsa",
+                "-b",
+                "4096",
+                "-f",
+                "/tmp/k/id_rsa",
+                "-C",
+                "me@host",
+                "-N",
+                "",
+                "-q",
+            ])
+        );
+    }
+
+    /// generate_key_args — Interactive では `-N`/`-q` を発行しない（ssh-keygen に対話させる）
+    #[test]
+    fn generate_key_args_interactive_omits_n_and_q() {
+        // given
+        let out = Path::new("/tmp/k/id_ed25519");
+
+        // when
+        let args = generate_key_args(KeyType::Ed25519, out, "me@host", GenPassphrase::Interactive);
+
+        // then
+        assert!(
+            !args.contains(&OsString::from("-N")),
+            "must omit -N: {args:?}"
+        );
+        assert!(
+            !args.contains(&OsString::from("-q")),
+            "must omit -q: {args:?}"
+        );
+        assert!(args.contains(&OsString::from("-t")));
+        assert!(args.contains(&OsString::from("-f")));
+        assert!(args.contains(&OsString::from("-C")));
+    }
+
+    /// hosts_using_key — `~/` 展開と絶対パスの IdentityFile が key_path に一致する
+    #[test]
+    fn hosts_using_key_matches_tilde_and_absolute_identity() {
+        // given: (alias, identity_files, マッチ期待)
+        let home = Path::new("/home/u");
+        let key = Path::new("/home/u/.ssh/id_a");
+        let cases: &[(&str, &[&str], bool)] = &[
+            ("tilde", &["~/.ssh/id_a"], true),
+            ("absolute", &["/home/u/.ssh/id_a"], true),
+            ("other-key", &["~/.ssh/id_b"], false),
+            ("no-identity", &[], false),
+        ];
+        let hosts: Vec<HostView> = cases
+            .iter()
+            .map(|(alias, ids, _)| host_view(alias, ids))
+            .collect();
+
+        // when
+        let matched = hosts_using_key(key, home, &hosts);
+
+        // then
+        for (alias, _, expect) in cases {
+            assert_eq!(
+                matched.iter().any(|m| m == alias),
+                *expect,
+                "alias {alias} (matched: {matched:?})"
+            );
+        }
+    }
+
+    /// hosts_using_key — `Host` 行の非 glob パターンを全て返す（接続時オートフィルと同じ照合鍵）
+    #[test]
+    fn hosts_using_key_matches_every_non_glob_pattern() {
+        // given: 1 つの Host 行が別名を複数持ち、glob パターンも混ざる
+        let home = Path::new("/home/u");
+        let key = Path::new("/home/u/.ssh/id_a");
+        let hosts = vec![host_view_multi(
+            &["prod", "prod-old", "*.internal"],
+            &["~/.ssh/id_a"],
+        )];
+
+        // when
+        let matched = hosts_using_key(key, home, &hosts);
+
+        // then: 先頭パターンだけでなく副パターンも返る。glob は vault エントリに
+        // 一致しえないので候補にしない（gather_secrets と同じ規則）。
+        assert_eq!(
+            matched,
+            vec!["prod".to_string(), "prod-old".to_string()],
+            "every non-glob pattern must be a lookup key"
+        );
+    }
+
+    /// hosts_using_key — IdentityFile 未宣言のホストは OpenSSH の既定 identity を暗黙候補にする
+    #[test]
+    fn hosts_using_key_falls_back_to_default_identities() {
+        // given: IdentityFile 行が無い（＝既定 identity を使う典型構成）
+        let home = Path::new("/home/u");
+        let hosts = vec![host_view("prod", &[])];
+
+        // when / then: 既定 identity の 1 つならマッチする
+        assert_eq!(
+            hosts_using_key(Path::new("/home/u/.ssh/id_ed25519"), home, &hosts),
+            vec!["prod".to_string()]
+        );
+        // when / then: 既定でない鍵にはマッチしない
+        assert!(
+            hosts_using_key(Path::new("/home/u/.ssh/deploy_key"), home, &hosts).is_empty(),
+            "a non-default key must not match a host that declares no IdentityFile"
+        );
+        // when / then: IdentityFile を明示したホストには既定を足さない
+        let explicit = vec![host_view("prod", &["~/.ssh/deploy_key"])];
+        assert!(
+            hosts_using_key(Path::new("/home/u/.ssh/id_ed25519"), home, &explicit).is_empty(),
+            "an explicit IdentityFile replaces the defaults"
+        );
+    }
+
+    /// hosts_using_key — Windows ではパスの大小・区切りを畳んで比較する（unix は厳密）
+    #[test]
+    fn hosts_using_key_folds_case_and_separators_on_windows() {
+        // given: 手書き config によくある全小文字・バックスラッシュ表記
+        let home = Path::new("C:/Users/taro");
+        let key = Path::new("C:/Users/taro/.ssh/id_a");
+        let hosts = vec![host_view("prod", &["c:\\users\\taro\\.ssh\\id_a"])];
+
+        // when
+        let matched = hosts_using_key(key, home, &hosts);
+
+        // then: Windows は case-insensitive かつ `/`≡`\` なので接続でき、
+        // 検出もそれに揃える。unix ではこれらは別パスなので一致しない。
+        if cfg!(windows) {
+            assert_eq!(matched, vec!["prod".to_string()]);
+        } else {
+            assert!(matched.is_empty(), "unix paths are compared exactly");
+        }
+    }
+
+    /// stale_passphrase_hosts — 副パターンで登録された vault エントリも陳腐化として拾う
+    #[test]
+    fn stale_passphrase_hosts_covers_secondary_patterns() {
+        // given: vault のエントリは Host 行の 2 つ目のパターン名で登録されている
+        let home = Path::new("/home/u");
+        let key = Path::new("/home/u/.ssh/id_a");
+        let hosts = vec![host_view_multi(&["prod", "prod-old"], &["~/.ssh/id_a"])];
+        let mut vault = Vault::create("pw").unwrap();
+        vault.upsert(
+            None,
+            VaultEntry {
+                host: "prod-old".into(),
+                kind: SecretKind::Passphrase,
+                secret: "s".into(),
+                note: String::new(),
+            },
+        );
+
+        // when
+        let stale = stale_passphrase_hosts(key, home, &hosts, &vault);
+
+        // then: 接続時は prod-old のエントリが使われるので、検出も拾わねばならない
+        assert_eq!(stale, vec!["prod-old".to_string()]);
+    }
+
+    /// stale_passphrase_hosts — 鍵一致かつ vault に Passphrase がある host だけを返す
+    #[test]
+    fn stale_passphrase_hosts_requires_both_key_match_and_vault_entry() {
+        // given
+        let home = Path::new("/home/u");
+        let key = Path::new("/home/u/.ssh/id_a");
+        let hosts = vec![
+            host_view("with-pass", &["~/.ssh/id_a"]), // 鍵一致 + Passphrase → 含む
+            host_view("pw-only", &["~/.ssh/id_a"]),   // 鍵一致 + Password のみ → 含まない
+            host_view("other-key", &["~/.ssh/id_b"]), // 鍵不一致 + Passphrase → 含まない
+        ];
+        let entry = |host: &str, kind| VaultEntry {
+            host: host.into(),
+            kind,
+            secret: "s".into(),
+            note: String::new(),
+        };
+        let mut vault = Vault::create("pw").unwrap();
+        vault.upsert(None, entry("with-pass", SecretKind::Passphrase));
+        vault.upsert(None, entry("pw-only", SecretKind::Password));
+        vault.upsert(None, entry("other-key", SecretKind::Passphrase));
+
+        // when
+        let stale = stale_passphrase_hosts(key, home, &hosts, &vault);
+
+        // then
+        assert_eq!(stale, vec!["with-pass".to_string()]);
+
+        // given: 何も無い
+        let empty_vault = Vault::create("pw").unwrap();
+        // when
+        let stale = stale_passphrase_hosts(key, home, &[], &empty_vault);
+        // then
+        assert!(stale.is_empty());
     }
 
     #[cfg(unix)]

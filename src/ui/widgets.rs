@@ -1,7 +1,7 @@
 //! Small shared rendering helpers used across screens.
 
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Padding};
 
@@ -137,9 +137,16 @@ pub fn input_line_borrowed(value: &str, cursor: usize, editing: bool) -> Line<'_
 
 /// A right-aligned `key  value` detail line (14-wide dim key, primary value).
 pub fn kv_line(key: &str, value: String) -> Line<'static> {
+    kv_line_colored(key, value, theme::TEXT)
+}
+
+/// [`kv_line`] with the value in an explicit colour, for rows whose value
+/// carries a verdict (pair status, agent membership, service state) rather than
+/// plain text. Keeps the label column aligned with the plain rows around it.
+pub fn kv_line_colored(key: &str, value: String, color: Color) -> Line<'static> {
     Line::from(vec![
         Span::styled(format!("{key:>14}  "), Style::default().fg(theme::DIM)),
-        Span::styled(value, Style::default().fg(theme::TEXT)),
+        Span::styled(value, Style::default().fg(color)),
     ])
 }
 

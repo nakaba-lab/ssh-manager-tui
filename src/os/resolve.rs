@@ -185,6 +185,21 @@ pub fn parse_ssh_g_output(dump: &str) -> ResolvedConfig {
     rc
 }
 
+/// Parse `ssh -G` output into an ordered list of EVERY `key value` pair, in
+/// emission order — keeping keys outside the typed [`ResolvedConfig`] subset and
+/// repeated keys (e.g. multiple `identityfile`). Blank and keyless (whitespace-
+/// less) lines are dropped. Powers the effective-config inspector (#43); pure,
+/// zero ratatui / `App`. Keys are kept VERBATIM as `ssh -G` emits them (mostly
+/// lowercase, but a few like `canonicalizePermittedcnames` stay camelCase).
+pub fn parse_ssh_g_full(dump: &str) -> Vec<(String, String)> {
+    dump.lines()
+        .filter_map(|line| {
+            let (key, val) = line.trim().split_once(char::is_whitespace)?;
+            Some((key.to_string(), val.trim().to_string()))
+        })
+        .collect()
+}
+
 /// Upper bound on how long the `ssh -G` resolve may take before we kill it and
 /// degrade to manual entry. Sized for the common case; a hanging `Match exec`
 /// or slow DNS must not wedge the caller.
@@ -201,24 +216,41 @@ pub const SSH_G_RESOLVE_TIMEOUT: Duration = Duration::from_millis(500);
 /// them from validated form input via `os::connect::resolve_options`; a plain
 /// saved-host connect passes `&[]`. The untrusted `alias` always follows `--`.
 pub fn resolve_config_with_options(options: &[String], alias: &str) -> io::Result<ResolvedConfig> {
-    // Defense against argv flag-smuggling: an alias beginning with '-' would be
-    // parsed by ssh as an option (e.g. `-oProxyCommand=...` → code execution).
-    // No legitimate SSH host alias starts with '-' (plain `ssh <alias>` could
-    // not use one either), so reject it outright rather than resolve it.
+    reject_dash_alias(alias)?;
+    run_ssh_g(options, alias)
+}
+
+/// Argv flag-smuggling guard shared by both resolvers: an alias beginning with
+/// '-' would be parsed by ssh as an option (e.g. `-oProxyCommand=...` → code
+/// execution). No legitimate SSH host alias starts with '-' (plain `ssh <alias>`
+/// could not use one either), so reject it outright rather than resolve it.
+fn reject_dash_alias(alias: &str) -> io::Result<()> {
     if alias.starts_with('-') {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "alias may not start with '-'",
         ));
     }
-    run_ssh_g(options, alias)
+    Ok(())
 }
 
-/// Shared bounded runner: `ssh -G <options> -- <alias>`. `options` are trusted
-/// leading flags (production passes none; tests may pass `-F <fixture>`); the
-/// untrusted `alias` always follows the `--` end-of-options sentinel so it can
-/// never be interpreted as a flag, even if an upstream caller skips validation.
-fn run_ssh_g(options: &[String], alias: &str) -> io::Result<ResolvedConfig> {
+/// Resolve an alias to its FULL effective config as an ordered `Vec<(key, value)>`
+/// — every `ssh -G` line in emission order, not just the typed [`ResolvedConfig`]
+/// subset. Same argv guard and bounded runner as [`resolve_config_with_options`].
+/// Powers the effective-config inspector (#43); zero ratatui / `App` dependency.
+pub fn resolve_full(options: &[String], alias: &str) -> io::Result<Vec<(String, String)>> {
+    reject_dash_alias(alias)?;
+    Ok(parse_ssh_g_full(&run_ssh_g_dump(options, alias)?))
+}
+
+/// Shared bounded runner returning the raw `ssh -G` stdout dump. `options` are
+/// trusted leading flags (production passes none; tests may pass `-F <fixture>`);
+/// the untrusted `alias` always follows the `--` end-of-options sentinel so it
+/// can never be interpreted as a flag, even if an upstream caller skips
+/// validation. `stdin` is nulled so it can never block on a prompt; on timeout
+/// the child is killed and an error returned (caller degrades to manual entry).
+/// The typed [`run_ssh_g`] and the full [`resolve_full`] view both read this dump.
+fn run_ssh_g_dump(options: &[String], alias: &str) -> io::Result<String> {
     let mut child = Command::new(&tools().ssh)
         .arg("-G")
         .args(options)
@@ -246,8 +278,13 @@ fn run_ssh_g(options: &[String], alias: &str) -> io::Result<ResolvedConfig> {
     }
 
     let output = child.wait_with_output()?;
-    let dump = String::from_utf8_lossy(&output.stdout);
-    Ok(parse_ssh_g_output(&dump))
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Typed resolver: run `ssh -G` and parse into the extracted [`ResolvedConfig`]
+/// subset the vault gates key off.
+fn run_ssh_g(options: &[String], alias: &str) -> io::Result<ResolvedConfig> {
+    Ok(parse_ssh_g_output(&run_ssh_g_dump(options, alias)?))
 }
 
 /// True if the raw SSH config text contains a `Match` line with an `exec`
@@ -1245,5 +1282,77 @@ identityfile ~/.ssh/id_rsa
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- #43: effective-config inspector (`ssh -G` view) ---
+
+    #[test]
+    fn parse_full_preserves_order_and_all_keys() {
+        // Unlike `parse_ssh_g_output` (which extracts a typed subset), the
+        // inspector must surface EVERY key/value in emission order, including
+        // keys outside the typed struct (`forwardagent`) and repeated keys
+        // (`identityfile` twice).
+        let dump = "\
+host web1
+hostname 10.0.0.5
+user deploy
+port 2222
+forwardagent no
+identityfile ~/.ssh/id_ed25519
+identityfile ~/.ssh/id_rsa
+";
+        let pairs = parse_ssh_g_full(dump);
+        assert_eq!(
+            pairs,
+            vec![
+                ("host".to_string(), "web1".to_string()),
+                ("hostname".to_string(), "10.0.0.5".to_string()),
+                ("user".to_string(), "deploy".to_string()),
+                ("port".to_string(), "2222".to_string()),
+                ("forwardagent".to_string(), "no".to_string()),
+                ("identityfile".to_string(), "~/.ssh/id_ed25519".to_string()),
+                ("identityfile".to_string(), "~/.ssh/id_rsa".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_full_skips_blank_and_keyless_lines() {
+        // Blank lines and keyless (whitespace-less) lines are dropped, matching
+        // the typed parser's tolerance; every real `key value` line is kept.
+        let pairs = parse_ssh_g_full("\nhostname h\nbogusline\n   \n");
+        assert_eq!(pairs, vec![("hostname".to_string(), "h".to_string())]);
+    }
+
+    #[test]
+    fn resolve_full_returns_ordered_pairs_for_any_alias() {
+        // `ssh -G <alias>` always succeeds; the full view must surface many
+        // keyword lines, with `hostname` defaulting to the alias itself. Keys are
+        // kept VERBATIM as ssh emits them — mostly lowercase but a few stay
+        // camelCase (e.g. `canonicalizePermittedcnames`), so we assert only that
+        // each key is a single whitespace-free token. Requires ssh on PATH.
+        let pairs = resolve_full(&[], "sshm-test-nonexistent-alias")
+            .expect("ssh -G should succeed for any alias");
+        assert!(pairs.len() > 5, "ssh -G emits many keyword lines");
+        assert!(
+            pairs
+                .iter()
+                .any(|(k, v)| k == "hostname" && v == "sshm-test-nonexistent-alias"),
+            "hostname defaults to the alias"
+        );
+        assert!(
+            pairs
+                .iter()
+                .all(|(k, _)| !k.is_empty() && !k.contains(char::is_whitespace)),
+            "each key is a single whitespace-free token, preserved verbatim"
+        );
+    }
+
+    #[test]
+    fn resolve_full_rejects_leading_dash_alias() {
+        // Same argv flag-smuggling guard as the typed resolver: a `-`-prefixed
+        // alias must be refused before ever reaching `ssh`.
+        let err = resolve_full(&[], "-oProxyCommand=evil").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 }

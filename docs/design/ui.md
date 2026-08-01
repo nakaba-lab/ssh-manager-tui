@@ -1,14 +1,14 @@
 ---
 title: ui 領域 設計
 area: ui
-status: draft
-relatedIssues: [46]
+status: active
+relatedIssues: [43, 44, 45, 46, 47, 48, 49, 65, 73]
 updated: 2026-07-29
 ---
 
 # ui 領域 設計（`src/ui/` — TUI 描画）
 
-> status: draft — 初期骨子。**TUI（ratatui）であり Web フロントではない**（`frontendDir: none`）。ブラウザ向けの a11y/レスポンシブ検証（`frontend-reviewer`）は対象外で、UI 配慮は本領域の記述で担保する。
+> **TUI（ratatui）であり Web フロントではない**（`frontendDir: none`）。ブラウザ向けの a11y/レスポンシブ検証（`frontend-reviewer`）は対象外で、UI 配慮は本領域の記述で担保する。
 
 ## 責務
 
@@ -21,12 +21,72 @@ updated: 2026-07-29
 | `mod.rs` | `draw()` ディスパッチ。固定 3 行フレーム（breadcrumb・body・footer hints）＋モーダル重ね |
 | `theme.rs` | 全色の単一真実源（Tokyo Night）・`selection()`/`border()`/`SELECT_SYMBOL`。色ハードコード禁止 |
 | `widgets.rs` | `panel`/`modal_block`/`footer_hints`/`kv_line`/`section_header`/`input_line`/`responsive_split` |
-| 画面別 | `list`・`edit`・`diff`・`vault`・`sftp`・`keys`・`known_hosts`・`confirm`・`connect_override`・`help`・`keyscan`（#46 で新規: ホスト鍵スキャンモーダル） |
+| 画面別 | `list`・`edit`・`diff`・`vault`・`sftp`・`keys`・`known_hosts`・`inspect`・`confirm`・`connect_override`・`help`・`keyscan`（#46 で新規: ホスト鍵スキャンモーダル） |
 
 ## UI/画面設計（TUI）
 
 - **画面遷移**: `Screen` enum が駆動。モーダルは `App::prev_screen` + `open_overlay`/`close_overlay`。画面/モード追加時は `Screen`（app.rs）・dispatch（update.rs）・draw（ui/mod.rs）の 3 箇所を触る。
-- **主要画面**: ホスト一覧（検索・到達性列・詳細ペイン）／編集フォーム／保存前 diff ／vault ／SFTP ブラウザ（2 ペイン）／鍵マネージャ／known_hosts ／ヘルプ。キーバインドの一覧は [README](../../README.md#keybindings) が真実源。
+- **主要画面**: ホスト一覧（検索・到達性列・詳細ペイン）／編集フォーム／保存前 diff ／vault ／SFTP ブラウザ（2 ペイン）／鍵マネージャ／known_hosts ／**実効設定インスペクタ（`ssh -G` ビュー・#43）**／ヘルプ。キーバインドの一覧は [README](../../README.md#keybindings) が真実源。
+- **実効設定インスペクタ（`Screen::Inspect`・#43）**: ホスト一覧で `i` を押すと、選択ホストの `ssh -G` 実効設定を**フルスクリーンのベース画面**（`known_hosts` と同じ流儀＝`app.screen = Screen::Inspect` を直接設定・Esc で List へ戻る。モーダルオーバーレイではない）で表示する。`resolve.rs::resolve_full` の順序付き key/value を `/` の部分一致フィルタ（`kh_filtered` と同じ大小無視の substring）と j/k・g/G スクロールで閲覧する（v1 は閲覧専用＝値コピー等は対象外）。
+  - **開く前の安全ゲート（fail-safe・#65 で 3 経路統一・#73 で 2 段化）**: `i` 押下時、まず**クライアント信頼ゲート**（#73・`autofill_client_trusted()`＝`binaries::tools().is_system32`。Windows で System32 OpenSSH を解決できず `[PATH ssh]` フォールバック中なら `ssh -G` を実行せず sticky トーストで退避する。unix は常に信頼＝no-op）を通し、次に共有ゲート **`App::ssh_g_exec_risk()`** が理由を返すなら `ssh -G` を実行せず sticky エラートーストで退避する。判定は接続 autofill・SFTP arm と**同一**（メイン render の `Match exec` → Include 先ファイルの `Match exec` → 追えない include 形式＝`blind_spot`。詳細は [includes.md](./includes.md)）。#43 当初の「`Include` があれば一律退避」（`inspect_block_reason` + `has_include`）は #52 の include 展開で included ファイルを実際に走査できるようになったため置換・削除した。**benign な `config.d/*` 構成ではインスペクタが開く**ようになり、実 `Match exec` や追えない include 形式（ブロック内ネスト・クオート装飾・深さ超）では従来どおり安全側に退避する。`ssh -G` がタイムアウト/非ゼロ/ssh 不在で失敗したときも sticky トーストを出し、インスペクタは開かない（半端な画面を出さない）。解決は開く瞬間に 1 回だけ走らせ（500ms 上限・UI スレッドは tick ごとにブロックしない設計を崩さない）、結果を App に載せてから描画する（`diff` プレビューと同じ「一度計算して載せる」流儀）。
+  - **表示の正直さ（#43 リスク#2）**: `ssh -G` はキーを小文字化し値を正規化しコンパイル時デフォルトも出すため、「書いた値」との単純比較で由来をハイライトすると誤分類する。由来ハイライトはせず、ヘッダで「`ssh -G` 正規化の**近似**」であることを明示する。
+- **ホストのタグ・説明（`# sshm:` コメント経由・#45）**: `~/.ssh/config` のホスト直上コメント（`# sshm:tags prod,db` / `# sshm:desc …`）で付与するメタデータ。データ層の設計は [config.md](./config.md)（`# sshm:` ディレクティブ）。UI 側は次の 4 箇所に閉じる（新 `Screen`・モーダルは増やさない）:
+  - **一覧のタグ表示（採択案＝インライン chips）**: `draw_list_pane`（`ui/list.rs`）の Alias セル（`Line::from(vec![…])`）に、エイリアス名の直後へタグを chip 風に並べる。**専用カラムは増やさない**（到達性列/HostName/User と幅を競合させないため）。色は `theme.rs` のアクセント（ハードコードしない）。`responsive_split` の縦積み（90 桁未満）では幅に応じてタグを省略/折返す。
+    ```
+    ┌─ Hosts ─────────────────────────────────────┐
+    │    Alias                HostName      User   │
+    │  ● web-prod #prod #db   10.0.0.1      me     │
+    │  ● db-replica #db       10.0.0.2      me     │
+    │  ○ staging #staging     10.0.1.9      me     │
+    └──────────────────────────────────────────────┘
+      ●=到達 / ○=未到達。タグはエイリアス直後にアクセント色の #chip。
+    ```
+  - **詳細ペインの説明**: `draw_detail_pane` に「Tags / Description」セクションを Connection の後へ追加（`if !tags.is_empty()` / desc ガード、既存 "Other"（extras）と同じ流儀）。**説明は一覧行ではなく詳細ペインに置く**（#45 決定）。
+  - **編集フォーム**: `FIELD_LABELS`・`form_idx`・`MULTI_FIELDS`（`app.rs`）に **EXTRAS の後ろへ** Tags・Description を追記する（末尾追加で `form_idx` 再採番を避ける）。**Tags = 単一行カンマ区切り（`multi: false`）**、**Description = 単一行（`multi: false`）**。`form_from_view`/`view_from_form` の両変換を更新。`ui/edit.rs` の `section_for` に "Metadata" セクションを追加（フィールドは汎用レンダラが位置で描くため追加描画コードは不要）。
+  - **フィルタ**: `refilter`（`app.rs`）のファジー・ハイスタック `"{patterns} {host_name} {user}"` に `tags.join(" ")` を足すだけ（**専用フィルタは設けず既存 `/` 検索に畳み込む**＝#45 決定）。known_hosts 側の substring フィルタ（`kh_filtered`）とは別系統（挙動を共有しない）。
+  - **ヘルプ**: 汎用フィールド操作キー（Tab/j/k/i/a/d）で足りるため Edit ヘルプは変更不要。List ヘルプにタグが検索対象である旨を 1 行足すのは任意。
+- **マスターパスワード変更・KDF 昇格モーダル（`Screen::VaultRekey`・#44）**: vault 一覧（`Screen::Vault`＝アンロック済みでのみ到達）から開くモーダルオーバーレイ。`VaultUnlock` パターンを踏襲する（フォーム状態は `Screen` に載せず `App::vault_rekey` に持ち、`Drop` で zeroize・`Debug` で redact）。
+  - **導線 2 つ（KDF 昇格モデル B）**: 一覧で `m` → **Change master password**（current/new/confirm の 3 フィールド）。一覧で `u` → **Upgrade vault KDF**（current の 1 フィールド・**`needs_kdf_upgrade()` が真のときだけ有効**）。両者は同じ `Screen::VaultRekey` の 2 モード（`mode: RekeyMode { ChangePassword, UpgradeKdf }`）で、内部はどちらも `os::vault::rekey()` を呼ぶ（KDF 昇格は `new_pw == current`）。
+  - **可視性ヒント**: `needs_kdf_upgrade()` が真のとき、vault 一覧タイトルに ` ·  older KDF (u: upgrade)` を出す（`theme.rs` の色を使う。ハードコードしない。エントリ 0 件の空 vault でも同じ導線を出す）。デフォルト以上の KDF では出さない。
+  - **画面遷移（ASCII ワイヤーフレーム）**:
+
+    ```
+    Screen::Vault  ── m ─▶  Change master password        Screen::Vault ── u(needs_upgrade) ─▶ Upgrade vault KDF
+    ┌─ Change master password ───────────────┐            ┌─ Upgrade vault KDF ─────────────────────┐
+    │  Re-encrypt the vault under a new pw.   │            │  Re-derive with current defaults.       │
+    │  Current   ••••••••                     │            │  Confirm current password to continue.  │
+    │  New       ••••••                       │            │  Current   ••••••••                     │
+    │  Confirm   ••••••                       │            │  Enter upgrade · Esc cancel             │
+    │  Tab move · Enter change · Esc cancel   │            └─────────────────────────────────────────┘
+    └─────────────────────────────────────────┘
+    Enter→verify current→rekey(new)→成功で overlay を閉じ Vault へ／Esc で破棄しスクラブ
+    ```
+
+  - **状態**: 入力中（マスク表示）／検証エラー（不一致・空・現行PW誤り＝sticky トースト、モーダルは開いたまま入力PWをスクラブ）／成功（overlay を閉じ成功トースト）。全離脱経路でフォームをスクラブ（Esc・`L`ロック・アイドル自動ロック・終了）。
+- **公開鍵のリモート配布（鍵マネージャ `D`・#48）**: ホスト一覧で `K` → 鍵マネージャ（`key_host_ctx` あり）で鍵を選び `D`（小文字 `p` は #47 のパスフレーズ変更が先に使っているため、Deploy の頭文字を大文字で採る）。フッター（`KEY_MANAGER_FOOTER`）は 1 行 80 桁の制約（`footers_fit_80_cols`）があるため、キーを 1 つ増やすぶんラベルを詰める（`passphrase`→`passphr`・`copy pub`→`copy`）。全文はヘルプモーダルが持つ。**新しい `Screen` は増やさず**、既存の確認モーダル（`Screen::Confirm`）に配布用アクションを 1 つ足すだけに閉じる。実行は確認後に TUI を suspend してインラインで走る（設計の正は [os.md](./os.md)）。
+  - **導線とガード（`s`＝set IdentityFile と同じ流儀に揃える）**: `key_host_ctx` が無ければ「ホスト経由で開いて」の sticky トースト、`.pub` が無ければ「no public key file」、`.pub` 行が検証に落ちれば「配布を拒否した」トースト——いずれも**確認モーダルを開く前**に弾く（危険な行でコマンドを組み立てない）。Include 由来の read-only ホストでも配布は可能（`~/.ssh/config` を書かずリモートの `authorized_keys` だけを変えるため。`s` の read-only ガードとは対象が違う）。
+  - **確認モーダルのレイアウト比較（採択＝案 B）**:
+
+    ```
+    案 A: 汎用確認モーダルを流用          案 B（採択・実装済み）: 配布内容を明示する専用レイアウト
+    centered(56, 7)                       centered(60, 12)
+    ┌─ Deploy public key ────────────┐    ┌─ Deploy public key ──────────────────────────┐
+    │                                │    │                                              │
+    │  Append this key to web-prod?  │    │  Append this key to the remote ~/.ssh/…?     │
+    │                                │    │                                              │
+    │  y/Enter confirm   n/Esc cancel│    │     Host  web-prod (10.0.0.1)                │
+    └────────────────────────────────┘    │      Key  id_ed25519.pub                     │
+                                          │  Fingerprint  SHA256:Rlb…9kQ                 │
+    行数は最小だが「どの鍵が・どこへ・      │  Comment  me@laptop                          │
+    どの指紋で」入るのかが読めない。        │                                              │
+    リモートを書き換える不可逆操作の        │  y/Enter confirm      n/Esc cancel            │
+    確認としては情報が足りない。            └──────────────────────────────────────────────┘
+    ```
+
+    **案 B を採る**理由: 配布は*リモートの認証情報*を書き換える操作で、取り消しは手作業（リモートで該当行を消す）になる。「どの鍵が・どのホストへ」を指紋つきで見せる方が、鍵を取り違えたまま押す事故を防げる。コメントが allowlist で落ちた場合は `Comment` 行を `— (dropped: unsafe characters)` と出し、**リモートに何が入るかを画面と一致させる**（黙って落とさない）。`kv_line` を使うので新しい widget は増えない。値は `kv_line` の 16 桁ラベル溝を差し引いた幅に収まらなければ末尾を残して省略する（`elide`）ため、フル SHA256 指紋は頭尾を残した省略表示になる。汎用モーダルとの共通枠（枠線・色・`y/n` ヒント行）は `draw_modal` に切り出して共有し、体裁が分岐しないようにした。
+  - **状態**: 確認前（モーダル）／実行中（TUI が suspend され `ssh` の出力・パスワードプロンプトが直接見える）／成功（`deployed to <alias>` 自動失効トースト）／既存（`key already present on <alias>` 自動失効トースト）／失敗（sticky エラートースト。非 POSIX シェルの可能性＝Windows OpenSSH サーバに言及する）。
+  - **触る箇所**: `ConfirmAction::DeployKey`（app.rs・ペイロードは `pending_save` と同じ流儀で `App::pending_deploy` に持つ）・`handle_keys` の `D`（update.rs）・`handle_confirm` の terminal 経路（`OverwriteTransfer` と同じ理由で terminal が要る）・`ui/confirm.rs` の描画分岐・ヘルプ/README のキー一覧。**`ACTION_LABELS`／`action_idx` は触らない**（ホストのアクションメニューには足さない＝#48 決定）。
+- **画面追加の 3 箇所**: `Screen::VaultRekey`（app.rs）・`handle_vault_rekey` dispatch（update.rs）・`draw_rekey`（ui/vault.rs＋ui/mod.rs のディスパッチ）。開くキー `m`/`u` は `handle_vault` に追加。
 - **状態設計**: 空（0 件）・ローディング（到達性 `checking`）・エラー（`Toast`）・成功（自動失効 Toast）を各画面で扱う。
 - **ホスト鍵スキャンモーダル（#46・`Screen::KeyScan` オーバーレイ）**: 導線は ActionMenu の「Scan host key」（明示起動のみ。接続時の「host key not yet trusted」トーストに案内文言を追記するが接続フローには割り込まない＝案A）。状態は `KeyScanModal` の `Scanning`（`scanning <host> …`）→ `Results`（全鍵一括ピン）／`Error`（赤ボーダ表示）で、描画は `ui/keyscan.rs`・状態は `App::keyscan`（`KeyScanUi`）。各行に鍵種・SHA256・分類チップ（`[new]`／`[already trusted]`／`[CHANGED]`／`[REVOKED]`）を出し、randomart は 3 列ずつ並べる。`Changed`／`Revoked` があるときは「**ピン留めは無効**（既存ピンと矛盾）— Known hosts（`H`）で確認せよ」を赤字で添える（上書き操作は置かない）。プロキシ経由ホストはモーダルを開かずトーストで拒否する。`y` が何も追記しなかった場合も理由を Toast で返す（無言で閉じない）。ピン留め可能なときは末尾に `Pins are recorded as <lookup key>` ＋ `  and written to <file>` の **2 行**（`ui::keyscan::pin_destination`）を出す — **追記先ファイルだけでなく「どのホスト名で記録されるか」も示す**のは、`HostKeyAlias` を使う設定では 1 本のピンがその別名を共有する全ホストを覆うため、`host:port` しか見えないと承認の射程を誤解するから（#46 round 13）。**2 行に分けるのは折り返しではなくクリップだから**で、1 行に同居させると長い lookup key がファイル名を右端の外へ押し出し、どちらも読めなくなる（#46 round 14）。**ファイル名を後ろに置く**のは `fit_body` が tail を前から削るためで、書き込み先は不自然な連結先を `y` の前に目視するための情報＝より重要な側だから（#46 round 15・`security.md` の書き込み先残存リスクの緩和）。
 - **モーダルの寸法規律（#46）**: 幅は `modal_size` が端末幅まで切り下げる（`u16::clamp` は下限＞上限で panic するため使わない — 46 桁未満の端末で落ちた）。高さが足りないときは `fit_body` が **randomart から**削り、AC8 の検証文言（末尾固定）は決して切り落とさない。**ただしこの保証は縦方向だけ**で、`Paragraph` は横方向には折り返さず**クリップする** — AC8 文言は 80 桁端末の内寸（78 桁）に収まる長さでなければ末尾を失う（実際に 80 文字版が 2 文字欠けていた＝#46 round 17）。長さはテストで固定する（`keyscan_verify_hint_fits_an_80_col_modal`）。
@@ -59,10 +119,95 @@ updated: 2026-07-29
       KeyScan --> List: y（ピン留め→成功 Toast）
       KeyScan --> List: Esc（変更なし）
   ```
-- **レスポンシブ**: `responsive_split` が `WIDE_MIN_WIDTH`（90 桁）以上で横並び・未満で縦積み。フッターは 80 桁以内で描ける（`footers_fit_80_cols` テスト）。
+- **レスポンシブ**: `responsive_split` が `WIDE_MIN_WIDTH`（90 桁）以上で横並び・未満で縦積み。フッターは 80 桁以内で描ける（`footers_fit_80_cols` テスト）。**ヒントが増える長いフッターは定数化して `ALL_FOOTERS` に列挙し、ガードがまとめて検査する**（#47 のレビュー時、定数 2 つだけを見ていた旧ガードが Key manager 82 桁・Vault 93 桁の超過を見逃していた）。短いフッターは `draw_footer` 内にインラインのままでよいが、ヒントを足して長くなったら定数へ引き上げてガード対象にする。桁が足りない画面は、使用頻度の低いキーをヘルプモーダル側に寄せる。モーダル内の可変長リスト（同期モーダルの対象ホスト等）は件数を丸めて固定高に収める。
 - **配色/コントラスト**: `theme.rs` の Tokyo Night パレットに集約。
+
+### 鍵パスフレーズの追加・変更（#47）
+
+鍵マネージャの `p`（passphrase 追加/変更）は、TUI を退避して `ssh-keygen -p` を対話実行し（現在/新パスフレーズは OpenSSH 自身が聴取）、成功後に vault の陳腐化 Passphrase エントリの一括更新モーダル（`Screen::PassphraseSync`）へ繋ぐ。**vault がロック中はエントリを読めない＝陳腐化の有無すら判定できない**ため、検出を試みる前にアンロックへ迂回し、アンロック成功後に判定をやり直す（`App::passphrase_sync_pending` が再開マーカー）:
+
+```mermaid
+flowchart TD
+    KM[KeyManager] -->|p ＝秘密鍵あり| RUN["TUI 退避 → ssh-keygen -p -f 鍵 を対話実行 → TUI 復帰"]
+    KM -->|p ＝.pub のみ/未選択| W[警告トースト（no-op）]
+    RUN -->|失敗| E[sticky エラートースト]
+    RUN -->|成功| OK["成功トースト（unverified 表示の説明つき）"]
+    OK --> VU{vault の状態}
+    VU -->|vault ファイルなし| END[終了]
+    VU -->|ロック中| UL["VaultUnlock モーダル（Esc でスキップ＝再開マーカーを破棄）"]
+    UL -->|アンロック成功| DET
+    VU -->|アンロック済み| DET{陳腐化エントリを検出}
+    DET -->|なし| END
+    DET -->|あり| BM["一括更新モーダル: 新パスフレーズを 1 回入力（マスク表示）"]
+    BM -->|Enter| UP[該当全ホストの Passphrase エントリを upsert・保存 → 件数トースト]
+    BM -->|Esc（スキップ）| END
+```
+
+生成ウィザードは 4 つ目のフィールドとして「Passphrase」トグル（Type と同じラジオ表現）を持つ:
+
+```
+┌─ Generate key ─────────────────────────────┐
+│ Type:       (•) ed25519    ( ) rsa-4096    │
+│ Filename:   id_ed25519                     │
+│ Comment:    you@host                       │
+│ Passphrase: (•) none       ( ) interactive │  ← #47 で追加
+│  Tab/↑↓ move · Space toggle · Enter · Esc  │
+└────────────────────────────────────────────┘
+```
+
+`interactive` を選ぶと `-N ""`/`-q` を発行せず TUI を退避して実行し、ssh-keygen 自身がパスフレーズを聴取する（sshm は値を持たない）。
+
+保護直後の鍵は詳細ペインの PairStatus が Matched→Unverified に変わる（見かけの回帰）。手当ては二段: ①詳細ペインの Unverified 説明を「パスフレーズ無しでは検証できない（エラーではない）」に拡張（恒久）、②パスフレーズ変更の成功トーストにも同じ趣旨を含める（文脈）。
+### 鍵マネージャの ssh-agent ブロック（#49）
+
+detail ペイン下部に `section_header` で **独立したブロック**を切る。agent 全体状態・サービス状態は**鍵別ではなく全体**の情報なので、鍵別の kv リストには混ぜない（スコープの混在を避ける）。
+
+```
+┌ Keys ──────────────┐┌ Key detail ───────────────┐
+│▶ ● id_ed25519      ││          name  id_ed25519 │
+│    ED25519 256 agent││          type  ED25519    │
+│  ● id_rsa          ││          bits  256        │
+│    RSA 4096        ││   fingerprint  SHA256:Rl… │
+│  ○ work.pub        ││   private key  present    │
+│    ED25519 256     ││          pair  verified … │
+└────────────────────┘│                           │
+                      │ ── ssh-agent ──────────── │
+                      │        status  running (2)│
+                      │       service  running    │
+                      │      this key  loaded     │
+                      └───────────────────────────┘
+```
+
+- **一覧のバッジ**: 既存の `mismatch` バッジと同じ作り（`Span::styled` のテキスト＋`theme` 色）で `agent` を出す。グリフではなくテキストにするのは既存踏襲＋幅計算の安定のため。
+- **行は `widgets::kv_line_colored` で組む**: 値が「判定」を担う行（`pair`・`status`・`service`・`this key`）は色付き、素の行は `kv_line`。両者は同一実装（`kv_line` が委譲）なので、ラベル列（14 桁）の桁揃えが 1 箇所定義になる。
+- **状態設計**（このブロックが空/不明/エラーを集約する）:
+
+  | 状態 | `status` 行 | `this key` 行 |
+  |---|---|---|
+  | プローブ中 | `checking…` | `—` |
+  | agent 稼働・鍵あり | `running (N keys)` | `loaded` / `not loaded` |
+  | agent 稼働・鍵なし | `running (no keys)` | `not loaded` |
+  | agent 未起動 | `not running` | `—` |
+  | `ssh-add` が 0/1/2 以外で終了・起動不可 | `unavailable` | `—` |
+  | fingerprint 不明・pair 不一致の鍵 | （agent 状態は出る） | `unknown` |
+
+  **判定の優先順位**: `this key` は fingerprint 不明／pair 不一致を **agent 状態より先に**見る。したがって「agent 未起動 ＋ fingerprint 不明」は `—` ではなく `unknown` になる（どちらも「分からない」だが、鍵側の理由の方が具体的なため）。
+
+- **サービス行の案内**（Windows のみ・`service` の値で決まる。`status` ではない）:
+  - `stopped or disabled` → `Set-Service -StartupType Automatic` → `Start-Service` の **2 行**（素の Windows は ssh-agent を無効で出荷し、`sc query` は無効も `STOPPED` と報告するため片方だけでは失敗する）。
+  - `status = not running` かつ `service = running` → 昇格の食い違いを疑う 1 行（サービスは動いているのに到達できない典型）。
+  - sshm は起動を代行しない（昇格が要るため）。
+- **非 Windows**: `service` 行を出さない。実装は `#[cfg(windows)]` ではなく **`AgentSnapshot::service: Option<_>` が `None`** になることで抑止する（cfg で囲うと `parse_service_state` のテストが Linux CI で 1 件も走らなくなるため。ランタイム判定の方が単体テスト可能）。
+- **レスポンシブ**: 既存 `responsive_split(area, 45, 55)` をそのまま使う。縦積み（90 桁未満）でも agent ブロックは detail 内の最下部に収まる。
+- **フッターは 80 桁以内**（`footers_fit_80_cols` が門番）。`a load`・`U unload` の 2 つを足すと **87 桁**になり 80 桁端末で末尾のヒントが黙って切れたため、`generate`→`gen`・`copy pub`→`copy` に短縮して 78 桁に収めた。完全なラベルは `?`（ヘルプ画面）が持つ。**フッターは `KEY_MANAGER_FOOTER` 定数に切り出した** — インラインのリテラルのままだと 80 桁ガードの対象外で、この回帰が素通りする。
 
 ## 主要な設計判断（現行の理由）
 
 - **描画と mutation の分離**: `ui/` は状態を変えず、全 mutation を `update.rs`/`app.rs` に集約（Elm 風）。テスト・見通しのため。
 - **色の単一真実源**: 画面ごとの色ハードコードを禁止し `theme.rs` に集約（テーマ一貫性）。
+- **ウィザードのパスフレーズはトグルフィールド案を採択**（#47）: 「生成実行時に毎回確認モーダルを挟む」案と比較し、フォームの一貫性（既存 3 フィールドと同じ巡回操作）とパスフレーズ不要ユーザーにステップを増やさない点で優位のため。
+- **PairStatus の見かけ回帰は説明で吸収**（#47）: パスフレーズ無しで検証できないのは仕様（`derive_public_key` は `-P ""`）であり、状態を偽装せず説明文＋トーストで「エラーではない」ことを伝える。
+- **rekey は VaultUnlock 踏襲のオーバーレイ・2 モード 1 画面（#44）**: 中央モーダル（`open_overlay`/`close_overlay`）とし、`m`（パスワード変更）と `u`（KDF 昇格）を `Screen::VaultRekey` の 2 モードに集約（別 Screen を増やさず dispatch/draw を 1 本化）。KDF 昇格は `needs_kdf_upgrade()` 真のときだけ導線を出し、手動強化 vault にダウングレードを勧めない。フォームを `Screen` に載せないのは `Screen` の `Debug`/`Clone` 導出に平文パスワードを漏らさないため（`VaultUnlock` と同じ規律）。
+- **鍵配布は新画面を作らず確認モーダル 1 アクションに閉じる（#48）**: 入口は鍵マネージャの `D` のみとし、ホストのアクションメニュー（`ACTION_LABELS`）には行を足さない。理由は (1) 既存の `s`（set IdentityFile）と同じ「ホスト文脈つきで鍵マネージャを開く」導線に載るので学習コストが増えない、(2) `ACTION_LABELS`/`action_idx`/`action_idx_aligns_with_labels` とモーダル高さの拡張が要らず、既存テストへ波及しない。発見性はヘルプと README のキー一覧で補う。将来アクションメニュー行が欲しくなったら「そのホスト文脈で鍵マネージャを開く」1 行を足すだけで済む（配布ロジックは共有される）。
+- **インスペクタはベース画面（オーバーレイではない）（#43）**: `ssh -G` 出力は 40 行以上になりやすく、full-height の一覧が読みやすいため、Help/DiffPreview のような中央モーダルではなく `known_hosts` と同じベース画面にした（filterable-list パターンを踏襲＝`kh_search`/`kh_state` と同型の inspect 状態を App に持つ）。画面追加の 3 箇所（`Screen`＝app.rs／dispatch＝update.rs／draw＝ui/mod.rs）を触る一般則に従う。
+- **インスペクタにもクライアント信頼ゲート（#73・案 A＝オートフィルと同基準で退避）**: `open_inspect` は `ssh_g_exec_risk()`（config 内容のリスク）に加え、接続 autofill・SFTP arm と同じ **`autofill_client_trusted()` を独立の前段チェック**として通す。untrusted（`[PATH ssh]`）の `ssh -G` は「見るだけ」でも、ゲートが `dirs::home_dir()` 基準で走査した config と Git/MSYS `ssh` が `%HOME%` 基準で読む config が食い違い、未走査の `Match exec` が実行されうるため（根本原因の詳細は [includes.md](./includes.md)）。代替案「開くが警告」は実行リスクが残り、「乖離検出時のみ退避」は検出漏れの余地が残るため不採用（fail-safe 方針を優先）。System32 OpenSSH の無い環境（Git for Windows のみ）ではインスペクタは使えなくなるが、その環境では既にオートフィルが全面停止し `[PATH ssh]` チップで周知済み。ゲートを `ssh_g_exec_risk()` に**混ぜない**のは、exec-risk の意味（config 内容のリスク）を保ち、接続経路の untrusted nudge（`maybe_untrusted_client_nudge`）との区別を崩さないため（接続・SFTP も trust は exec-risk とは別のチェックとして持つ）。なお **trust チェックが `ssh -G` spawn の前段に立つのはインスペクタと SFTP arm の 2 経路**で、接続経路の trust は arming 判定（`connect_plan`）で消費される — その差と受容理由は [includes.md](./includes.md) が正。
