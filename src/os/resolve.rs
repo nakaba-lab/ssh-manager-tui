@@ -654,6 +654,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // A swallow file's own name embeds a SECOND absolute path, so on Windows it
+    // would contain a drive-letter colon — an illegal filename there (Win32
+    // error 123), which makes the fixture, not the code, fail. The logic under
+    // test is platform-independent and the Windows-representable shapes are
+    // covered by `ambiguity_covers_a_swallow_within_one_spaced_path` and
+    // `ambiguity_ignores_a_sibling_account_directory` below (#46).
+    #[cfg(unix)]
     #[test]
     fn a_swallowing_file_name_makes_the_list_ambiguous() {
         // given — three reported files, the pin in the LAST one, plus a file
@@ -677,18 +684,16 @@ mod tests {
         std::fs::write(&swallow, "").unwrap();
         // then — ambiguous, and the writer must refuse rather than guess
         assert!(known_hosts_paths_are_ambiguous(&list));
-
-        // and the space-bearing Windows home stays UNambiguous: neither word is
-        // a real FILE on its own, so the join is the only reading
-        let win = vec![f("First"), "Last/.ssh/known_hosts".to_string()];
-        assert!(!known_hosts_paths_are_ambiguous(&win));
-        // even when a sibling account DIRECTORY exists — a directory holds no
-        // entries, so it must not disable the feature (#46 round 12)
-        std::fs::create_dir_all(dir.join("First")).unwrap();
-        assert!(!known_hosts_paths_are_ambiguous(&win));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // A swallow file's own name embeds a SECOND absolute path, so on Windows it
+    // would contain a drive-letter colon — an illegal filename there (Win32
+    // error 123), which makes the fixture, not the code, fail. The logic under
+    // test is platform-independent and the Windows-representable shapes are
+    // covered by `ambiguity_covers_a_swallow_within_one_spaced_path` and
+    // `ambiguity_ignores_a_sibling_account_directory` below (#46).
+    #[cfg(unix)]
     #[test]
     fn ambiguity_covers_a_swallow_whose_first_word_is_absent() {
         // given — the run the reader would join starts with a word that does
@@ -714,6 +719,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // A swallow file's own name embeds a SECOND absolute path, so on Windows it
+    // would contain a drive-letter colon — an illegal filename there (Win32
+    // error 123), which makes the fixture, not the code, fail. The logic under
+    // test is platform-independent and the Windows-representable shapes are
+    // covered by `ambiguity_covers_a_swallow_within_one_spaced_path` and
+    // `ambiguity_ignores_a_sibling_account_directory` below (#46).
+    #[cfg(unix)]
     #[test]
     fn ambiguity_covers_a_swallow_of_a_multi_word_path() {
         // given — the genuine pin lives in a path that ITSELF contains a space,
@@ -740,6 +752,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // A swallow file's own name embeds a SECOND absolute path, so on Windows it
+    // would contain a drive-letter colon — an illegal filename there (Win32
+    // error 123), which makes the fixture, not the code, fail. The logic under
+    // test is platform-independent and the Windows-representable shapes are
+    // covered by `ambiguity_covers_a_swallow_within_one_spaced_path` and
+    // `ambiguity_ignores_a_sibling_account_directory` below (#46).
+    #[cfg(unix)]
     #[test]
     fn ambiguity_covers_a_swallow_that_overlaps_the_genuine_path() {
         // given — the same shape as round 13, except the attacker's file
@@ -769,6 +788,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // A swallow file's own name embeds a SECOND absolute path, so on Windows it
+    // would contain a drive-letter colon — an illegal filename there (Win32
+    // error 123), which makes the fixture, not the code, fail. The logic under
+    // test is platform-independent and the Windows-representable shapes are
+    // covered by `ambiguity_covers_a_swallow_within_one_spaced_path` and
+    // `ambiguity_ignores_a_sibling_account_directory` below (#46).
+    #[cfg(unix)]
     #[test]
     fn ambiguity_covers_the_writers_parent_dir_join() {
         // given — two real files, and only the DIRECTORY that the joined name
@@ -788,6 +814,48 @@ mod tests {
         let join = std::path::PathBuf::from(format!("{} {}", f("f1"), f("f2")));
         std::fs::create_dir_all(join.parent().unwrap()).unwrap();
         // then — ambiguous under the writer's predicate too
+        assert!(known_hosts_paths_are_ambiguous(&list));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ambiguity_ignores_a_sibling_account_directory() {
+        // given — the space-bearing Windows home (`C:\Users\First Last\…`), which
+        // `ssh -G` reports as two words, beside a sibling account DIRECTORY
+        let dir = std::env::temp_dir().join(format!("sshm-sibling-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = |n: &str| dir.join(n).to_str().unwrap().to_string();
+        let win = vec![f("First"), "Last/.ssh/known_hosts".to_string()];
+        // when / then — neither word is a real FILE on its own, so the join is
+        // the only reading
+        assert!(!known_hosts_paths_are_ambiguous(&win));
+        // and a sibling DIRECTORY must not change that — a directory holds no
+        // entries, so counting it would disable the feature for every Windows
+        // user whose machine has both `C:\Users\Bob` and `C:\Users\Bob Smith`
+        // (#46 round 12)
+        std::fs::create_dir_all(dir.join("First")).unwrap();
+        assert!(!known_hosts_paths_are_ambiguous(&win));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ambiguity_covers_a_swallow_within_one_spaced_path() {
+        // given — ONE configured path containing two spaces, so `ssh -G` reports
+        // three words and every candidate reading is a sub-run of them. Unlike
+        // the fixtures above, no candidate name embeds a second absolute path,
+        // so this shape is representable on Windows too (#46 round 18).
+        let dir = std::env::temp_dir().join(format!("sshm-spaced-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = |n: &str| dir.join(n).to_str().unwrap().to_string();
+        std::fs::write(dir.join("a b c"), "").unwrap();
+        let list = vec![f("a"), "b".to_string(), "c".to_string()];
+        // both partitions read the whole run as the one path that exists
+        assert!(!known_hosts_paths_are_ambiguous(&list));
+
+        // when — a SHORTER prefix of the run is also a real file, holding pins
+        std::fs::write(dir.join("a b"), "h ssh-ed25519 GENUINE\n").unwrap();
+        // then — ambiguous: greedy coalescing takes the longest run, so our
+        // reading produces `a b c` only and the pins in `a b` go unseen
         assert!(known_hosts_paths_are_ambiguous(&list));
         let _ = std::fs::remove_dir_all(&dir);
     }
