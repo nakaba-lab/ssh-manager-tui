@@ -19,6 +19,7 @@ use crate::config::model::{HostView, parse_sshm_tags};
 use crate::os::connect::{ConnectOverrides, Protocol};
 use crate::os::history::History;
 use crate::os::keys::KeyInfo;
+use crate::os::keyscan::{KeyscanSession, PinClass, ScannedKey};
 use crate::os::known_hosts::{HostSpec, KnownHostEntry};
 use crate::os::liveness::{Liveness, LivenessProbe, ProbeTarget};
 use crate::os::resolve::{ResolvedConfig, has_match_exec};
@@ -198,6 +199,72 @@ pub enum Screen {
         target: String,
         origin: PasswordConfirmOrigin,
     },
+    /// Host-key pre-scan modal (#46): `ssh-keyscan` fingerprints for one host,
+    /// pinned into known_hosts on approval. All state lives in [`App::keyscan`].
+    KeyScan,
+}
+
+/// One scanned key with its classification against the host's existing pins
+/// (#46 AC 4/5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassifiedKey {
+    pub key: ScannedKey,
+    pub class: PinClass,
+}
+
+/// Why a scan result may not be pinned (#46). A scan authenticates nothing —
+/// `ssh-keyscan` never verifies the responder holds the private half — so
+/// pinnability is decided structurally, not from evidence in the result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinBlocked {
+    /// A key contradicts (`Changed`) or is revoked (`Revoked`).
+    Contradicted,
+    /// This host already has a genuine pin. Appending an unauthenticated key
+    /// beside it would silently defeat it: OpenSSH accepts a host key matching
+    /// ANY entry, and an in-path attacker can replay the public pinned key
+    /// while sidecarring its own.
+    AlreadyPinned,
+}
+
+/// Modal state for the host-key scan overlay (#46): spinner → results / error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyScanModal {
+    /// The worker is scanning; the UI shows a spinner and stays responsive.
+    Scanning,
+    /// The scan finished: all offered keys, each classified (#46 AC 4/5).
+    Results {
+        rows: Vec<ClassifiedKey>,
+        /// Why nothing here may be pinned, or `None` when it may.
+        blocked: Option<PinBlocked>,
+    },
+    /// The scan failed (unreachable / timed out): sticky error text (AC6).
+    Error(String),
+}
+
+/// Live state of the host-key scan overlay (#46): the worker session, the
+/// modal state machine, and the scan target resolved once at open.
+pub struct KeyScanUi {
+    pub session: KeyscanSession,
+    pub modal: KeyScanModal,
+    /// Alias of the host being scanned (title / toast).
+    pub alias: String,
+    /// The TOFU lookup key the pins are recorded under (`tofu_lookup_key`
+    /// output), so `is_host_known` finds them on the next connect.
+    pub lookup_key: String,
+    /// The `host:port` target shown in the modal.
+    pub target: String,
+    /// The entries OpenSSH itself matches for `lookup_key` (via `ssh-keygen -F`
+    /// over the files `ssh -G` reported), used to classify the scan result.
+    pub existing: Vec<KnownHostEntry>,
+    /// Where an approved pin is written: the host's effective known_hosts file,
+    /// NOT a hardcoded `~/.ssh/known_hosts` (which would no-op for a custom
+    /// `UserKnownHostsFile` while reporting success).
+    pub pin_target: std::path::PathBuf,
+    /// The known_hosts file lists `ssh -G` reported for this host, kept SEPARATE
+    /// per option (user / global) so the pin can be re-checked through
+    /// OpenSSH's matcher without letting path reconstruction straddle the
+    /// option boundary.
+    pub files: Vec<Vec<String>>,
 }
 
 /// Where a [`Screen::PasswordConfirm`] modal was opened from — determines what its
@@ -949,6 +1016,9 @@ pub struct App {
     // --- dual-pane SFTP browser (None when not browsing) ---
     pub sftp_browser: Option<SftpBrowser>,
 
+    // --- host-key scan modal (#46; None when closed) ---
+    pub keyscan: Option<KeyScanUi>,
+
     // --- S3 keys ---
     pub keys: Vec<KeyInfo>,
     pub keys_state: ListState,
@@ -1081,6 +1151,7 @@ impl App {
             override_form: OverrideForm::default(),
             sftp_form: SftpForm::default(),
             sftp_browser: None,
+            keyscan: None,
             keys,
             keys_state: ListState::default(),
             key_host_ctx: None,

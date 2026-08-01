@@ -49,6 +49,9 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
             // Apply any completed SFTP browse ops so the panes refresh without
             // blocking the draw (no-op when not browsing).
             app.drain_sftp_browser();
+            // Fold completed host-key scans into the scan modal (#46; no-op
+            // while the modal is closed).
+            update::drain_keyscan(app);
             // Pick up a finished ssh-agent probe (no-op when none is in flight),
             // so the key manager's badges settle without blocking the draw.
             app.drain_agent();

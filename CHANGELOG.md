@@ -11,10 +11,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- ホスト鍵の事前スキャン＆ピン留め: アクションメニュー（`o`）の「Scan host key」で接続前に `ssh-keyscan` を実行し、フィンガープリント（SHA256）と randomart を確認したうえで `y` で `known_hosts` に追記できる。初回接続時の TOFU プロンプトが不要になり、保存済み秘密の自動入力ブロックも解消する。**ピン留めできるのはまだピンの無いホストだけ**（スキャンは応答者が本物かを検証しないため、既存のピンの隣に鍵を足すことはしない。鍵の入れ替えが正当な場合は Known hosts 画面〔`H`〕で既存ピンを削除してから再スキャンする）。取得鍵が既存ピンと矛盾する場合（HOST KEY CHANGED）や取り消し済み（`@revoked`）の場合も警告のみで、上書き手段は提供しない。ピン留め先はそのホストに有効な `UserKnownHostsFile` で、モーダルには追記先ファイルと**どのホスト名で記録されるか**（`HostKeyAlias` を使う設定では別名になる）を表示する。なお、`Match exec`／`Match localnetwork` のように**接続のたびに `UserKnownHostsFile` の解決が変わりうる設定**では、スキャン時に見えなかったピンが接続時に読まれる可能性があり、この機能では検出できない — その場合は手動でのピン留めを推奨する（#46）
+
 - 鍵マネージャに ssh-agent パネルを追加: agent の稼働状態と保持鍵数、選択中の鍵が agent にロード済みかの表示、および Windows では ssh-agent サービスの状態を表示する。ロード済みの鍵は一覧に `agent` バッジが付く ([#49](https://github.com/nakaba-lab/ssh-manager-tui/issues/49))
 - 鍵マネージャのキー操作 `a`（agent にロード）/ `U`（agent からアンロード）。パスフレーズ付きの鍵は OpenSSH 自身がターミナルで尋ねる（sshm はパスフレーズを保持しない） ([#49](https://github.com/nakaba-lab/ssh-manager-tui/issues/49))
 
 ### Changed
+
+- ホスト鍵未信頼で自動入力が保留されたときのメッセージが、「Scan host key」でピン留めできることを案内するようになった（#46）
 
 - 鍵マネージャのフッターのラベルを短縮（`generate`→`gen`、`copy pub`→`copy`）。agent の 2 操作を足すと 80 桁端末で末尾のヒントが切れるため。完全な説明は `?` のヘルプ画面にある ([#49](https://github.com/nakaba-lab/ssh-manager-tui/issues/49))
 - 鍵マネージャで `D` を押すと、選択した公開鍵をリモートホストの `~/.ssh/authorized_keys` へ

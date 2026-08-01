@@ -9,6 +9,7 @@ pub mod connect;
 pub mod deploy;
 pub mod history;
 pub mod keys;
+pub mod keyscan;
 pub mod known_hosts;
 pub mod liveness;
 pub mod prefs;

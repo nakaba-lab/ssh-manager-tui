@@ -2,8 +2,8 @@
 title: ui 領域 設計
 area: ui
 status: active
-relatedIssues: [43, 44, 45, 47, 48, 49, 65, 73]
-updated: 2026-07-28
+relatedIssues: [43, 44, 45, 46, 47, 48, 49, 65, 73]
+updated: 2026-07-29
 ---
 
 # ui 領域 設計（`src/ui/` — TUI 描画）
@@ -21,7 +21,7 @@ updated: 2026-07-28
 | `mod.rs` | `draw()` ディスパッチ。固定 3 行フレーム（breadcrumb・body・footer hints）＋モーダル重ね |
 | `theme.rs` | 全色の単一真実源（Tokyo Night）・`selection()`/`border()`/`SELECT_SYMBOL`。色ハードコード禁止 |
 | `widgets.rs` | `panel`/`modal_block`/`footer_hints`/`kv_line`/`section_header`/`input_line`/`responsive_split` |
-| 画面別 | `list`・`edit`・`diff`・`vault`・`sftp`・`keys`・`known_hosts`・`inspect`・`confirm`・`connect_override`・`help` |
+| 画面別 | `list`・`edit`・`diff`・`vault`・`sftp`・`keys`・`known_hosts`・`inspect`・`confirm`・`connect_override`・`help`・`keyscan`（#46 で新規: ホスト鍵スキャンモーダル） |
 
 ## UI/画面設計（TUI）
 
@@ -88,6 +88,37 @@ updated: 2026-07-28
   - **触る箇所**: `ConfirmAction::DeployKey`（app.rs・ペイロードは `pending_save` と同じ流儀で `App::pending_deploy` に持つ）・`handle_keys` の `D`（update.rs）・`handle_confirm` の terminal 経路（`OverwriteTransfer` と同じ理由で terminal が要る）・`ui/confirm.rs` の描画分岐・ヘルプ/README のキー一覧。**`ACTION_LABELS`／`action_idx` は触らない**（ホストのアクションメニューには足さない＝#48 決定）。
 - **画面追加の 3 箇所**: `Screen::VaultRekey`（app.rs）・`handle_vault_rekey` dispatch（update.rs）・`draw_rekey`（ui/vault.rs＋ui/mod.rs のディスパッチ）。開くキー `m`/`u` は `handle_vault` に追加。
 - **状態設計**: 空（0 件）・ローディング（到達性 `checking`）・エラー（`Toast`）・成功（自動失効 Toast）を各画面で扱う。
+- **ホスト鍵スキャンモーダル（#46・`Screen::KeyScan` オーバーレイ）**: 導線は ActionMenu の「Scan host key」（明示起動のみ。接続時の「host key not yet trusted」トーストに案内文言を追記するが接続フローには割り込まない＝案A）。状態は `KeyScanModal` の `Scanning`（`scanning <host> …`）→ `Results`（全鍵一括ピン）／`Error`（赤ボーダ表示）で、描画は `ui/keyscan.rs`・状態は `App::keyscan`（`KeyScanUi`）。各行に鍵種・SHA256・分類チップ（`[new]`／`[already trusted]`／`[CHANGED]`／`[REVOKED]`）を出し、randomart は 3 列ずつ並べる。`Changed`／`Revoked` があるときは「**ピン留めは無効**（既存ピンと矛盾）— Known hosts（`H`）で確認せよ」を赤字で添える（上書き操作は置かない）。プロキシ経由ホストはモーダルを開かずトーストで拒否する。`y` が何も追記しなかった場合も理由を Toast で返す（無言で閉じない）。ピン留め可能なときは末尾に `Pins are recorded as <lookup key>` ＋ `  and written to <file>` の **2 行**（`ui::keyscan::pin_destination`）を出す — **追記先ファイルだけでなく「どのホスト名で記録されるか」も示す**のは、`HostKeyAlias` を使う設定では 1 本のピンがその別名を共有する全ホストを覆うため、`host:port` しか見えないと承認の射程を誤解するから（#46 round 13）。**2 行に分けるのは折り返しではなくクリップだから**で、1 行に同居させると長い lookup key がファイル名を右端の外へ押し出し、どちらも読めなくなる（#46 round 14）。**ファイル名を後ろに置く**のは `fit_body` が tail を前から削るためで、書き込み先は不自然な連結先を `y` の前に目視するための情報＝より重要な側だから（#46 round 15・`security.md` の書き込み先残存リスクの緩和）。
+- **モーダルの寸法規律（#46）**: 幅は `modal_size` が端末幅まで切り下げる（`u16::clamp` は下限＞上限で panic するため使わない — 46 桁未満の端末で落ちた）。高さが足りないときは `fit_body` が **randomart から**削り、AC8 の検証文言（末尾固定）は決して切り落とさない。**ただしこの保証は縦方向だけ**で、`Paragraph` は横方向には折り返さず**クリップする** — AC8 文言は 80 桁端末の内寸（78 桁）に収まる長さでなければ末尾を失う（実際に 80 文字版が 2 文字欠けていた＝#46 round 17）。長さはテストで固定する（`keyscan_verify_hint_fits_an_80_col_modal`）。
+
+  採択ワイヤーフレーム（案1: 全鍵一括ピン。案2 の鍵ごと選択式は、部分ピンだと鍵種ネゴ次第で TOFU が再発しうるため不採用）:
+
+  ```
+  ┌─ Scan host key: web-prod ──────────────────────┐
+  │ host.example.com:22 — 3 keys found             │
+  │                                                │
+  │ ED25519 SHA256:Rlb8…xQ4  +--[ED25519 256]--+   │
+  │                          |   .o+o.. (art)  |   │
+  │ ECDSA   SHA256:aa11…     +--[ECDSA 256]---+    │
+  │ RSA     SHA256:bb22…     +--[RSA 3072]----+    │
+  │                                                │
+  │ Verify against a trusted source before         │
+  │ pinning (server console / provider docs).      │
+  │                                                │
+  │ [y] pin all 3 keys   [Esc] cancel              │
+  └────────────────────────────────────────────────┘
+  ```
+
+  画面遷移（#46 追加分）:
+
+  ```mermaid
+  stateDiagram-v2
+      List --> ActionMenu: Enter/a
+      ActionMenu --> KeyScan: Scan host key
+      KeyScan --> KeyScan: scanning → results/error
+      KeyScan --> List: y（ピン留め→成功 Toast）
+      KeyScan --> List: Esc（変更なし）
+  ```
 - **レスポンシブ**: `responsive_split` が `WIDE_MIN_WIDTH`（90 桁）以上で横並び・未満で縦積み。フッターは 80 桁以内で描ける（`footers_fit_80_cols` テスト）。**ヒントが増える長いフッターは定数化して `ALL_FOOTERS` に列挙し、ガードがまとめて検査する**（#47 のレビュー時、定数 2 つだけを見ていた旧ガードが Key manager 82 桁・Vault 93 桁の超過を見逃していた）。短いフッターは `draw_footer` 内にインラインのままでよいが、ヒントを足して長くなったら定数へ引き上げてガード対象にする。桁が足りない画面は、使用頻度の低いキーをヘルプモーダル側に寄せる。モーダル内の可変長リスト（同期モーダルの対象ホスト等）は件数を丸めて固定高に収める。
 - **配色/コントラスト**: `theme.rs` の Tokyo Night パレットに集約。
 

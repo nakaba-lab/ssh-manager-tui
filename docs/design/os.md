@@ -2,13 +2,11 @@
 title: os 領域 設計
 area: os
 status: active
-relatedIssues: [43, 47, 48, 49, 52, 65]
-updated: 2026-07-28
+relatedIssues: [43, 46, 47, 48, 49, 52, 65]
+updated: 2026-07-29
 ---
 
 # os 領域 設計（`src/os/`）
-
-> status: draft — 初期骨子。実装の現状に合わせて随時確定する。
 
 ## 責務
 
@@ -22,7 +20,8 @@ updated: 2026-07-28
 | `sftp.rs` | `ls -l` 一覧パース ＋ ライブ `SftpSession` browse ワーカー（短命 `sftp -b`・circuit-breaker） |
 | `keys.rs` | `~/.ssh` 再帰探索（最初のヘッダ行のみ sniff）・フィンガープリントで公開/秘密をペアリング・鍵生成（パスフレーズなし/対話）・パスフレーズ変更の引数構築（`change_passphrase_args`） |
 | `deploy.rs`（#48） | 公開鍵のリモート配布（ssh-copy-id 相当）の**純粋部**＝`.pub` 行の検証／リモート sh スニペット組み立て／終了コードの意味づけ。プロセス起動そのものは `update.rs` の既存インライン経路（`suspend_tui`→`run_inline`→`restore_tui`）が担い、本モジュールは I/O を持たない |
-| `known_hosts.rs` | 解析・内容アドレスでの削除（`.old` バックアップ） |
+| `known_hosts.rs` | 解析・内容アドレスでの削除（`.old` バックアップ）・スキャン結果の追記 `append_entries`（CRLF/末尾改行を保存・追記のみ） |
+| `keyscan.rs`（#46） | `ssh-keyscan` によるホスト鍵の事前スキャン。`KeyscanSession`（thread＋`mpsc`・tick drain）で実行し、取得行を `secure_fs` の owner-private 一時ファイル経由で `ssh-keygen -lv -f` に渡してフィンガープリント＋randomart 化。純粋部（`keyscan_args`・`parse_keyscan_output`・`parse_keygen_lv_output`・`pinned_lines`・`classify_key`）はプロセス起動を伴わずテスト可能 |
 | `liveness.rs` | ワーカースレッドプールで TCP 到達性プローブ・`mpsc` 報告・`App::hosts` index キー |
 | `resolve.rs` | `ssh -G` による設定解決。型付き `ResolvedConfig`（vault 自動入力用の抽出サブセット）と、実効設定インスペクタ（#43）向けの `resolve_full`（順序付き `Vec<(String, String)>`＝全 key/value を欠かさず保持）の 2 経路。`run_ssh_g` を「生ダンプ取得」と「型付きパース」に分割 |
 | `agent.rs` | ssh-agent 連携（#49）: `ssh-add -l` の**終了コード**から `AgentStatus` を構築・`sc.exe` のサービス状態パース・`AgentProbe`（単発スレッド＋`mpsc`）・`ssh-add` 引数構築 |
@@ -34,6 +33,27 @@ updated: 2026-07-28
 ## データフロー・主要シーケンス
 
 到達性プローブ: UI スレッドは tick ごとに `App::drain_liveness()` を呼ぶだけ（非ブロック）。プロキシ経由（`is_proxied`）は `Skipped`。
+
+ホスト鍵の事前スキャン（#46・keyscan → ピン留め）:
+
+```mermaid
+sequenceDiagram
+    participant UI as update.rs（open_keyscan）
+    participant W as KeyscanSession ワーカー
+    participant KS as ssh-keyscan
+    participant KG as ssh-keygen -lv
+    participant KH as known_hosts.rs
+    UI->>UI: keyscan_gate（プロキシ経由は拒否）→ resolve_config_with_options で host/port 解決
+    UI->>W: request(host, port)（モーダルは Scanning 状態）
+    W->>KS: spawn（-T 5・-p port。8 秒バジェットの try_wait/kill ループ）
+    KS-->>W: 「host keytype base64」行
+    W->>KG: owner-private 一時ファイル経由でフィンガープリント+randomart
+    KG-->>W: SHA256 + randomart ブロック
+    W-->>UI: drain_keyscan（tick）→ keyscan_apply_event が New/AlreadyTrusted/Changed/Revoked に分類
+    UI->>KH: [y] 承認時のみ append_entries（New のみ・ホストトークンは tofu_lookup_key に正規化）
+```
+
+キーレスポンスは `keyscan_handle_key`（純粋）が決める: `y`＝`New` 鍵だけを追記して閉じる／`Esc`＝どの状態でも無追記で閉じる。`Changed`（HOST KEY CHANGED）は承認しても書き込まれない。
 
 公開鍵配布（#48）は**リモート往復 1 回**で完結する。スニペット組み立て・検証・終了コード解釈という判断はすべて `deploy.rs` の純粋関数に閉じ、副作用（TUI の suspend／`ssh` 起動）は `update.rs` に残す（`config/`・`os/` から ratatui に手を伸ばさない層規律のまま）:
 
@@ -108,6 +128,11 @@ sequenceDiagram
 - **config を接続の真実源に**: 保存済みは `ssh <alias>` で OpenSSH に config を読ませる（ProxyJump/forwards/IdentityFile が自動適用）。
 - **秘密鍵本体を読まない**: 鍵ペアリングは公開フィンガープリント照合のみ。暗号化 PEM は `Unverified`（エラーにしない）。
 - **liveness index キーの脆さ**: ホスト追加/削除で index がずれるため `rebuild_hosts()` が liveness マップをクリアし再プローブ。
+- **keyscan は専用ワーカー（#46）**: keyscan は数秒かかるため UI スレッドで実行しない。`SftpSession::request` 型（thread＋`mpsc`・tick drain・`is_finished` reap）を踏襲する。liveness プールはジョブ型・ホスト index キーが固定で不適合、同期実行は `draw()` をブロックするため不採用。バジェットは二重（keyscan 自身の `-T 5` ＋ 8 秒の wall-clock kill）で、前者が通常経路・後者は wedge した子プロセスの backstop。
+- **ピン留めのホストトークンは `tofu_lookup_key` の出力に書き換え（#46）**: ゲート判定 `is_host_known`（`ssh-keygen -F`）と確実に一致させるため、keyscan の出力行のホスト部を `HostKeyAlias` 優先／非 22 番ポート `[host]:port` の検索キーに正規化して追記する。追記はプレーン形式（ハッシュ化しない）。
+- **分類はホスト照合を OpenSSH に委ねる（#46）**: 既存ピンの取得は `matching_known_entries`（`ssh-keygen -F` を `ssh -G` が報告したファイル集合に対して実行）で行い、ホストトークンの自前比較はしない。**当初はプレーン行のみを自前照合していたが、これはハッシュ化エントリ（`HashKnownHosts yes`＝Debian/Ubuntu 既定）・カスタム `UserKnownHostsFile`・ワイルドカード・大小差をすべて取りこぼし、CHANGED 鍵を `[new]` と表示する fail-open だった**（実 OpenSSH で再現確認済み）。信頼ゲート `is_host_known` と同じ機構・同じファイル集合を使うことが正しさの条件。
+- **既にピンのあるホストには追記しない（#46）**: ピン留めできるのは真正なピンが 1 つも無いホストだけ（`pin_block`）。`ssh-keyscan` は秘密鍵の保有を検証しないため、スキャン結果からは攻撃者と正直なサーバを区別できない — 証拠ベースの判定は成立しない（根拠は `docs/design/security.md`）。
+- **`append_entries` は追記のみ（#46）**: 既存ファイルの CRLF/LF を踏襲し末尾改行を補ったうえで、`O_APPEND` で末尾だけに書く。全文書き換え（temp＋rename）は、読んだ直後のスナップショットを公開して他プロセスの追記を巻き戻すうえ、Windows では delete-before-rename の窓と宛先 ACL の消失を生むため採らない。
 - **パスフレーズ操作は引数ビルダーと実行を分離**（#47）: `change_passphrase_args`／`generate_key_args`（いずれも純粋・`OsString` を返すのでパスを lossy 変換しない）を `keys.rs` に置き、実行は `update.rs` の `run_ssh_keygen_inline`（`suspend_tui` → `run_inline` → `restore_tui` → `describe_exit`）が一手に担う（os 層の ratatui 非依存を維持）。現在/新パスフレーズは **OpenSSH 自身が対話聴取**し、sshm は値を保持も中継もしない（コマンドラインにも載らない）。`generate_key` も同じビルダーを通し、非対話（`-N ""`/`-q`）と対話（両フラグを省く）の差分をビルダー 1 箇所に閉じる。
 - **鍵ユーザーの逆引きは config 射影で行う**（#47）: `hosts_using_key` は純粋関数で、`ssh -G` を全ホスト分 spawn する案は起動遅延と副作用（`Match exec` の再実行）を招くため採らない。**照合規則は接続時オートフィルと一致させる**（非 glob パターン全走査・Windows のパス畳み込み・IdentityFile 未宣言時の既定 identity）＝ずれると陳腐化の取りこぼしになる。詳細は [security.md](./security.md)。
 - **`resolve_full` は型付き経路と生ダンプ取得を共有し、パースだけ分ける（#43）**: `run_ssh_g` の subprocess 実行部（500ms タイムアウト・stdin null・kill-on-timeout・`--` センチネル＋先頭ダッシュ拒否）を生ダンプ取得として括り出し、型付き `parse_ssh_g_output`（抽出サブセット）と `resolve_full` 用の全 key/value パース（順序保持）が同じダンプを読む。インスペクタは「書いた値」との由来比較をせず `ssh -G` の正規化出力をそのまま近似として見せる（キー小文字化・値正規化・コンパイル時デフォルト混入があるため、単純比較は誤分類する＝Issue #43 リスク#2）。ratatui 非依存を維持し、パース分割はヘッドレステスト可能。

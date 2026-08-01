@@ -16,11 +16,11 @@ use ratatui::crossterm::terminal::{
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::app::{
-    App, ConfirmAction, ConnectMode, EditForm, FormMode, GenOrigin, HostRef, ListFocus,
-    PassphraseSyncForm, PasswordConfirmOrigin, PendingSave, PickOrigin, RekeyMode, SFTP_FIELDS,
-    Screen, SftpBrowser, SftpDirection, SftpForm, SftpPane, VaultEntryForm, VaultRekey,
-    VaultUnlock, form_from_view, form_idx, override_form_from_host, override_idx,
-    overrides_from_form, read_local_dir, view_from_form,
+    App, ClassifiedKey, ConfirmAction, ConnectMode, EditForm, FormMode, GenOrigin, HostRef,
+    KeyScanModal, KeyScanUi, ListFocus, PassphraseSyncForm, PasswordConfirmOrigin, PendingSave,
+    PickOrigin, PinBlocked, RekeyMode, SFTP_FIELDS, Screen, SftpBrowser, SftpDirection, SftpForm,
+    SftpPane, VaultEntryForm, VaultRekey, VaultUnlock, form_from_view, form_idx,
+    override_form_from_host, override_idx, overrides_from_form, read_local_dir, view_from_form,
 };
 use crate::config::SshConfig;
 use crate::config::diff;
@@ -39,9 +39,14 @@ use crate::os::keys::{
     GenPassphrase, change_passphrase_args, generate_key, generate_key_args, read_public_key,
     stale_passphrase_hosts,
 };
-use crate::os::known_hosts::remove_entry;
+use crate::os::keyscan::{
+    KeyscanEvent, KeyscanSession, PinClass, ScannedKey, classify_key, pinned_lines,
+};
+use crate::os::known_hosts::{KnownHostEntry, append_entries, remove_entry};
 use crate::os::resolve::{
-    ResolvedConfig, is_host_known, resolve_config_with_options, resolve_full, tofu_lookup_key,
+    ResolvedConfig, has_unresolvable_known_hosts_file, is_host_known, is_none_file_list,
+    known_hosts_paths_are_ambiguous, matching_known_entries, primary_known_hosts_file,
+    resolve_config_with_options, resolve_full, tofu_lookup_key,
 };
 use crate::os::sftp::{SftpOp, SftpSession, remote_join, remote_parent, sftp_quote, stage_batch};
 use crate::os::ssh_dir;
@@ -89,6 +94,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent, terminal: &mut DefaultTerminal) 
         Screen::PasswordConfirm { target, origin, .. } => {
             handle_password_confirm(app, key, target, origin, terminal)?
         }
+        Screen::KeyScan => handle_keyscan(app, key),
     }
     Ok(())
 }
@@ -514,7 +520,7 @@ fn connect_plan(
         // unknown host even for a (local) passphrase: leave the first connect
         // un-armed so the user accepts the key on the TTY, then auto-fill on reconnect.
         return ConnectPlan::Normal(Some(format!(
-            "host key not yet trusted for {alias} — accept it at the prompt, then reconnect to auto-fill the stored secret"
+            "host key not yet trusted for {alias} — pin it via 'Scan host key' (o menu) or accept at the prompt, then reconnect to auto-fill"
         )));
     }
     if kinds.password && !password_confirmed {
@@ -565,6 +571,483 @@ enum PasswordChoice {
     Confirmed,
     /// The modal was declined — withhold the password; passphrase still arms.
     Withheld,
+}
+
+// ---------------------------------------------------------------------------
+// Host-key pre-scan modal (#46) — pure state machine + availability gate.
+// The modal state types live in `app.rs` (drawn by `ui/keyscan.rs`); the
+// mutation-free fold/dispatch logic lives here.
+// ---------------------------------------------------------------------------
+
+/// What a key press in the scan modal does. `Close(lines)` closes the modal
+/// and appends exactly `lines` to known_hosts — an empty vec means the file
+/// is not touched at all (cancel / nothing pinnable).
+#[derive(Debug, PartialEq, Eq)]
+enum KeyScanAction {
+    Stay,
+    Close(Vec<String>),
+}
+
+/// Pure fold of a worker event into the modal state: `Keys` classifies each
+/// scanned key against `existing` (the host's current known_hosts entries)
+/// and moves to `Results`; `Failed` moves to `Error`.
+fn keyscan_apply_event(
+    state: KeyScanModal,
+    event: KeyscanEvent,
+    existing: &[KnownHostEntry],
+) -> KeyScanModal {
+    // One request per open — a late event never downgrades a settled modal.
+    if !matches!(state, KeyScanModal::Scanning) {
+        return state;
+    }
+    match event {
+        KeyscanEvent::Keys(keys) => {
+            let rows: Vec<ClassifiedKey> = keys
+                .into_iter()
+                .map(|key| {
+                    let class = classify_key(&key, existing);
+                    ClassifiedKey { key, class }
+                })
+                .collect();
+            let blocked = pin_block(&rows, existing);
+            KeyScanModal::Results { rows, blocked }
+        }
+        KeyscanEvent::Failed(msg) => KeyScanModal::Error(msg),
+    }
+}
+
+/// Why this scan result may not be pinned, if it may not be.
+///
+/// **A scan authenticates nothing.** `ssh-keyscan` aborts the key exchange
+/// before signature verification, so it never proves the responder holds the
+/// private half — and a host key is public, so an in-path attacker can replay
+/// the genuine key and sidecar its own alongside it. No property of the scan
+/// result can distinguish that from an honest server (#46 final review, proven
+/// end-to-end against a responder holding no private key).
+///
+/// So the only sound rule is structural, not evidential: a host that ALREADY
+/// has a genuine pin gets nothing appended. OpenSSH accepts a host key matching
+/// ANY known_hosts entry, so appending an unauthenticated key next to a real
+/// pin silently defeats it — and OpenSSH itself refuses to auto-add a key when
+/// other types are already known. Pinning is for hosts with no pin yet, where
+/// this is plain TOFU and the out-of-band verification hint is the safeguard.
+fn pin_block(rows: &[ClassifiedKey], existing: &[KnownHostEntry]) -> Option<PinBlocked> {
+    if rows.iter().any(|r| r.class.poisons_result()) {
+        return Some(PinBlocked::Contradicted);
+    }
+    // ANY entry blocks. `matching_known_entries` returns exactly what
+    // `ssh-keygen -F` reports, and every one of those is an entry OpenSSH
+    // honours for this host — a plain pin, a `@cert-authority` delegation, a
+    // `@revoked` line, or a wildcard covering the host. Appending an
+    // unauthenticated key beside any of them widens trust past what the user
+    // decided, because OpenSSH accepts a host key matching ANY entry.
+    //
+    // Earlier rounds carved out narrower rules — marker-free only, then
+    // non-pattern only — and each carve-out turned out to be a bypass. The
+    // marker-free WILDCARD carve-out was the last: with `*.example ssh-ed25519
+    // <genuine>` present, real OpenSSH prints HOST KEY CHANGED for an
+    // attacker's key of another type, and appending that key made it accept
+    // silently (#46 round 8, reproduced end-to-end). The usability argument for
+    // the carve-out — "the trust gate ignores wildcards, so the user must be
+    // able to create the exact pin" — was resting on that false premise.
+    // Materialising a wildcard's key as a per-host pin is a job for the
+    // Known hosts screen, not for a scan that authenticates nothing.
+    let has_decision = !existing.is_empty();
+    has_decision.then_some(PinBlocked::AlreadyPinned)
+}
+
+/// Pure key dispatch for the scan modal:
+/// - `y` in `Results` → `Close` with the normalized entry lines of the `New`
+///   keys ONLY (`AlreadyTrusted` is never re-appended — AC4; `Changed` is a
+///   warning with NO overwrite path — AC5). No `New` keys → `Close(vec![])`.
+/// - `y` in `Results` when ANY row is `Changed`/`Revoked` → `Close(vec![])`:
+///   a contradicted pin means the channel is showing keys that disagree with
+///   what the user already trusted, so the WHOLE result set is suspect. Pinning
+///   a sibling key of another type would defeat the genuine pin outright —
+///   OpenSSH accepts any matching entry, so the attacker's key would be taken
+///   with no HOST KEY CHANGED warning ever printed (#46 review).
+/// - `y` while `Scanning` → `Stay`; `y` in `Error` → `Close(vec![])`.
+/// - `Esc` in ANY state → `Close(vec![])` (known_hosts untouched — AC3).
+fn keyscan_handle_key(state: &KeyScanModal, key: KeyCode, lookup_key: &str) -> KeyScanAction {
+    match (state, key) {
+        (_, KeyCode::Esc) => KeyScanAction::Close(Vec::new()),
+        (KeyScanModal::Results { rows, blocked }, KeyCode::Char('y')) => {
+            // `blocked` is the decision (computed once, from the scan AND the
+            // existing pins); the row re-check is defence in depth for the one
+            // condition visible from the rows alone.
+            if blocked.is_some() || rows.iter().any(|r| r.class.poisons_result()) {
+                return KeyScanAction::Close(Vec::new());
+            }
+            let new_keys: Vec<ScannedKey> = rows
+                .iter()
+                .filter(|r| r.class == PinClass::New)
+                .map(|r| r.key.clone())
+                .collect();
+            KeyScanAction::Close(pinned_lines(&new_keys, lookup_key))
+        }
+        (KeyScanModal::Error(_), KeyCode::Char('y')) => KeyScanAction::Close(Vec::new()),
+        _ => KeyScanAction::Stay,
+    }
+}
+
+/// Reject a lookup key that is not a single literal known_hosts host token
+/// (#46 review). `pinned_lines` writes it verbatim into the host field, so a
+/// wildcard/negation (`*`, `?`, `!`), a comma list, whitespace, a comment
+/// marker or a `@`-marker would pin the scanned key for hosts that were never
+/// scanned — or corrupt the line outright.
+fn keyscan_lookup_key_gate(lookup_key: &str) -> Result<(), String> {
+    let bad = lookup_key.is_empty()
+        || lookup_key.contains(['*', '?', '!', ',', '#', ' ', '\t', '\r', '\n'])
+        || lookup_key.starts_with('@')
+        // `-` could be read as a flag by a future caller that forgets `--`;
+        // `|1|` is the hashed-entry prefix and must never be forged by hand.
+        || lookup_key.starts_with('-')
+        || lookup_key.starts_with('|');
+    if bad {
+        return Err(format!(
+            "refusing to pin under {lookup_key:?} — not a single literal host token"
+        ));
+    }
+    Ok(())
+}
+
+/// The file a pin is written to: the first known-hosts file `ssh -G` reported
+/// for this host, so the pin lands where OpenSSH (and the `is_host_known` gate)
+/// will actually read it. A hardcoded `~/.ssh/known_hosts` silently no-ops for
+/// a host with a custom `UserKnownHostsFile`, and widens trust to every alias
+/// using the default file (#46 review). Falls back to the default path only
+/// when `ssh -G` reported nothing.
+fn keyscan_pin_target(rc: &ResolvedConfig) -> Option<std::path::PathBuf> {
+    // Fall back to the default path ONLY when `ssh -G` reported no user file at
+    // all. A list that resolves to nothing (`UserKnownHostsFile none`) means ssh
+    // reads no user file for this host, so writing to the default would be a
+    // no-op that still reports success — refuse instead (#46 final review).
+    // An empty list means `ssh -G` told us nothing about where ssh reads, so
+    // the default path is a guess that is NOT in the read set `known_hosts_files`
+    // built — a pin there would be invisible to our own checks. Refuse instead.
+    if rc.user_known_hosts_files.is_empty() {
+        return None;
+    }
+    primary_known_hosts_file(&rc.user_known_hosts_files)
+}
+
+/// Availability gate for the scan action (#46 AC7): a `ProxyJump`/
+/// `ProxyCommand` host cannot be meaningfully scanned from here (the direct
+/// TCP path is not the path ssh will take), so return the user-facing
+/// refusal reason instead of scanning.
+fn keyscan_gate(is_proxied: bool) -> Result<(), String> {
+    if is_proxied {
+        return Err(
+            "can't scan through ProxyJump/ProxyCommand — a direct scan would not see \
+             the host ssh actually reaches"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Every precondition the scan must hold, evaluated on a RESOLVED config.
+///
+/// Returns the lookup key and the pin target, or the user-facing reason to
+/// refuse. Kept as one function because `handle_keyscan` re-evaluates the WHOLE
+/// verdict before appending: checking only a few fields let a config that
+/// acquired a `KnownHostsCommand`, a proxy or an unsplittable path DURING the
+/// modal window append anyway (#46 round 12).
+fn keyscan_preconditions(
+    rc: &ResolvedConfig,
+    alias: &str,
+) -> Result<(String, std::path::PathBuf), String> {
+    // `HostView::is_proxied` only sees what the alias's own block declares, so a
+    // proxy inherited from a `Host *` stanza or an `Include` is caught here.
+    keyscan_gate(rc.proxy_jump.is_some() || rc.proxy_command.is_some())?;
+    // Trust from somewhere `ssh-keygen -F` cannot see (`KnownHostsCommand`,
+    // SSHFP, GSSAPI keyex): "no matching entry" would not mean "unpinned", so
+    // appending would sidecar that trust path.
+    if rc.has_external_trust_source {
+        return Err(format!(
+            "can't scan {alias}: its host keys are verified by KnownHostsCommand, DNS (SSHFP) \
+             or GSSAPI key exchange, which this build cannot inspect — pin manually"
+        ));
+    }
+    if rc.known_hosts_list_lossy {
+        return Err(format!(
+            // Describe the CONDITION, not one instance of it: this fires whenever
+            // the splitter cannot round-trip ssh's raw value, which includes a
+            // trailing space and an unmatched leading quote as well as repeated
+            // spaces and tabs. Naming only the latter sends the user hunting for
+            // characters their config does not contain (#46 round 16).
+            "can't scan {alias}: ssh reports a known_hosts path this build cannot split back \
+             into file names without losing bytes (e.g. a repeated space, a tab, a leading or \
+             trailing space, an unmatched quote) — pin manually"
+        ));
+    }
+    let lists = known_hosts_file_lists(rc);
+    // Deciding pinnability needs a COMPLETE picture of the host's pins. An
+    // explicitly-set `GlobalKnownHostsFile` with a `~`/`%` token arrives
+    // unexpanded from `ssh -G`, so a genuine pin could be living there unseen.
+    if has_unresolvable_known_hosts_file(&lists.concat()) {
+        return Err(format!(
+            "can't scan {alias}: ssh reports a known_hosts path this build can't resolve \
+             (unexpanded ~ or %) — pin manually or use an absolute path"
+        ));
+    }
+    // Same principle: if the reported words read equally well as separate paths
+    // or as one space-bearing path, the pins we would see and the file we would
+    // write to are a guess.
+    if lists.iter().any(|l| known_hosts_paths_are_ambiguous(l)) {
+        return Err(format!(
+            "can't scan {alias}: ssh reports its known_hosts files space-separated and \
+             unquoted, and here the words split more than one way — a file on disk matches \
+             a different split than the one we would use, so a real pin could be missed. \
+             Pin manually"
+        ));
+    }
+    let lookup_key =
+        tofu_lookup_key(rc).ok_or_else(|| format!("could not resolve a host name for {alias}"))?;
+    // The lookup key becomes the host field of every appended line, so it must
+    // be a single, literal known_hosts token.
+    keyscan_lookup_key_gate(&lookup_key)?;
+    let pin_target = keyscan_pin_target(rc)
+        .ok_or_else(|| format!("could not resolve a known_hosts file for {alias}"))?;
+    Ok((lookup_key, pin_target))
+}
+
+/// Open the host-key scan overlay (#46): gate proxied hosts, resolve the scan
+/// target on the bounded `ssh -G` runner, seed the existing pins for
+/// classification, and dispatch the scan to the worker session.
+fn open_keyscan(app: &mut App, host_idx: usize) {
+    let Some(host) = app.hosts.get(host_idx) else {
+        return;
+    };
+    if let Err(msg) = keyscan_gate(host.is_proxied()) {
+        app.toast(msg, true);
+        return;
+    }
+    let alias = host.alias().to_string();
+    // NOTE ON `Match exec`: resolving with `ssh -G` evaluates such a predicate,
+    // exactly as any `ssh` invocation to this host would. This action is an
+    // explicit user choice, so that is accepted rather than guarded against.
+    //
+    // Three rounds of review (#46 rounds 9-11) tried to predict it instead, by
+    // reading the config text — the loaded file, then also `~/.ssh/config` and
+    // `/etc/ssh/ssh_config`, then expanding `Include`. Every version was
+    // evaded, because it amounted to reimplementing OpenSSH's parser and
+    // glob(3): `Match !exec`, a non-UTF-8 byte, `Include` with a `[...]` class,
+    // a quoted or `=`-bearing include path, and the Windows system-config
+    // location each slipped through, and the file reading itself opened a DoS
+    // (a fifo include blocks the UI thread forever).
+    //
+    // What actually matters is not "does a predicate exist" but "did the
+    // resolution this scan is based on stay stable" — and that is CHECKED, not
+    // predicted: `handle_keyscan` re-resolves immediately before appending and
+    // refuses if the known_hosts file lists or the pin target moved.
+    let rc = match resolve_config_with_options(&[], &alias) {
+        Ok(rc) => rc,
+        Err(e) => {
+            app.toast(format!("could not resolve {alias}: {e}"), true);
+            return;
+        }
+    };
+    let (lookup_key, pin_target) = match keyscan_preconditions(&rc, &alias) {
+        Ok(pair) => pair,
+        Err(msg) => {
+            app.toast(msg, true);
+            return;
+        }
+    };
+    let hostname = rc.hostname.clone().unwrap_or_else(|| alias.clone());
+    let port = rc.port.clone().unwrap_or_else(|| "22".to_string());
+    let existing = matching_entries_per_option(&lookup_key, &rc);
+    let mut session = KeyscanSession::open();
+    session.request(&hostname, &port);
+    let target = if port == "22" {
+        hostname
+    } else {
+        format!("{hostname}:{port}")
+    };
+    app.keyscan = Some(KeyScanUi {
+        session,
+        modal: KeyScanModal::Scanning,
+        alias,
+        lookup_key,
+        target,
+        existing,
+        pin_target,
+        files: known_hosts_file_lists(&rc),
+    });
+    open_overlay(app, Screen::KeyScan);
+}
+
+/// Key handling for the scan overlay: apply the pure dispatch, then perform
+/// the append (if any) and close. The worker session is dropped on close; an
+/// in-flight scan thread just exits when its send fails.
+fn handle_keyscan(app: &mut App, key: KeyEvent) {
+    let Some(ks) = app.keyscan.as_ref() else {
+        close_overlay(app);
+        return;
+    };
+    let KeyScanAction::Close(lines) = keyscan_handle_key(&ks.modal, key.code, &ks.lookup_key)
+    else {
+        return; // Stay: the modal swallows the key and keeps its state.
+    };
+    // `y` on a result set that pins nothing must still say why, or the modal
+    // just vanishes and the user cannot tell whether anything was written.
+    if lines.is_empty() && key.code == KeyCode::Char('y') {
+        if let KeyScanModal::Results { blocked, .. } = &ks.modal {
+            let msg = match blocked {
+                Some(PinBlocked::Contradicted) => {
+                    "nothing pinned — these keys contradict a pin you already trust"
+                }
+                Some(PinBlocked::AlreadyPinned) => {
+                    "nothing pinned — this host is already pinned; remove it in Known hosts (H) to re-pin"
+                }
+                None => "nothing to pin — every key this host offered is already trusted",
+            };
+            app.toast(msg, true);
+        }
+    } else if !lines.is_empty() {
+        let (alias, target) = (ks.alias.clone(), ks.pin_target.clone());
+        let lookup_key = ks.lookup_key.clone();
+        let ks_files = ks.files.clone();
+        // Re-RESOLVE and re-run the WHOLE precondition verdict, then refuse if
+        // anything moved. A `Match exec` predicate (or any config edit) can make
+        // `ssh -G` answer differently at scan time and at connect time, which
+        // would mean the pins were read from — and the key written to — files
+        // the real connection does not use. Comparing only a few fields let a
+        // config that acquired a `KnownHostsCommand`, a proxy or an
+        // unsplittable path mid-window append anyway (#46 round 12).
+        //
+        // LIMIT: this is two adjacent samples. A resolution that flips OUTSIDE
+        // the modal window — a `Match exec` keyed on time, network or a counter
+        // — is not detected; see docs/design/security.md.
+        let moved = match resolve_config_with_options(&[], &alias) {
+            Ok(fresh_rc) => match keyscan_preconditions(&fresh_rc, &alias) {
+                Ok((fresh_key, fresh_target)) => {
+                    known_hosts_file_lists(&fresh_rc) != ks_files
+                        || fresh_target != target
+                        || fresh_key != lookup_key
+                }
+                // A precondition that now refuses is itself a move.
+                Err(_) => true,
+            },
+            // Could not re-resolve: we cannot confirm the basis still holds.
+            Err(_) => true,
+        };
+        if moved {
+            app.toast(
+                format!(
+                    "nothing pinned — {alias} no longer resolves the way it did when the scan \
+                     started, so the keys may belong to another target"
+                ),
+                true,
+            );
+            app.keyscan = None;
+            close_overlay(app);
+            return;
+        }
+        // Re-read the pins immediately before appending: `ks.existing` is the
+        // snapshot taken when the modal opened, and a pin can appear while it
+        // is open — OpenSSH writes known_hosts BEFORE verifying the signature,
+        // so a TOFU accept in another terminal lands inside the window
+        // (#46 final review). The rows are RE-CLASSIFIED against the fresh
+        // read too, or `Contradicted` would still be judged on the stale
+        // snapshot and a key revoked mid-window would be pinned (#46 round 5).
+        // A window of a few microseconds remains between this read and the
+        // append; closing it entirely would need file locking.
+        let fresh = matching_entries_in_lists(&lookup_key, &ks.files);
+        let rows: Vec<ClassifiedKey> = match &ks.modal {
+            KeyScanModal::Results { rows, .. } => rows
+                .iter()
+                .map(|r| ClassifiedKey {
+                    class: classify_key(&r.key, &fresh),
+                    key: r.key.clone(),
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        if let Some(reason) = pin_block(&rows, &fresh) {
+            let msg = match reason {
+                PinBlocked::Contradicted => {
+                    "nothing pinned — known_hosts changed while the scan was open and now contradicts these keys"
+                }
+                PinBlocked::AlreadyPinned => {
+                    "nothing pinned — this host was pinned while the scan was open"
+                }
+            };
+            app.toast(msg, true);
+            app.keyscan = None;
+            close_overlay(app);
+            return;
+        }
+        match append_entries(&target, &lines) {
+            Ok(()) => {
+                app.reload_known_hosts();
+                // Verify through OpenSSH's own matcher that THE KEYS JUST
+                // WRITTEN are visible — not merely that some pin exists, which
+                // a pre-existing entry would satisfy regardless of where the
+                // write landed (#46 final review). Writing to a file ssh does
+                // not read for this host is the failure this feature keeps
+                // re-learning, and it looks exactly like success from here.
+                // Resolution happens AFTER the write because a first pin's file
+                // does not exist at open time and would drop out of the read set,
+                // producing a false failure (#46 round 5).
+                //
+                // LIMIT (accepted, documented in docs/design/security.md): this
+                // check re-reads through the SAME greedy join that chose the
+                // target, so it cannot detect a target that is itself a bad
+                // guess. When ssh's first known_hosts file does not exist yet
+                // and a regular file named `"<fileA> <fileB>"` was already
+                // planted in its directory, the write lands in that file and
+                // this check confirms it (#46 round 15, reproduced). It is not
+                // an escalation — creating entries in that directory already
+                // lets the attacker create `<fileA>` itself, which OpenSSH
+                // would trust outright — so the claim to fix is the coverage
+                // claim, not the write path.
+                let seen = matching_entries_in_lists(&lookup_key, &ks_files);
+                let visible = lines.iter().all(|line| {
+                    let mut f = line.split_whitespace().skip(1);
+                    let (Some(key_type), Some(key_b64)) = (f.next(), f.next()) else {
+                        return false;
+                    };
+                    seen.iter().any(|e| {
+                        e.marker.is_none()
+                            && !e.is_pattern()
+                            && e.key_type == key_type
+                            && e.key_b64 == key_b64
+                    })
+                });
+                if visible {
+                    app.toast(
+                        format!("pinned {} host key(s) for {alias}", lines.len()),
+                        false,
+                    );
+                } else {
+                    app.toast(
+                        format!(
+                            "wrote {} to {} but ssh does not read it for {alias} — check UserKnownHostsFile",
+                            if lines.len() == 1 { "1 key".into() } else { format!("{} keys", lines.len()) },
+                            target.display()
+                        ),
+                        true,
+                    );
+                }
+            }
+            Err(e) => app.toast(format!("pinning failed: {e}"), true),
+        }
+    }
+    app.keyscan = None;
+    close_overlay(app);
+}
+
+/// Per-tick drain of the host-key scan worker (#46): fold completed events
+/// into the modal state. No-op while no scan overlay is open.
+pub fn drain_keyscan(app: &mut App) {
+    let Some(ks) = app.keyscan.as_mut() else {
+        return;
+    };
+    for event in ks.session.drain() {
+        ks.modal = keyscan_apply_event(ks.modal.clone(), event, &ks.existing);
+    }
 }
 
 /// `t` (new-tab) auto-fill stays OFF until the `wt.exe -w 0` env-inheritance spike
@@ -937,10 +1420,43 @@ fn resolved_target(rc: &ResolvedConfig) -> String {
 }
 
 /// The known_hosts files `ssh -G` reported for a resolved host (user + global).
+///
+/// Each option's list is dropped when it is OpenSSH's `none` sentinel ("read no
+/// file"). The check is per option because OpenSSH's "argument must appear
+/// alone" rule is per option — after merging, `UserKnownHostsFile none` is just
+/// one element of a longer list and the sentinel would go unnoticed, arming the
+/// trust gate off a stray file literally named `none` (#46 round 5).
 fn known_hosts_files(rc: &ResolvedConfig) -> Vec<String> {
-    let mut files = rc.user_known_hosts_files.clone();
-    files.extend(rc.global_known_hosts_files.iter().cloned());
-    files
+    known_hosts_file_lists(rc).concat()
+}
+
+/// The same lists, kept SEPARATE per option.
+///
+/// Path reconstruction coalesces adjacent words by existence, so running it
+/// over the merged list lets a run straddle the user→global boundary: a file
+/// named `"<last user file> <first global file>"` — creatable with write access
+/// to the user's own `.ssh` — swallows the global file and hides the pins in it
+/// (#46 round 9). Resolving each option's list on its own removes that shape.
+fn known_hosts_file_lists(rc: &ResolvedConfig) -> Vec<Vec<String>> {
+    [&rc.user_known_hosts_files, &rc.global_known_hosts_files]
+        .into_iter()
+        .filter(|list| !is_none_file_list(list))
+        .map(|list| list.to_vec())
+        .collect()
+}
+
+/// Entries OpenSSH matches for `lookup_key`, resolving each option's file list
+/// separately (see [`known_hosts_file_lists`]).
+fn matching_entries_per_option(lookup_key: &str, rc: &ResolvedConfig) -> Vec<KnownHostEntry> {
+    matching_entries_in_lists(lookup_key, &known_hosts_file_lists(rc))
+}
+
+/// [`matching_entries_per_option`] over already-separated lists.
+fn matching_entries_in_lists(lookup_key: &str, lists: &[Vec<String>]) -> Vec<KnownHostEntry> {
+    lists
+        .iter()
+        .flat_map(|list| matching_known_entries(lookup_key, list))
+        .collect()
 }
 
 /// One-time-per-session nudge: a host has a stored password but connect-time
@@ -4444,6 +4960,7 @@ fn handle_action_menu(
                         action_idx::SFTP_TRANSFER => open_sftp_transfer(app, host_idx),
                         action_idx::CONNECT_OVERRIDES => open_connect_override(app, host_idx),
                         action_idx::COPY_COMMAND => copy_command(app),
+                        action_idx::SCAN_HOST_KEY => open_keyscan(app, host_idx),
                         action_idx::EDIT => open_edit(app),
                         _ => {}
                     }
@@ -6149,6 +6666,472 @@ mod tests {
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
+    // -----------------------------------------------------------------------
+    // Host-key pre-scan modal (#46)
+    // -----------------------------------------------------------------------
+
+    /// Fixture: a scanned key (presentation fields filled mechanically).
+    fn scanned(key_type: &str, key_b64: &str) -> ScannedKey {
+        ScannedKey {
+            key_type: key_type.to_string(),
+            key_b64: key_b64.to_string(),
+            fingerprint: format!("SHA256:fp-of-{key_b64}"),
+            bits: 256,
+            randomart: Vec::new(),
+        }
+    }
+
+    /// Fixture: parse known_hosts fixture lines into entries.
+    fn kh_entries(lines: &[&str]) -> Vec<KnownHostEntry> {
+        use crate::os::known_hosts::parse_line;
+        lines
+            .iter()
+            .enumerate()
+            .filter_map(|(i, l)| parse_line(l, i))
+            .collect()
+    }
+
+    #[test]
+    fn tofu_nudge_toast_mentions_scan_action() {
+        // given — a trusted client with a vault candidate but no TOFU pin
+        // (the exact gate combination that already yields the nudge toast)
+        let both = MatchedKinds {
+            password: true,
+            passphrase: true,
+        };
+        // when
+        let plan = connect_plan(Some(both), false, true, false, false, false, true, "web1");
+        // then — #46 wires a discoverable path out of the TOFU block: the
+        // nudge must now also point at the ActionMenu "Scan host key" action
+        match plan {
+            ConnectPlan::Normal(Some(msg)) => assert!(
+                msg.to_lowercase().contains("scan"),
+                "the not-yet-trusted nudge should mention the scan action, got: {msg}"
+            ),
+            other => panic!("expected Normal(Some(_)), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn keyscan_apply_event_classifies_results_against_existing_pins() {
+        // given — existing pins (ed25519 + ecdsa) and a 3-key scan result
+        let existing = kh_entries(&[
+            "db.example ssh-ed25519 OLDKEYAAA",
+            "db.example ecdsa-sha2-nistp256 OLDECDSA",
+        ]);
+        let keys = vec![
+            scanned("ssh-ed25519", "OLDKEYAAA"), // same type+b64 → trusted
+            scanned("ecdsa-sha2-nistp256", "EVILECDSA"), // same type, new b64 → CHANGED
+            scanned("ssh-rsa", "BRANDNEW"),      // unpinned type → new
+        ];
+        // when — the worker reports the scan into the Scanning modal
+        let next = keyscan_apply_event(
+            KeyScanModal::Scanning,
+            KeyscanEvent::Keys(keys.clone()),
+            &existing,
+        );
+        // then — Results carries every key, classified (AC1 / AC4 / AC5)
+        match next {
+            KeyScanModal::Results { rows, blocked } => {
+                assert_eq!(rows.len(), 3);
+                assert_eq!(rows[0].class, PinClass::AlreadyTrusted);
+                assert_eq!(rows[1].class, PinClass::Changed);
+                assert_eq!(rows[2].class, PinClass::New);
+                assert_eq!(rows[2].key, keys[2], "keys pass through unmodified");
+                // a contradicted key outranks "already pinned" in the reason
+                assert_eq!(blocked, Some(PinBlocked::Contradicted));
+            }
+            other => panic!("expected Results, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn keyscan_appends_nothing_to_an_already_pinned_host() {
+        // given — a genuine ed25519 pin. An in-path attacker cannot be told
+        // apart from the real host by ANY property of a scan: `ssh-keyscan`
+        // aborts the KEX before signature verification, so it never proves the
+        // responder holds the private half — and the pinned key is public, so
+        // the attacker can simply replay it and sidecar its own key.
+        let existing = kh_entries(&["db.example ssh-ed25519 AAAAGENUINE"]);
+        let attacks = [
+            // withhold the pinned type entirely (no row can be `Changed`)
+            vec![scanned("ssh-rsa", "AAAAEVILRSA")],
+            // replay the genuine public key, sidecar an attacker key
+            vec![
+                scanned("ssh-ed25519", "AAAAGENUINE"),
+                scanned("ssh-rsa", "AAAAEVILRSA"),
+            ],
+        ];
+        for keys in attacks {
+            // when
+            let next =
+                keyscan_apply_event(KeyScanModal::Scanning, KeyscanEvent::Keys(keys), &existing);
+            let KeyScanModal::Results { blocked, .. } = &next else {
+                panic!("expected Results, got {next:?}");
+            };
+            // then — pinning is refused structurally, not on evidence
+            assert_eq!(*blocked, Some(PinBlocked::AlreadyPinned));
+            // and `y` appends NOTHING: a second trusted type would be accepted
+            // by OpenSSH with no HOST KEY CHANGED warning
+            assert_eq!(
+                keyscan_handle_key(&next, KeyCode::Char('y'), "db.example"),
+                KeyScanAction::Close(vec![])
+            );
+        }
+    }
+
+    #[test]
+    fn keyscan_appends_nothing_beside_a_marker_free_wildcard() {
+        // given — a marker-free wildcard holding the host's genuine key. This
+        // IS a trust decision OpenSSH honours: with it present, a real client
+        // prints HOST KEY CHANGED for an attacker's key of another type and
+        // refuses. Appending that key made OpenSSH accept it silently, so the
+        // earlier "wildcards don't count" carve-out was a bypass (#46 round 8,
+        // reproduced end-to-end).
+        let existing = kh_entries(&["*.example ssh-ed25519 GENUINE"]);
+        // when — an in-path responder replays the genuine key and sidecars its own
+        let next = keyscan_apply_event(
+            KeyScanModal::Scanning,
+            KeyscanEvent::Keys(vec![
+                scanned("ssh-ed25519", "GENUINE"),
+                scanned("ecdsa-sha2-nistp256", "EVIL"),
+            ]),
+            &existing,
+        );
+        // then — the wildcard's key reads as trusted (OpenSSH does trust it),
+        // and NOTHING may be appended
+        let KeyScanModal::Results { rows, blocked } = &next else {
+            panic!("expected Results, got {next:?}");
+        };
+        assert_eq!(rows[0].class, PinClass::AlreadyTrusted);
+        assert_eq!(rows[1].class, PinClass::New);
+        assert_eq!(*blocked, Some(PinBlocked::AlreadyPinned));
+        assert_eq!(
+            keyscan_handle_key(&next, KeyCode::Char('y'), "db.example"),
+            KeyScanAction::Close(vec![])
+        );
+    }
+
+    #[test]
+    fn keyscan_appends_nothing_beside_a_marker_entry() {
+        // given — the host has no plain pin, but the administrator HAS made a
+        // trust decision about it: a CA delegation, or a revocation.
+        for line in [
+            "@cert-authority db.example ssh-rsa CAKEY",
+            "@revoked db.example ssh-rsa OLDEVIL",
+            // WILDCARD markers count too — `@cert-authority *.example` is the
+            // form people actually write, and OpenSSH honours it for this host
+            // (#46 round 7). Only a marker-FREE wildcard is excused.
+            "@cert-authority *.example ssh-rsa CAKEY",
+            "@revoked *.example ssh-rsa OLDEVIL",
+        ] {
+            let existing = kh_entries(&[line]);
+            // when — the scan returns an unrelated key, so no row is Revoked
+            let next = keyscan_apply_event(
+                KeyScanModal::Scanning,
+                KeyscanEvent::Keys(vec![scanned("ecdsa-sha2-nistp256", "FRESH")]),
+                &existing,
+            );
+            let KeyScanModal::Results { rows, blocked } = &next else {
+                panic!("expected Results, got {next:?}");
+            };
+            assert_eq!(rows[0].class, PinClass::New, "{line}");
+            // then — pinning is refused. Dropping a raw key beside a CA
+            // delegation bypasses the CA's revocation control the same way a
+            // sidecar key bypasses a pin; beside a revocation it quietly works
+            // around a distrust the administrator declared (#46 round 6).
+            assert_eq!(*blocked, Some(PinBlocked::AlreadyPinned), "{line}");
+            assert_eq!(
+                keyscan_handle_key(&next, KeyCode::Char('y'), "db.example"),
+                KeyScanAction::Close(vec![]),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn keyscan_wildcard_entry_with_a_different_key_reads_as_changed() {
+        // given — a wildcard entry whose key differs from what the host offers.
+        // `ssh-keygen -F` only returns entries OpenSSH honours for this host, so
+        // this really is a key OpenSSH would reject: reporting it as `New` would
+        // be dishonest (#46 round 8).
+        let existing = kh_entries(&["*.example ssh-ed25519 REALKEY"]);
+        // when
+        let next = keyscan_apply_event(
+            KeyScanModal::Scanning,
+            KeyscanEvent::Keys(vec![scanned("ssh-ed25519", "OTHERKEY")]),
+            &existing,
+        );
+        // then — CHANGED, and the contradiction outranks "already pinned"
+        let KeyScanModal::Results { rows, blocked } = &next else {
+            panic!("expected Results, got {next:?}");
+        };
+        assert_eq!(rows[0].class, PinClass::Changed);
+        assert_eq!(*blocked, Some(PinBlocked::Contradicted));
+    }
+
+    #[test]
+    fn keyscan_still_pins_a_host_with_no_entry_at_all() {
+        // given — nothing matches this host: the feature must not be dead
+        let next = keyscan_apply_event(
+            KeyScanModal::Scanning,
+            KeyscanEvent::Keys(vec![scanned("ssh-ed25519", "FRESH")]),
+            &[],
+        );
+        // when / then — plain TOFU, pinnable
+        let KeyScanModal::Results { rows, blocked } = &next else {
+            panic!("expected Results, got {next:?}");
+        };
+        assert_eq!(rows[0].class, PinClass::New);
+        assert_eq!(*blocked, None);
+        assert_eq!(
+            keyscan_handle_key(&next, KeyCode::Char('y'), "db.example"),
+            KeyScanAction::Close(vec!["db.example ssh-ed25519 FRESH".to_string()])
+        );
+    }
+
+    #[test]
+    fn keyscan_apply_event_failure_becomes_error_state() {
+        // given — a scan in progress
+        // when — the worker reports an unreachable host / timeout (AC6)
+        let next = keyscan_apply_event(
+            KeyScanModal::Scanning,
+            KeyscanEvent::Failed("connection timed out".into()),
+            &[],
+        );
+        // then — the modal shows the error; no known_hosts write can follow
+        assert_eq!(next, KeyScanModal::Error("connection timed out".into()));
+    }
+
+    #[test]
+    fn keyscan_y_pins_only_new_keys_with_normalized_host_token() {
+        // given — an UNcontradicted result: one key already trusted, one new.
+        // (A `Changed` row would poison the whole set — see
+        // `keyscan_y_pins_nothing_when_any_key_contradicts_an_existing_pin`.)
+        let rows = vec![
+            ClassifiedKey {
+                key: scanned("ssh-ed25519", "OLDKEYAAA"),
+                class: PinClass::AlreadyTrusted,
+            },
+            ClassifiedKey {
+                key: scanned("ssh-rsa", "BRANDNEW"),
+                class: PinClass::New,
+            },
+        ];
+        let state = KeyScanModal::Results {
+            rows: rows.clone(),
+            blocked: None,
+        };
+        // when — the user approves with `y`
+        let action = keyscan_handle_key(&state, KeyCode::Char('y'), "[db.example]:2222");
+        // then — ONLY the New key is appended (AC4: no duplicate append),
+        // host token = the TOFU lookup key (AC2)
+        assert_eq!(
+            action,
+            KeyScanAction::Close(vec!["[db.example]:2222 ssh-rsa BRANDNEW".to_string()])
+        );
+
+        // given — results with nothing pinnable (everything already trusted)
+        let no_new = KeyScanModal::Results {
+            rows: rows[..1].to_vec(),
+            blocked: None,
+        };
+        // when / then — y closes WITHOUT touching known_hosts
+        assert_eq!(
+            keyscan_handle_key(&no_new, KeyCode::Char('y'), "[db.example]:2222"),
+            KeyScanAction::Close(vec![])
+        );
+    }
+
+    #[test]
+    fn keyscan_y_pins_nothing_when_any_key_contradicts_an_existing_pin() {
+        // given — an in-path attacker answers with its own key of a type that
+        // is already pinned (CHANGED) PLUS a key of an unpinned type (new)
+        let poisoned = KeyScanModal::Results {
+            blocked: None,
+            rows: vec![
+                ClassifiedKey {
+                    key: scanned("ecdsa-sha2-nistp256", "EVILECDSA"),
+                    class: PinClass::Changed,
+                },
+                ClassifiedKey {
+                    key: scanned("ssh-ed25519", "EVILED25519"),
+                    class: PinClass::New,
+                },
+            ],
+        };
+        // when — the user presses y
+        let action = keyscan_handle_key(&poisoned, KeyCode::Char('y'), "db1");
+        // then — NOTHING is appended. Pinning the sibling key would defeat the
+        // genuine pin outright: OpenSSH accepts any matching entry, so the
+        // attacker's ed25519 key would be taken with no CHANGED warning ever
+        // shown, and the TOFU gate would arm auto-fill for it (#46 review).
+        assert_eq!(action, KeyScanAction::Close(vec![]));
+
+        // given — the same shape with a @revoked match instead of CHANGED
+        let revoked = KeyScanModal::Results {
+            blocked: None,
+            rows: vec![
+                ClassifiedKey {
+                    key: scanned("ssh-ed25519", "REVOKEDKEY"),
+                    class: PinClass::Revoked,
+                },
+                ClassifiedKey {
+                    key: scanned("ssh-rsa", "SIDECARKEY"),
+                    class: PinClass::New,
+                },
+            ],
+        };
+        // when / then — a key the user explicitly revoked poisons the set too
+        assert_eq!(
+            keyscan_handle_key(&revoked, KeyCode::Char('y'), "db1"),
+            KeyScanAction::Close(vec![])
+        );
+    }
+
+    #[test]
+    fn keyscan_esc_closes_without_touching_known_hosts() {
+        // given — every modal state, including results WITH pinnable keys
+        let states = [
+            KeyScanModal::Scanning,
+            KeyScanModal::Results {
+                blocked: None,
+                rows: vec![ClassifiedKey {
+                    key: scanned("ssh-ed25519", "BRANDNEW"),
+                    class: PinClass::New,
+                }],
+            },
+            KeyScanModal::Error("boom".into()),
+        ];
+        for state in states {
+            // when — the user cancels with Esc
+            let action = keyscan_handle_key(&state, KeyCode::Esc, "db.example");
+            // then — close with an empty append set = known_hosts untouched (AC3)
+            assert_eq!(action, KeyScanAction::Close(vec![]), "state {state:?}");
+        }
+    }
+
+    #[test]
+    fn keyscan_y_outside_results_never_pins() {
+        // given — a scan still running
+        // when / then — y is ignored while Scanning (nothing to approve yet)
+        assert_eq!(
+            keyscan_handle_key(&KeyScanModal::Scanning, KeyCode::Char('y'), "h"),
+            KeyScanAction::Stay
+        );
+        // given — a failed scan (AC6)
+        // when / then — y merely dismisses; it must never append anything
+        assert_eq!(
+            keyscan_handle_key(
+                &KeyScanModal::Error("timed out".into()),
+                KeyCode::Char('y'),
+                "h"
+            ),
+            KeyScanAction::Close(vec![])
+        );
+    }
+
+    #[test]
+    fn known_hosts_file_lists_stay_separate_per_option() {
+        // given — the default shapes of both options
+        let rc = ResolvedConfig {
+            user_known_hosts_files: vec![
+                "/h/.ssh/known_hosts".into(),
+                "/h/.ssh/known_hosts2".into(),
+            ],
+            global_known_hosts_files: vec![
+                "/etc/ssh/ssh_known_hosts".into(),
+                "/etc/ssh/ssh_known_hosts2".into(),
+            ],
+            ..Default::default()
+        };
+        // when / then — kept apart, so path reconstruction (which joins
+        // adjacent words by existence) can never straddle the boundary: a file
+        // named "<last user file> <first global file>" would otherwise swallow
+        // the global file and hide the pins in it (#46 round 9)
+        let lists = known_hosts_file_lists(&rc);
+        assert_eq!(lists.len(), 2);
+        assert_eq!(lists[0].len(), 2);
+        assert_eq!(lists[1][0], "/etc/ssh/ssh_known_hosts");
+        // and the flattened view still matches the old merged order
+        assert_eq!(known_hosts_files(&rc), lists.concat());
+    }
+
+    #[test]
+    fn known_hosts_files_drops_the_none_sentinel_per_option() {
+        // given — `UserKnownHostsFile none` with the default global files, as
+        // real `ssh -G` reports it
+        let rc = ResolvedConfig {
+            user_known_hosts_files: vec!["none".to_string()],
+            global_known_hosts_files: vec![
+                "/etc/ssh/ssh_known_hosts".to_string(),
+                "/etc/ssh/ssh_known_hosts2".to_string(),
+            ],
+            ..Default::default()
+        };
+        // when / then — the user list is dropped, the global list survives. The
+        // sentinel must not reach the reader: a stray file literally named
+        // `none` in the CWD would otherwise arm the vault trust gate (#46 r5).
+        assert_eq!(
+            known_hosts_files(&rc),
+            vec![
+                "/etc/ssh/ssh_known_hosts".to_string(),
+                "/etc/ssh/ssh_known_hosts2".to_string()
+            ]
+        );
+
+        // given — the mirror case on the global option
+        let rc = ResolvedConfig {
+            user_known_hosts_files: vec!["/home/me/.ssh/known_hosts".to_string()],
+            global_known_hosts_files: vec!["none".to_string()],
+            ..Default::default()
+        };
+        // when / then
+        assert_eq!(
+            known_hosts_files(&rc),
+            vec!["/home/me/.ssh/known_hosts".to_string()]
+        );
+
+        // given — a path component named `none` inside a space-bearing path
+        // (pre-split by `ssh -G`): NOT the sentinel, must survive intact
+        let rc = ResolvedConfig {
+            user_known_hosts_files: vec![
+                "/home/me/my".to_string(),
+                "none".to_string(),
+                "dir/known_hosts".to_string(),
+            ],
+            ..Default::default()
+        };
+        // when / then
+        assert_eq!(known_hosts_files(&rc).len(), 3);
+    }
+
+    #[test]
+    fn keyscan_lookup_key_gate_rejects_non_literal_tokens() {
+        // given / when / then — ordinary keys pass
+        for good in ["web1.example.com", "[db.example.com]:2222", "web1ka"] {
+            assert!(keyscan_lookup_key_gate(good).is_ok(), "{good}");
+        }
+        // given / when / then — anything that would widen or corrupt the pin is
+        // refused: the key is written verbatim into the host field (#46 review)
+        for bad in [
+            "*.example.com",
+            "web?.example",
+            "!web1",
+            "web1,web2",
+            "web1 web2",
+            "@revoked",
+            "web1#c",
+            "",
+        ] {
+            let err = keyscan_lookup_key_gate(bad).unwrap_err();
+            assert!(
+                err.contains("refusing to pin"),
+                "expected refusal for {bad:?}, got {err}"
+            );
+        }
+    }
+
     // --- Issue #47: gen wizard passphrase field + change-passphrase (`p`) ---
 
     fn plain_key(code: KeyCode) -> KeyEvent {
@@ -6277,6 +7260,20 @@ mod tests {
         }
     }
 
+    #[test]
+    fn keyscan_gate_blocks_proxied_hosts() {
+        // given / when — a directly-reachable host
+        // then — scanning is available
+        assert!(keyscan_gate(false).is_ok());
+
+        // given / when — a ProxyJump/ProxyCommand host (AC7)
+        let msg = keyscan_gate(true).unwrap_err();
+        // then — refused with a user-facing reason naming the proxy cause
+        assert!(
+            msg.to_lowercase().contains("proxy"),
+            "refusal should explain the proxied-host cause, got: {msg}"
+        );
+    }
     /// plan_passphrase_sync — Passphrase エントリだけを対象にし note を保存する
     #[test]
     fn plan_passphrase_sync_targets_only_passphrase_entries() {

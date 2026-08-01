@@ -10,7 +10,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use super::binaries::tools;
-use super::known_hosts::{HostSpec, parse_line};
+use super::known_hosts::{KnownHostEntry, parse_line};
 
 /// The effective connection identity for an alias, parsed from `ssh -G`.
 /// `ssh -G` lowercases keys and leaves IdentityFile `~`/`%`-tokens UNexpanded.
@@ -25,6 +25,28 @@ pub struct ResolvedConfig {
     pub proxy_command: Option<String>,
     pub user_known_hosts_files: Vec<String>,
     pub global_known_hosts_files: Vec<String>,
+    /// True when the host's trust decisions come from a source this code cannot
+    /// read: `KnownHostsCommand` (OpenSSH ≥ 8.5 — supplies known-hosts lines
+    /// from a program, honoured for host-key verification) or
+    /// `VerifyHostKeyDNS yes` (a DNSSEC-signed SSHFP authenticates the host
+    /// without any known_hosts entry).
+    ///
+    /// `ssh-keygen -F` sees neither, so the keyscan writer would believe an
+    /// established host is unpinned and append beside that trust path — proven
+    /// end-to-end for `KnownHostsCommand` (#46 round 8). It refuses instead.
+    pub has_external_trust_source: bool,
+    /// True when a known-hosts file list could NOT be split back into paths
+    /// without losing information: the raw `ssh -G` value contained a run of
+    /// two-or-more whitespace characters, or a tab.
+    ///
+    /// `ssh -G` prints the list separated by exactly one space and does NOT
+    /// collapse whitespace inside a path (verified against OpenSSH 9.6p1), so a
+    /// longer run is content — but [`split_quoted_paths`] splits on any
+    /// whitespace and drops empties, which discards where the boundaries were.
+    /// Readers merely lose entries (fail-safe); the keyscan writer would pick a
+    /// wrong file while believing it had the whole picture, so it refuses to
+    /// scan when this is set (#46 round 6).
+    pub known_hosts_list_lossy: bool,
 }
 
 /// Split a possibly-quoted space-separated path list (as `ssh -G` emits for
@@ -62,6 +84,24 @@ fn split_quoted_paths(s: &str) -> Vec<String> {
     out
 }
 
+/// True when [`split_quoted_paths`] would discard information about where the
+/// path boundaries were.
+///
+/// `ssh -G` separates entries with exactly ONE space and preserves whitespace
+/// inside a path, so the split is lossless exactly when re-joining the pieces
+/// with single spaces reproduces the value byte for byte. Asking the splitter
+/// itself is the point: a hand-written scanner is a SECOND model of the split,
+/// and the two disagreed — the previous one exempted quoted segments (which
+/// `split_quoted_paths` only honours at the start of a token) and ran on a
+/// trimmed value, so a stray `"` or a trailing run slipped past it while the
+/// splitter still mangled the path (#46 round 7).
+///
+/// Must be given the RAW value: leading and trailing runs are as unrecoverable
+/// as interior ones.
+fn splitting_loses_information(raw: &str) -> bool {
+    split_quoted_paths(raw).join(" ") != raw
+}
+
 fn strip_one_quote(s: &str) -> String {
     let t = s.trim();
     if t.len() >= 2 && t.starts_with('"') && t.ends_with('"') {
@@ -77,11 +117,20 @@ fn strip_one_quote(s: &str) -> String {
 pub fn parse_ssh_g_output(dump: &str) -> ResolvedConfig {
     let mut rc = ResolvedConfig::default();
     for line in dump.lines() {
-        let line = line.trim();
+        // Trailing whitespace is NOT trimmed here: a known-hosts path may end
+        // in a space or tab, and that byte is exactly what decides whether the
+        // list can be split back into paths (#46 round 7). Only a CRLF's `\r`
+        // is dropped, since it is never part of a value.
+        let line = line.trim_start().trim_end_matches('\r');
         let Some((key, val)) = line.split_once(char::is_whitespace) else {
             continue;
         };
-        let val = val.trim();
+        // `raw` is the value with NOTHING trimmed — `split_once` consumed
+        // exactly the one separator space `ssh -G` emits, so any whitespace
+        // still attached belongs to a path. `val` is the trimmed form every
+        // other option wants.
+        let raw = val;
+        let val = raw.trim();
         if val.is_empty() {
             continue;
         }
@@ -97,8 +146,39 @@ pub fn parse_ssh_g_output(dump: &str) -> ResolvedConfig {
             "proxycommand" if !val.eq_ignore_ascii_case("none") => {
                 rc.proxy_command = Some(val.to_string())
             }
-            "userknownhostsfile" => rc.user_known_hosts_files = split_quoted_paths(val),
-            "globalknownhostsfile" => rc.global_known_hosts_files = split_quoted_paths(val),
+            // `ssh -G` omits `knownhostscommand` entirely both when unset and
+            // when explicitly set to `none` (verified against OpenSSH 9.6p1),
+            // so the `none` arm below is belt-and-braces for other builds. The
+            // unreached branch is the EXEMPTION, so a wrong guess here fails
+            // safe: an unexpected value is treated as a live external trust
+            // source and the scan is refused.
+            "knownhostscommand" if !val.eq_ignore_ascii_case("none") => {
+                rc.has_external_trust_source = true;
+            }
+            // `ssh -G` renders this through OpenSSH's multistate table, which
+            // prints `true`/`false`/`ask` — never the `yes`/`no` the config
+            // uses. Matching only `yes` made this arm dead code (#46 round 9).
+            // `ask` is deliberately NOT flagged: with it, trust does not exist
+            // without user interaction and the accepted key lands in
+            // known_hosts, so "no matching entry" really does mean "not trusted".
+            "verifyhostkeydns" if matches!(val, "true" | "yes") => {
+                rc.has_external_trust_source = true;
+            }
+            // Kerberos-authenticated key exchange (the Debian/Ubuntu GSSAPI
+            // patch): the server is authenticated without any host key, so a
+            // host in daily use legitimately has no known_hosts entry and a pin
+            // would create a host-key fallback that did not exist before.
+            "gssapikeyexchange" if matches!(val, "true" | "yes") => {
+                rc.has_external_trust_source = true;
+            }
+            "userknownhostsfile" => {
+                rc.known_hosts_list_lossy |= splitting_loses_information(raw);
+                rc.user_known_hosts_files = split_quoted_paths(raw);
+            }
+            "globalknownhostsfile" => {
+                rc.known_hosts_list_lossy |= splitting_loses_information(raw);
+                rc.global_known_hosts_files = split_quoted_paths(raw);
+            }
             _ => {}
         }
     }
@@ -234,7 +314,10 @@ pub fn has_match_exec(config_text: &str) -> bool {
         {
             continue;
         }
-        if words.any(|w| w.eq_ignore_ascii_case("exec")) {
+        // A leading `!` NEGATES a criterion but still evaluates it — OpenSSH
+        // runs `Match !exec "cmd"` just as it runs `Match exec "cmd"` (verified).
+        // Comparing the undecorated word missed it entirely (#46 round 10).
+        if words.any(|w| w.trim_start_matches('!').eq_ignore_ascii_case("exec")) {
             return true;
         }
     }
@@ -262,6 +345,161 @@ pub fn tofu_lookup_key(rc: &ResolvedConfig) -> Option<String> {
 /// `ssh-keygen -F`, so hashed entries (`HashKnownHosts yes`, the Debian/Ubuntu
 /// default) match too. A `@revoked` / `@cert-authority` / wildcard / negation
 /// match does NOT count — auto-fill must only arm for a host the user pinned.
+/// Every `known_hosts` entry OpenSSH itself matches for `lookup_key` across
+/// `files`, markers included, via `ssh-keygen -F`. Delegating the match to
+/// OpenSSH is the point: hashed lines (`HashKnownHosts yes`), wildcard
+/// patterns and case-insensitive hostname comparison are all handled by the
+/// same matcher the connection will use, which hand-rolled token comparison
+/// gets wrong (#46 review). Callers classify on the returned `key_type` /
+/// `key_b64` / `marker`, never on the host field — the returned entries are
+/// UNFILTERED, so a caller that needs "is this a genuine pin" must apply the
+/// marker / [`KnownHostEntry::is_pattern`] checks itself (as [`is_host_known`]
+/// does).
+pub fn matching_known_entries(lookup_key: &str, files: &[String]) -> Vec<KnownHostEntry> {
+    resolve_known_hosts_files(files)
+        .iter()
+        .flat_map(|file| entries_in_file(lookup_key, file))
+        .collect()
+}
+
+/// True when our reading of the reported words would DROP a real file — i.e.
+/// the words can be read as EITHER separate paths OR one space-bearing path,
+/// and the greedy reading loses a file that exists on disk.
+///
+/// `coalesce_existing_paths` resolves that ambiguity greedily, joining the
+/// longest run that exists — so a file literally named `"<pathA> <pathB>"`
+/// swallows `pathB` and every later word in the run, hiding the pins in them
+/// while the write still lands in a file ssh reads (#46 round 11, reproduced
+/// end-to-end). The reader can afford the greedy guess (it only loses entries);
+/// the writer cannot, so it refuses when the input is ambiguous at all.
+///
+/// The question is asked DIRECTLY — "does either partition drop a file?" —
+/// rather than by reasoning about one run at a time. Every run-local rule tried
+/// here was wrong: keying on the first word's existence missed a swallow whose
+/// run starts with an absent word (#46 round 12); a word-level swallow test
+/// missed a genuine path that itself contains a space (#46 round 13); and
+/// testing only the sub-runs INSIDE a joined run missed a genuine file
+/// straddling its right edge (#46 round 14). All three are the same failure —
+/// a real file our reading does not produce — so that is what is tested.
+///
+/// Only REGULAR files count: a directory holds no entries, so a sibling
+/// account directory must not make the space-bearing Windows home ambiguous.
+pub fn known_hosts_paths_are_ambiguous(files: &[String]) -> bool {
+    let expanded: Vec<String> = files.iter().map(|p| expand_known_hosts_path(p)).collect();
+    // Both coalescing predicates in use must be checked: the readers join when
+    // the joined path exists; the writer also joins when its parent directory
+    // exists (a first pin names a file that does not exist yet). Checking only
+    // one lets an attacker pick whichever partition the checker ignores
+    // (#46 round 12).
+    let reader = coalesce_existing_paths(&expanded, |p| std::path::Path::new(p).exists());
+    let writer = coalesce_existing_paths(&expanded, |p| {
+        let path = std::path::Path::new(p);
+        path.exists()
+            || path
+                .parent()
+                .is_some_and(|d| !d.as_os_str().is_empty() && d.is_dir())
+    });
+    let is_file = |p: &str| std::fs::metadata(p).is_ok_and(|m| m.is_file());
+    (0..expanded.len()).any(|k| {
+        (k..expanded.len()).any(|l| {
+            let candidate = expanded[k..=l].join(" ");
+            is_file(&candidate) && (!reader.contains(&candidate) || !writer.contains(&candidate))
+        })
+    })
+}
+
+pub fn has_unresolvable_known_hosts_file(files: &[String]) -> bool {
+    files.iter().any(|p| {
+        p.starts_with('~')
+            || has_percent_token(p)
+            || expand_known_hosts_path(p).contains("__PROGRAMDATA__")
+    })
+}
+
+/// True for an UNEXPANDED `%`-token (`%d`, `%u`, …), not for a literal `%` in a
+/// filename: `ssh -G` expands user-file tokens, so `/tmp/50%off/known_hosts` is
+/// a perfectly readable path and refusing it would be a false negative
+/// (#46 round 5). The token letters are ssh_config's TOKENS for these options.
+fn has_percent_token(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.iter().enumerate().any(|(i, &c)| {
+        c == b'%'
+            && bytes
+                .get(i + 1)
+                .is_some_and(|n| b"CdhiklLnpruj%".contains(n))
+    })
+}
+
+/// The first known-hosts file `ssh -G` reported, as a real path — the file a
+/// new entry should be written to.
+///
+/// This cannot just take `files[0]`: `ssh -G` prints the list space-separated
+/// and UNQUOTED, so a path containing a space (the Windows default under
+/// `C:\Users\First Last\`) arrives pre-split and `files[0]` is a truncated
+/// prefix. Writing there creates a stray file OpenSSH never reads (#46
+/// re-review). Coalescing keys off the parent directory rather than the file
+/// itself, because the first-pin case is exactly when the file does not exist.
+///
+/// Returns `None` when the list resolves to no writable file — including the
+/// `none` sentinel, which OpenSSH documents as "read no user file" and `ssh -G`
+/// emits verbatim. Treating `none` as a filename would create a junk file in
+/// the process's CWD and report success for a pin OpenSSH never reads.
+pub fn primary_known_hosts_file(files: &[String]) -> Option<std::path::PathBuf> {
+    if is_none_file_list(files) {
+        return None;
+    }
+    let expanded: Vec<String> = files.iter().map(|p| expand_known_hosts_path(p)).collect();
+    let writable = |p: &str| {
+        let path = std::path::Path::new(p);
+        path.exists()
+            || path
+                .parent()
+                .is_some_and(|d| !d.as_os_str().is_empty() && d.is_dir())
+    };
+    let coalesced = coalesce_existing_paths(&expanded, writable);
+    // EVERY member must look writable, not just the one chosen. Coalescing
+    // degrades to single words when a run matches nothing, and the degraded
+    // members are exactly the truncated prefixes of an unrecoverable path — the
+    // `…/a  b/known_hosts` (double-space) case, where `ssh -G` collapsed the run
+    // and no reconstruction is possible. Writing to such a prefix creates a
+    // stray file OpenSSH never reads, and the post-write check cannot catch it
+    // because the prefix is itself a member of the read set (#46 round 5).
+    if coalesced.is_empty() || !coalesced.iter().all(|p| writable(p)) {
+        return None;
+    }
+    coalesced.into_iter().next().map(std::path::PathBuf::from)
+}
+
+/// True when a known-hosts file list is OpenSSH's `none` sentinel ("use no
+/// file").
+///
+/// Tested against a WHOLE list from ONE option, never per element and never on
+/// a merged list. OpenSSH's "argument must appear alone" rule is per option, so
+/// `UserKnownHostsFile none` yields a merged (user + global) list of length 3 —
+/// checking the merged list misses the sentinel, while filtering per element
+/// would drop a path component of a space-bearing directory name (e.g.
+/// `/home/me/my none dir/known_hosts`, which `ssh -G` emits unquoted and split)
+/// and hide a genuine pin. Both mistakes have been shipped once each (#46
+/// rounds 4 and 5), so callers must pass `rc.user_known_hosts_files` and
+/// `rc.global_known_hosts_files` separately.
+pub fn is_none_file_list(files: &[String]) -> bool {
+    files.len() == 1 && files[0] == "none"
+}
+
+/// Shared file-list normalization for the known-hosts readers: expand the
+/// Windows `__PROGRAMDATA__` token, then coalesce `ssh -G`'s unquoted,
+/// space-split list back into paths that exist.
+fn resolve_known_hosts_files(files: &[String]) -> Vec<String> {
+    // No `none` handling here: this receives the MERGED user+global list, where
+    // a bare `none` element is a path component, not the sentinel. Dropping the
+    // sentinel is the caller's job, per option (see [`is_none_file_list`]).
+    let expanded: Vec<String> = files.iter().map(|p| expand_known_hosts_path(p)).collect();
+    // Readers coalesce on the file itself (a file that does not exist holds no
+    // entries anyway); the writer's variant keys off the parent directory
+    // instead, because it has to name a file that does not exist yet.
+    coalesce_existing_paths(&expanded, |p| std::path::Path::new(p).exists())
+}
+
 pub fn is_host_known(lookup_key: &str, files: &[String]) -> bool {
     // `ssh -G` prints the known-hosts file list with `~`/`%` already expanded but
     // UNQUOTED, and on Windows leaves the literal `__PROGRAMDATA__` token. Expand
@@ -273,8 +511,7 @@ pub fn is_host_known(lookup_key: &str, files: &[String]) -> bool {
     // it stat-misses and that file silently never contributes — a host pinned
     // only there won't arm. Rare; never wrongly arms. The default global file
     // (the `__PROGRAMDATA__` form) and all user files are handled.
-    let expanded: Vec<String> = files.iter().map(|p| expand_known_hosts_path(p)).collect();
-    coalesce_existing_paths(&expanded, |p| std::path::Path::new(p).exists())
+    resolve_known_hosts_files(files)
         .iter()
         .any(|file| known_in_file(lookup_key, file))
 }
@@ -327,7 +564,10 @@ fn coalesce_existing_paths(words: &[String], exists: impl Fn(&str) -> bool) -> V
     out
 }
 
-fn known_in_file(lookup_key: &str, file: &str) -> bool {
+/// The entries `ssh-keygen -F` reports for `lookup_key` in one file, parsed but
+/// unfiltered (markers and wildcard hosts included — callers decide). Empty on
+/// any failure: exit 1 = not found / file missing.
+fn entries_in_file(lookup_key: &str, file: &str) -> Vec<KnownHostEntry> {
     let output = match Command::new(&tools().ssh_keygen)
         .arg("-F")
         .arg(lookup_key)
@@ -339,32 +579,453 @@ fn known_in_file(lookup_key: &str, file: &str) -> bool {
         .output()
     {
         Ok(o) => o,
-        Err(_) => return false,
+        Err(_) => return Vec::new(),
     };
     if !output.status.success() {
-        return false; // exit 1 = not found / file missing
+        return Vec::new();
     }
     // ssh-keygen -F prints `# Host <key> found: line N` comments plus the
-    // matching line(s). Accept only a marker-free, non-wildcard entry — but a
-    // HASHED match (the line printed as `|1|…`) is a legitimate single-host pin
-    // and MUST count, otherwise `HashKnownHosts yes` (the Debian/Ubuntu default)
-    // would silently defeat the whole gate.
-    let text = String::from_utf8_lossy(&output.stdout);
-    text.lines().filter_map(|l| parse_line(l, 0)).any(|e| {
-        e.marker.is_none()
-            && match &e.host {
-                // ssh-keygen never hashes wildcards/negations or markers (those
-                // survive in plaintext and are excluded above/here), so a
-                // marker-free hashed hit is always a genuine per-host pin.
-                HostSpec::Hashed(_) => true,
-                HostSpec::Plain(h) => !h.contains(['*', '?', '!']),
-            }
-    })
+    // matching line(s); `parse_line` drops the comments.
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|l| parse_line(l, 0))
+        .collect()
+}
+
+fn known_in_file(lookup_key: &str, file: &str) -> bool {
+    // Accept only a marker-free, non-wildcard entry — but a HASHED match (the
+    // line printed as `|1|…`) is a legitimate single-host pin and MUST count,
+    // otherwise `HashKnownHosts yes` (the Debian/Ubuntu default) would silently
+    // defeat the whole gate.
+    // ssh-keygen never hashes wildcards/negations or markers (those survive in
+    // plaintext), so a marker-free, non-pattern hit — hashed or plain — is
+    // always a genuine per-host pin.
+    entries_in_file(lookup_key, file)
+        .iter()
+        .any(|e| e.marker.is_none() && !e.is_pattern())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn none_sentinel_is_judged_per_option_never_per_element() {
+        // given — the sentinel, exactly as OpenSSH allows it (alone in ONE
+        // option's list)
+        let sentinel = vec!["none".to_string()];
+        // when / then — recognised, and nothing to write
+        assert!(is_none_file_list(&sentinel));
+        assert_eq!(primary_known_hosts_file(&sentinel), None);
+
+        // given — a MERGED user+global list carrying the sentinel. OpenSSH's
+        // "argument must appear alone" rule is per option, so after merging the
+        // sentinel is just one element of a longer list and must NOT be
+        // recognised here — the caller drops it per option instead.
+        let merged = vec![
+            "none".to_string(),
+            "/etc/ssh/ssh_known_hosts".to_string(),
+            "/etc/ssh/ssh_known_hosts2".to_string(),
+        ];
+        assert!(!is_none_file_list(&merged));
+
+        // given — a directory literally named `none` inside a space-bearing
+        // path, which `ssh -G` emits UNQUOTED and therefore pre-split. Dropping
+        // the `none` element would break the path apart and hide a real pin.
+        let dir = std::env::temp_dir().join(format!("sshm-none-{}", std::process::id()));
+        let nested = dir.join("my none dir");
+        std::fs::create_dir_all(&nested).unwrap();
+        let kh = nested.join("known_hosts");
+        std::fs::write(&kh, "db.example ssh-ed25519 AAAA\n").unwrap();
+        let split: Vec<String> = kh
+            .to_str()
+            .unwrap()
+            .split(' ')
+            .map(str::to_string)
+            .collect();
+        assert!(split.contains(&"none".to_string()), "fixture must split");
+        // when / then — the path is rejoined intact, not filtered apart
+        assert!(!is_none_file_list(&split));
+        assert_eq!(primary_known_hosts_file(&split), Some(kh.clone()));
+        assert_eq!(
+            resolve_known_hosts_files(&split),
+            vec![kh.to_str().unwrap().to_string()]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A swallow file's own name embeds a SECOND absolute path, so on Windows it
+    // would contain a drive-letter colon — an illegal filename there (Win32
+    // error 123), which makes the fixture, not the code, fail. The logic under
+    // test is platform-independent and the Windows-representable shapes are
+    // covered by `ambiguity_covers_a_swallow_within_one_spaced_path` and
+    // `ambiguity_ignores_a_sibling_account_directory` below (#46).
+    #[cfg(unix)]
+    #[test]
+    fn a_swallowing_file_name_makes_the_list_ambiguous() {
+        // given — three reported files, the pin in the LAST one, plus a file
+        // literally named "<f2> <f3>". Greedy coalescing joins the longest run
+        // that exists, so it swallows f3 and the pin becomes invisible while
+        // the write still lands in f1 — a file ssh really reads (#46 round 11).
+        let dir = std::env::temp_dir().join(format!("sshm-swallow-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = |n: &str| dir.join(n).to_str().unwrap().to_string();
+        for n in ["f1", "f2", "f3"] {
+            std::fs::write(dir.join(n), "").unwrap();
+        }
+        let list = vec![f("f1"), f("f2"), f("f3")];
+        // without the swallow file the list reads one way only
+        assert!(!known_hosts_paths_are_ambiguous(&list));
+
+        // when — a file literally NAMED "<f2> <f3>" exists (its own path
+        // contains a space, so its parent directory is `<f2> <dir>`)
+        let swallow = std::path::PathBuf::from(format!("{} {}", f("f2"), f("f3")));
+        std::fs::create_dir_all(swallow.parent().unwrap()).unwrap();
+        std::fs::write(&swallow, "").unwrap();
+        // then — ambiguous, and the writer must refuse rather than guess
+        assert!(known_hosts_paths_are_ambiguous(&list));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A swallow file's own name embeds a SECOND absolute path, so on Windows it
+    // would contain a drive-letter colon — an illegal filename there (Win32
+    // error 123), which makes the fixture, not the code, fail. The logic under
+    // test is platform-independent and the Windows-representable shapes are
+    // covered by `ambiguity_covers_a_swallow_within_one_spaced_path` and
+    // `ambiguity_ignores_a_sibling_account_directory` below (#46).
+    #[cfg(unix)]
+    #[test]
+    fn ambiguity_covers_a_swallow_whose_first_word_is_absent() {
+        // given — the run the reader would join starts with a word that does
+        // NOT exist. Coalescing joins on whether the JOIN exists, so requiring
+        // the first word to exist missed this entirely, and the swallowed
+        // file's pins went invisible while the write target stayed a real file
+        // (#46 round 12, reproduced end-to-end).
+        let dir = std::env::temp_dir().join(format!("sshm-swallow2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = |n: &str| dir.join(n).to_str().unwrap().to_string();
+        std::fs::write(dir.join("f1"), "").unwrap();
+        std::fs::write(dir.join("f3"), "h ssh-ed25519 GENUINE\n").unwrap();
+        // `g` is absent on purpose
+        let list = vec![f("f1"), f("g"), f("f3")];
+        assert!(!known_hosts_paths_are_ambiguous(&list));
+
+        // when — a file named "<g> <f3>" exists
+        let swallow = std::path::PathBuf::from(format!("{} {}", f("g"), f("f3")));
+        std::fs::create_dir_all(swallow.parent().unwrap()).unwrap();
+        std::fs::write(&swallow, "").unwrap();
+        // then — ambiguous: f3 is a real file the join would swallow
+        assert!(known_hosts_paths_are_ambiguous(&list));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A swallow file's own name embeds a SECOND absolute path, so on Windows it
+    // would contain a drive-letter colon — an illegal filename there (Win32
+    // error 123), which makes the fixture, not the code, fail. The logic under
+    // test is platform-independent and the Windows-representable shapes are
+    // covered by `ambiguity_covers_a_swallow_within_one_spaced_path` and
+    // `ambiguity_ignores_a_sibling_account_directory` below (#46).
+    #[cfg(unix)]
+    #[test]
+    fn ambiguity_covers_a_swallow_of_a_multi_word_path() {
+        // given — the genuine pin lives in a path that ITSELF contains a space,
+        // so `ssh -G` reports it as two words. Asking whether any single WORD is
+        // a file missed this: none of the words is a file on its own, yet the
+        // join swallows the real (multi-word) file and its pins (#46 round 13,
+        // reproduced end-to-end against real OpenSSH).
+        let dir = std::env::temp_dir().join(format!("sshm-swallow4-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = |n: &str| dir.join(n).to_str().unwrap().to_string();
+        std::fs::write(dir.join("kh"), "").unwrap();
+        // the genuine, space-bearing pin file; `team` is absent on purpose
+        std::fs::write(dir.join("my hosts"), "h ssh-ed25519 GENUINE\n").unwrap();
+        let list = vec![f("kh"), f("team"), f("my"), "hosts".to_string()];
+        assert!(!known_hosts_paths_are_ambiguous(&list));
+
+        // when — a file named "<team> <my> hosts" exists, so the reader joins
+        // words 1..=3 and the genuine "<dir>/my hosts" disappears
+        let swallow = std::path::PathBuf::from(format!("{} {} hosts", f("team"), f("my")));
+        std::fs::create_dir_all(swallow.parent().unwrap()).unwrap();
+        std::fs::write(&swallow, "").unwrap();
+        // then — ambiguous: a CONTIGUOUS SUB-RUN of the join is a real file
+        assert!(known_hosts_paths_are_ambiguous(&list));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A swallow file's own name embeds a SECOND absolute path, so on Windows it
+    // would contain a drive-letter colon — an illegal filename there (Win32
+    // error 123), which makes the fixture, not the code, fail. The logic under
+    // test is platform-independent and the Windows-representable shapes are
+    // covered by `ambiguity_covers_a_swallow_within_one_spaced_path` and
+    // `ambiguity_ignores_a_sibling_account_directory` below (#46).
+    #[cfg(unix)]
+    #[test]
+    fn ambiguity_covers_a_swallow_that_overlaps_the_genuine_path() {
+        // given — the same shape as round 13, except the attacker's file
+        // OVERLAPS the genuine multi-word path instead of containing it. Asking
+        // "is some sub-run of the joined run a file" only looked INSIDE the run,
+        // so a genuine file straddling the run's right edge stayed invisible
+        // while coalescing destroyed it just the same (#46 round 14, reproduced
+        // end-to-end against real OpenSSH).
+        let dir = std::env::temp_dir().join(format!("sshm-swallow5-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = |n: &str| dir.join(n).to_str().unwrap().to_string();
+        std::fs::write(dir.join("kh"), "").unwrap();
+        // the genuine, space-bearing pin file spans words 2..=3; `team` is absent
+        let genuine = std::path::PathBuf::from(format!("{} {}", f("my"), f("hosts")));
+        std::fs::create_dir_all(genuine.parent().unwrap()).unwrap();
+        std::fs::write(&genuine, "h ssh-ed25519 GENUINE\n").unwrap();
+        let list = vec![f("kh"), f("team"), f("my"), f("hosts")];
+        assert!(!known_hosts_paths_are_ambiguous(&list));
+
+        // when — the attacker's file spans words 1..=2, overlapping (not
+        // containing) the genuine 2..=3
+        let swallow = std::path::PathBuf::from(format!("{} {}", f("team"), f("my")));
+        std::fs::create_dir_all(swallow.parent().unwrap()).unwrap();
+        std::fs::write(&swallow, "").unwrap();
+        // then — ambiguous: our reading no longer yields the genuine file at all
+        assert!(known_hosts_paths_are_ambiguous(&list));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A swallow file's own name embeds a SECOND absolute path, so on Windows it
+    // would contain a drive-letter colon — an illegal filename there (Win32
+    // error 123), which makes the fixture, not the code, fail. The logic under
+    // test is platform-independent and the Windows-representable shapes are
+    // covered by `ambiguity_covers_a_swallow_within_one_spaced_path` and
+    // `ambiguity_ignores_a_sibling_account_directory` below (#46).
+    #[cfg(unix)]
+    #[test]
+    fn ambiguity_covers_the_writers_parent_dir_join() {
+        // given — two real files, and only the DIRECTORY that the joined name
+        // would live in. The readers do not join (the join does not exist) but
+        // the writer does (its parent is a dir), so the write went to a stray
+        // path while the post-write check re-read it and reported success
+        // (#46 round 12).
+        let dir = std::env::temp_dir().join(format!("sshm-swallow3-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = |n: &str| dir.join(n).to_str().unwrap().to_string();
+        std::fs::write(dir.join("f1"), "").unwrap();
+        std::fs::write(dir.join("f2"), "").unwrap();
+        let list = vec![f("f1"), f("f2")];
+        assert!(!known_hosts_paths_are_ambiguous(&list));
+
+        // when — the attacker creates the directory the join would sit in
+        let join = std::path::PathBuf::from(format!("{} {}", f("f1"), f("f2")));
+        std::fs::create_dir_all(join.parent().unwrap()).unwrap();
+        // then — ambiguous under the writer's predicate too
+        assert!(known_hosts_paths_are_ambiguous(&list));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ambiguity_ignores_a_sibling_account_directory() {
+        // given — the space-bearing Windows home (`C:\Users\First Last\…`), which
+        // `ssh -G` reports as two words, beside a sibling account DIRECTORY
+        let dir = std::env::temp_dir().join(format!("sshm-sibling-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = |n: &str| dir.join(n).to_str().unwrap().to_string();
+        let win = vec![f("First"), "Last/.ssh/known_hosts".to_string()];
+        // when / then — neither word is a real FILE on its own, so the join is
+        // the only reading
+        assert!(!known_hosts_paths_are_ambiguous(&win));
+        // and a sibling DIRECTORY must not change that — a directory holds no
+        // entries, so counting it would disable the feature for every Windows
+        // user whose machine has both `C:\Users\Bob` and `C:\Users\Bob Smith`
+        // (#46 round 12)
+        std::fs::create_dir_all(dir.join("First")).unwrap();
+        assert!(!known_hosts_paths_are_ambiguous(&win));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ambiguity_covers_a_swallow_within_one_spaced_path() {
+        // given — ONE configured path containing two spaces, so `ssh -G` reports
+        // three words and every candidate reading is a sub-run of them. Unlike
+        // the fixtures above, no candidate name embeds a second absolute path,
+        // so this shape is representable on Windows too (#46 round 18).
+        let dir = std::env::temp_dir().join(format!("sshm-spaced-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = |n: &str| dir.join(n).to_str().unwrap().to_string();
+        std::fs::write(dir.join("a b c"), "").unwrap();
+        let list = vec![f("a"), "b".to_string(), "c".to_string()];
+        // both partitions read the whole run as the one path that exists
+        assert!(!known_hosts_paths_are_ambiguous(&list));
+
+        // when — a SHORTER prefix of the run is also a real file, holding pins
+        std::fs::write(dir.join("a b"), "h ssh-ed25519 GENUINE\n").unwrap();
+        // then — ambiguous: greedy coalescing takes the longest run, so our
+        // reading produces `a b c` only and the pins in `a b` go unseen
+        assert!(known_hosts_paths_are_ambiguous(&list));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn primary_known_hosts_file_refuses_an_unrecoverable_split() {
+        // given — a directory whose name contains TWO spaces. `ssh -G` collapses
+        // whitespace runs, so the path can never be reconstructed; coalescing
+        // degrades to single words and the first is a truncated prefix.
+        let dir = std::env::temp_dir().join(format!("sshm-dbl-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("a  b")).unwrap();
+        let collapsed = vec![
+            dir.join("a").to_str().unwrap().to_string(),
+            "b/known_hosts".to_string(),
+        ];
+        // when / then — refuse rather than write to `<dir>/a`, which OpenSSH
+        // never reads and which the post-write check cannot flag (the stray
+        // prefix is itself a member of the read set)
+        assert_eq!(primary_known_hosts_file(&collapsed), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn percent_token_detection_ignores_a_literal_percent_in_a_filename() {
+        // given / when / then — unexpanded tokens must be refused
+        assert!(has_unresolvable_known_hosts_file(&[
+            "%d/.ssh/known_hosts".into()
+        ]));
+        assert!(has_unresolvable_known_hosts_file(&["~/gkh".into()]));
+        // but a literal `%` in a real filename resolves fine — `ssh -G` expands
+        // user-file tokens, so refusing it would be a false negative
+        assert!(!has_unresolvable_known_hosts_file(&[
+            "/tmp/50%off/known_hosts".into()
+        ]));
+        assert!(!has_unresolvable_known_hosts_file(&[
+            "/home/me/.ssh/known_hosts".into()
+        ]));
+    }
+
+    #[test]
+    fn unresolvable_known_hosts_files_are_reported() {
+        // given / when / then — `ssh -G` leaves an explicitly-set global file's
+        // `~`/`%` tokens unexpanded; deciding pinnability on a partial view of
+        // the pins would be fail-open, so callers must be able to detect it
+        assert!(has_unresolvable_known_hosts_file(&[
+            "/home/me/.ssh/known_hosts".into(),
+            "~/gkh".into()
+        ]));
+        assert!(has_unresolvable_known_hosts_file(&[
+            "%d/.ssh/known_hosts".into()
+        ]));
+        assert!(!has_unresolvable_known_hosts_file(&[
+            "/home/me/.ssh/known_hosts".into(),
+            "/etc/ssh/ssh_known_hosts".into()
+        ]));
+    }
+
+    #[test]
+    fn known_hosts_list_lossy_is_flagged_for_unsplittable_paths() {
+        // given / when / then — `ssh -G` separates entries with ONE space and
+        // keeps whitespace inside a path, so a longer run (or a tab) is content
+        // our splitter cannot put back
+        for lossy in [
+            "userknownhostsfile /d/known_hosts /d/kh  2",
+            "userknownhostsfile /d/known  hosts",
+            "userknownhostsfile /d/a\tb/known_hosts",
+            "globalknownhostsfile /etc/ssh/a  b",
+        ] {
+            assert!(
+                parse_ssh_g_output(lossy).known_hosts_list_lossy,
+                "should be lossy: {lossy}"
+            );
+        }
+        // and ordinary configurations must NOT be flagged
+        for ok in [
+            "userknownhostsfile /root/.ssh/known_hosts /root/.ssh/known_hosts2",
+            "userknownhostsfile /c/Users/First Last/.ssh/known_hosts",
+            "userknownhostsfile none",
+            "userknownhostsfile /home/me/my none dir/known_hosts",
+            // a literal quote is not a separator: `ssh -G` splices quotes away
+            // and only ever emits single-space separators
+            "userknownhostsfile /d/kh1 /d/q\"p/kh",
+            // CRLF output (Windows) must not flag every line
+            "userknownhostsfile /d/kh1\r",
+        ] {
+            assert!(
+                !parse_ssh_g_output(ok).known_hosts_list_lossy,
+                "should not be lossy: {ok}"
+            );
+        }
+    }
+
+    #[test]
+    fn external_trust_sources_are_detected() {
+        // given / when / then — trust that `ssh-keygen -F` cannot see. Treating
+        // "no matching entry" as "unpinned" here would let a scan append beside
+        // an established trust path (#46 round 8, reproduced for
+        // KnownHostsCommand end-to-end).
+        // NOTE: the values here are the ones REAL `ssh -G` prints. An earlier
+        // version of this test used `verifyhostkeydns yes`, which `ssh -G`
+        // never emits (it renders the multistate as `true`/`false`/`ask`), so
+        // the test passed while the guard was dead code (#46 round 9).
+        // NOTE: `ssh -G` renders `verifyhostkeydns` as true/false/ask but
+        // `gssapikeyexchange` as yes/no — the values below are the ones each
+        // option really prints. A test using a value ssh -G cannot produce
+        // passes while the guard is dead code (#46 rounds 9-10).
+        for dump in [
+            "knownhostscommand /usr/local/bin/kh.sh",
+            "verifyhostkeydns true",
+            "gssapikeyexchange yes",
+        ] {
+            assert!(
+                parse_ssh_g_output(dump).has_external_trust_source,
+                "should flag: {dump}"
+            );
+        }
+        // and the disabled / default forms must NOT flag (`ssh -G` omits
+        // knownhostscommand entirely when unset, and prints `none` when off)
+        for dump in [
+            "knownhostscommand none",
+            "verifyhostkeydns false",
+            // `ask` prompts the user and still records the key in known_hosts,
+            // so "no matching entry" genuinely means "not yet trusted"
+            "verifyhostkeydns ask",
+            "gssapikeyexchange no",
+            "hostname db.example",
+        ] {
+            assert!(
+                !parse_ssh_g_output(dump).has_external_trust_source,
+                "should not flag: {dump}"
+            );
+        }
+    }
+
+    #[test]
+    fn match_exec_detects_the_negated_form() {
+        // given / when / then — OpenSSH RUNS the predicate for `!exec` too
+        assert!(has_match_exec("Match !exec \"/bin/true\""));
+        assert!(has_match_exec("Match all !exec=/bin/true"));
+        assert!(has_match_exec("Match exec \"/bin/true\""));
+        assert!(!has_match_exec("Match host db.example"));
+    }
+
+    #[test]
+    fn known_hosts_list_lossy_catches_runs_the_trim_used_to_eat() {
+        // given — a path ENDING in whitespace. Trimming the value before
+        // testing it deleted the very bytes that decide splittability, so the
+        // list silently lost its last path's tail (#46 round 7).
+        for lossy in [
+            "userknownhostsfile /d/kh1 /d/kh2  ",
+            "userknownhostsfile /d/kh1 /d/kh2\t",
+            // ...and a leading run, for the same reason
+            "userknownhostsfile  /d/kh1",
+        ] {
+            assert!(
+                parse_ssh_g_output(lossy).known_hosts_list_lossy,
+                "should be lossy: {lossy:?}"
+            );
+        }
+
+        // given — a stray literal quote followed by a real run. The previous
+        // scanner toggled an in-quotes state on any `"` and stopped noticing
+        // runs, while the splitter (which only honours a quote at the START of
+        // a token) still mangled the path.
+        let masked = "userknownhostsfile /d/kh1 /d/q\"p  /d/s/kh";
+        assert!(
+            parse_ssh_g_output(masked).known_hosts_list_lossy,
+            "a quote must not mask a later run"
+        );
+    }
 
     #[test]
     fn resolved_config_default_is_empty() {

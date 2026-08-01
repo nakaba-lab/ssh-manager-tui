@@ -12,13 +12,14 @@ use super::theme;
 use super::widgets::{centered, kv_line, modal_block};
 
 /// The labels shown in the per-host action menu, in selection order.
-pub const ACTION_LABELS: [&str; 8] = [
+pub const ACTION_LABELS: [&str; 9] = [
     "Connect (inline)",
     "Connect (new tab)",
     "SFTP (inline)",
     "SFTP transfer…",
     "Connect (overrides)…",
     "Copy ssh command",
+    "Scan host key",
     "Edit host",
     "Delete host",
 ];
@@ -34,8 +35,9 @@ pub mod action_idx {
     pub const SFTP_TRANSFER: usize = 3;
     pub const CONNECT_OVERRIDES: usize = 4;
     pub const COPY_COMMAND: usize = 5;
-    pub const EDIT: usize = 6;
-    pub const DELETE: usize = 7;
+    pub const SCAN_HOST_KEY: usize = 6;
+    pub const EDIT: usize = 7;
+    pub const DELETE: usize = 8;
 }
 
 /// Width of the deploy modal. The key/value rows use [`kv_line`]'s 16-column label
@@ -261,7 +263,7 @@ mod tests {
         // The dispatch keys off these indices; assert each names its own label so
         // a future reorder of ACTION_LABELS without updating action_idx (or the
         // match arms) fails here rather than silently misrouting a menu action.
-        assert_eq!(ACTION_LABELS.len(), 8);
+        assert_eq!(ACTION_LABELS.len(), 9);
         assert_eq!(
             ACTION_LABELS[action_idx::CONNECT_INLINE],
             "Connect (inline)"
@@ -277,8 +279,19 @@ mod tests {
             "Connect (overrides)…"
         );
         assert_eq!(ACTION_LABELS[action_idx::COPY_COMMAND], "Copy ssh command");
+        assert_eq!(ACTION_LABELS[action_idx::SCAN_HOST_KEY], "Scan host key");
         assert_eq!(ACTION_LABELS[action_idx::EDIT], "Edit host");
         assert_eq!(ACTION_LABELS[action_idx::DELETE], "Delete host");
+    }
+
+    #[test]
+    fn action_labels_include_scan_host_key() {
+        // given — the per-host action menu (#46 adds the explicit scan entry)
+        // when / then — the launch path for the host-key pre-scan exists
+        assert!(
+            ACTION_LABELS.contains(&"Scan host key"),
+            "ActionMenu must offer 'Scan host key' (#46), got {ACTION_LABELS:?}"
+        );
     }
 
     // --- #48 deploy confirmation: the last human gate before a remote write ---
