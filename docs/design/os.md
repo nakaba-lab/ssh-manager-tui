@@ -150,3 +150,39 @@ sequenceDiagram
 - **`sc.exe` も絶対 System32 パスで起動する（#49）**: `secure_fs` の `icacls_path()` と同じ CWE-426 対策。Rust の Windows 実行ファイル解決は **exe 自身のディレクトリを System32 より先に探す**ため、可搬配置（Scoop・zip 展開）の `sshm.exe` の隣に置かれた `sc.exe` が鍵マネージャを開くたびに実行されうる。`system_directory()` で解決できなければ問い合わせ自体を諦める。
 - **単発スレッド＋mpsc（#49）**: ジョブが 1〜2 件のため `LivenessProbe` のワーカープールは再利用せず、`drain` 契約だけを揃えた単発スレッドにする（安定した既存モジュールを 2 ジョブのために一般化しない）。同期呼び出しは採らない — ハングしたサービスが描画ループを止めるため。
 - **vault 連携はこの Issue の範囲外（#49）**: 鍵→パスフレーズの逆引きは `VaultEntry`（`host` + `SecretKind` キー）と鍵パスのスキーマ不一致を伴い、0 件/複数件の曖昧さに独立したフェイルセーフ設計が要る。`SSH_ASKPASS_REQUIRE=force` の OpenSSH 8.4+ バージョンゲートも同様。両者は別 Issue に分割し、本 Issue は agent 連携の骨格（状態・ロード/アンロード）を安定させることに絞る。
+
+## SFTP external editor
+
+`remote_edit.rs` owns editor command parsing, private temporary paths, bounded-memory
+content comparison and the edit workflow. `SftpOp::Edit` runs its network operations
+through the existing SFTP session's batch runner, preserving system OpenSSH discovery,
+configuration, ControlMaster and authentication. No SSH library or credential store
+is added. The UI owns `RemoteEdit` phases: Downloading → Ready → Saving → completion
+or Conflict. Only the external editor suspends the TUI; SFTP and byte comparisons
+run on the worker. `VISUAL` precedes `EDITOR`; commands run directly with a separate
+filename argument, without a shell. A blocking editor is required.
+
+Save compares local bytes to the original first, then fetches and compares fresh
+remote bytes. Conflicts require confirmation. Accept uses the just-observed snapshot
+as the expected version and repeats the check, including when a second writer changes
+the file while the dialog is open. Errors/cancellation preserve local edits and show
+the recovery path. Unchanged/successful edits clean up the private directory. Initial
+download failures clean up unedited temporary data.
+
+The editor quotes every SFTP path using OpenSSH's makeargv/undo_glob_escape rules
+(including literal quotes, backslashes and globs); control characters are refused.
+Real OpenSSH integration tests cover spaces, Unicode and Unix quote/glob filenames.
+The existing browser transfer quoting policy is unchanged. `ls -l` (not unsupported
+`ls -d`) verifies a regular-file mode, and nonrecursive `get` refuses directories.
+
+Uploads copy current POSIX mode bits to a staged sibling, require a successful move
+of the original to a backup, then rename the staged file into place. This shares the
+existing browser recovery model. Failure reports staging/backup paths and retains
+the edited local copy. Ownership, ACLs and xattrs are not guaranteed. SFTP offers no
+compare-and-swap here: a concurrent writer can race the last read and the rename;
+servers lacking atomic replacement have a brief backup-swap window. These limitations
+are documented in README. There is no silent overwrite of a detected conflict.
+
+Tests cover editor selection/argv, byte comparison, no-op edits, failure retention,
+repeated conflicts and mode preservation via a local `sftp -D` server. Windows target
+checks are separate from the required manual Windows OpenSSH Agent acceptance test.

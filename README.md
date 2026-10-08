@@ -72,7 +72,12 @@ layout that stacks the panes on narrow terminals.
 - **SFTP** — without leaving the TUI: open an **interactive SFTP session** (`F`), run a
   **guided one-shot transfer**, or browse with a **dual-pane file browser** (`b`) that
   walks the remote and local trees side by side and transfers a file with `Enter`.
-  Transfers are **atomic** (an interruption never truncates an existing file) and
+  In the browser, `F7` / `m` creates a directory, `n` an empty file, `F6` / `r` renames the
+  selected item, and `F8` removes it after confirmation (including nested
+  directories). `F5` / `c` copies marked files and directories, or the cursor item,
+  to the other pane; directory copies refuse an existing destination.
+  File transfers also work with `Enter`.
+  Single-file transfers are **atomic** (an interruption never truncates an existing file) and
   **prompt before overwriting**. A stored vault password / key passphrase auto-fills the
   connection — gated on a trusted System32 OpenSSH client and your per-session consent.
 - **Lossless config editing** — add, edit, and delete `Host` blocks through a form:
@@ -212,10 +217,65 @@ remove, `Enter` commit, `Esc` revert the field.
 |-----|--------|
 | `Tab` | switch focus between the **local** and **remote** pane |
 | `j` / `k`, `↓` / `↑` | move the selection |
-| `Enter` | enter a directory, or **transfer** the selected file to the other pane (prompts before overwriting) |
+| `Insert` / `*` | toggle an item and move down / select all files and directories in the focused pane |
+| `Enter` | copy marked items; otherwise enter a directory or transfer the cursor file (prompts before overwriting) |
+| `Esc` | clear marked items on both panes; close when nothing is marked |
+| `F4` / `e` | edit the focused remote file with `$VISUAL`, then `$EDITOR` |
+| `F5` / `c` | copy marked files and directories, or the cursor item, to the other pane |
+| `F6` / `r` | rename the selected file or directory |
+| `F7` / `m` | create a directory in the focused pane |
+| `F8` / `d` | delete the selected file or directory after confirmation |
+| `n` | create an empty file in the focused pane |
 | `Backspace` | go up a directory |
 | `F` | open a full interactive SFTP session to the host |
-| `r` | retry / refresh the remote listing · `?` help · `Esc` close |
+| `Shift+R` | retry / refresh the focused pane · `?` help |
+
+Marked files and directories show `*` and a filled row independently of the cursor; each pane shows its count.
+Batches run sequentially in the background. Navigation, selection changes and closing
+are locked during a batch; moving the cursor, switching panes and help remain available.
+Each existing destination prompts separately; declining counts as an error. Successful
+files are unmarked, failed/skipped files stay marked for retry. The final status shows
+success/error counts and the last error; move the cursor to a failed file to see its error. Authentication failures stop the batch safely.
+Selections are cleared when leaving their directory. Directories and remote symlinks
+are excluded. Existing filename restrictions (quotes, controls and source globs) apply.
+
+### Editing remote files
+
+Set `VISUAL` or `EDITOR` to an executable and optional arguments. `VISUAL` takes
+priority; an empty value falls back to `EDITOR`. Quote executable paths containing
+spaces. sshm does not run a shell or expand variables in these commands.
+
+```sh
+export EDITOR='code --wait'       # or vim / nano
+```
+
+```powershell
+[Environment]::SetEnvironmentVariable('EDITOR', '"C:\Program Files\Notepad++\notepad++.exe" -multiInst -nosession', 'User')
+# Restart your terminal to pick up the new User environment variable.
+```
+
+Use a **blocking** editor: it must stay running until the file is saved and closed.
+For VS Code use `--wait`; for Notepad++ use `-multiInst -nosession`. An editor that
+hands the file to an existing process and exits immediately is unsupported.
+
+Focus a regular remote file and press `F4` or `e`. sshm downloads into a unique
+private temporary directory, suspends the TUI while the editor runs, and compares
+contents after it exits. Unchanged files are never uploaded. Before saving it
+re-downloads the remote file and compares bytes; a conflict asks for confirmation.
+Accepting rechecks the version shown in that confirmation. Declining, editor failure,
+or a transfer error keeps the local copy and displays its path in the browser status.
+After a successful upload (or an unchanged edit), the temporary directory is removed.
+
+Saving stages a remote sibling, copies the current POSIX permission bits, and uses
+the browser's backup-and-rename swap. A failed swap may leave `.sshm-part-*` and
+`.sshm-bak-*` recovery files; their paths appear in the error. This protects the
+original bytes, but is not a compare-and-swap transaction: another writer can still
+race the final check, and servers without atomic replacement have a brief rename
+window. Ownership, ACLs and extended attributes cannot be guaranteed by this SFTP
+workflow. Symlinks, directories and names containing control characters are refused.
+Spaces, quotes and Unicode in remote names are supported; temporary filenames use
+Windows-compatible spelling. Network operations run in the existing SFTP worker;
+SSH config, agent and authentication behavior are unchanged.
 
 ### Key manager
 

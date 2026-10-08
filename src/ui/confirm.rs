@@ -6,7 +6,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Clear, Paragraph};
 
-use crate::app::{App, ConfirmAction, SftpDirection};
+use crate::app::{App, ConfirmAction, SftpDirection, SftpPane};
 
 use super::theme;
 use super::widgets::{centered, kv_line, modal_block};
@@ -128,6 +128,22 @@ pub fn draw(f: &mut Frame, app: &App, action: ConfirmAction, area: Rect) {
         return;
     }
     let (title, message, danger) = match action {
+        ConfirmAction::RemoteEditConflict => (
+            "Remote file changed",
+            "The server file changed since download. Overwrite with your edits? No keeps the local copy.".to_string(),
+            true,
+        ),
+        ConfirmAction::DeleteBrowserItem { pane, name, is_dir } => (
+            "Delete item",
+            format!(
+                "Delete {} {} '{}'{}?",
+                if pane == SftpPane::Local { "local" } else { "remote" },
+                if is_dir { "directory" } else { "file" },
+                name.chars().take(36).collect::<String>(),
+                if is_dir { " and all its contents" } else { "" },
+            ),
+            true,
+        ),
         ConfirmAction::DeleteHost(_) => (
             "Delete host",
             "Remove this Host block from ~/.ssh/config?".to_string(),

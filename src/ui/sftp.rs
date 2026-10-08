@@ -6,9 +6,9 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Clear, Paragraph};
+use ratatui::widgets::{Clear, Paragraph, Wrap};
 
-use crate::app::{App, SftpBrowser, SftpPane};
+use crate::app::{App, SftpBrowser, SftpNameAction, SftpPane};
 
 use super::theme;
 use super::widgets::{
@@ -99,7 +99,7 @@ pub fn draw_browser(f: &mut Frame, app: &App, area: Rect) {
     };
 
     // Reserve one row at the bottom for the status/help bar.
-    let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area);
+    let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(4)]).split(area);
     let (panes, status_row) = (rows[0], rows[1]);
     let (left, right) = responsive_split(panes, 50, 50);
 
@@ -108,15 +108,58 @@ pub fn draw_browser(f: &mut Frame, app: &App, area: Rect) {
     draw_status(f, b, status_row);
 }
 
+pub fn draw_name_prompt(f: &mut Frame, app: &App, area: Rect) {
+    let Some(prompt) = app
+        .sftp_browser
+        .as_ref()
+        .and_then(|b| b.name_prompt.as_ref())
+    else {
+        return;
+    };
+    let action = match prompt.action {
+        SftpNameAction::CreateDir => "New directory",
+        SftpNameAction::CreateFile => "New file",
+        SftpNameAction::Rename { .. } => "Rename item",
+    };
+    let side = if prompt.pane == SftpPane::Local {
+        "local"
+    } else {
+        "remote"
+    };
+    let modal = centered_pct(65, 24, area);
+    f.render_widget(Clear, modal);
+    let lines = vec![
+        Line::from(format!("  {action} on {side}:")),
+        input_line(&prompt.value, prompt.cursor, true),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Enter confirm · Esc cancel",
+            Style::default().fg(theme::DIM),
+        )),
+    ];
+    f.render_widget(
+        Paragraph::new(Text::from(lines)).block(modal_block(action, false)),
+        modal,
+    );
+}
+
 fn draw_local_pane(f: &mut Frame, b: &SftpBrowser, area: Rect) {
     let focused = b.focus == SftpPane::Local;
-    let title = format!("Local · {}", b.local_cwd.display());
+    let title = format!(
+        "Local · {} · {} selected",
+        b.local_cwd.display(),
+        b.selection.local.len()
+    );
     let block = panel(&title, focused);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     render_entry_list(f, &b.local_entries, b.local_sel, focused, inner, |e| {
-        entry_line(&e.name, e.is_dir, false, None)
+        let marked = b.selection.local.contains(&e.name);
+        (
+            entry_line(&e.name, e.is_dir, e.is_link, None, marked),
+            marked,
+        )
     });
 }
 
@@ -128,7 +171,10 @@ fn draw_remote_pane(f: &mut Frame, b: &SftpBrowser, area: Rect) {
         b.remote_cwd.clone()
     };
     let spinner = if b.remote_loading { " …" } else { "" };
-    let title = format!("Remote · {cwd}{spinner}");
+    let title = format!(
+        "Remote · {cwd}{spinner} · {} selected",
+        b.selection.remote.len()
+    );
     let block = panel(&title, focused);
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -146,12 +192,22 @@ fn draw_remote_pane(f: &mut Frame, b: &SftpBrowser, area: Rect) {
         return;
     }
     render_entry_list(f, &b.remote_entries, b.remote_sel, focused, inner, |e| {
-        entry_line(&e.name, e.is_dir, e.is_link, Some(e.size))
+        let marked = b.selection.remote.contains(&e.name);
+        (
+            entry_line(&e.name, e.is_dir, e.is_link, Some(e.size), marked),
+            marked,
+        )
     });
 }
 
 /// One directory-entry line: a type glyph, the name, and (remote) a size column.
-fn entry_line(name: &str, is_dir: bool, is_link: bool, size: Option<u64>) -> Line<'static> {
+fn entry_line(
+    name: &str,
+    is_dir: bool,
+    is_link: bool,
+    size: Option<u64>,
+    selected: bool,
+) -> Line<'static> {
     let (glyph, color) = if is_dir {
         ("/", theme::ACCENT)
     } else if is_link {
@@ -160,6 +216,12 @@ fn entry_line(name: &str, is_dir: bool, is_link: bool, size: Option<u64>) -> Lin
         (" ", theme::TEXT)
     };
     let mut spans = vec![
+        Span::styled(
+            if selected { "* " } else { "  " },
+            Style::default()
+                .fg(theme::ACCENT2)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(format!("{glyph} "), Style::default().fg(color)),
         Span::styled(name.to_string(), Style::default().fg(color)),
     ];
@@ -191,7 +253,7 @@ fn render_entry_list<T>(
     sel: usize,
     focused: bool,
     area: Rect,
-    to_line: impl Fn(&T) -> Line<'static>,
+    to_line: impl Fn(&T) -> (Line<'static>, bool),
 ) {
     let height = area.height as usize;
     if height == 0 || entries.is_empty() {
@@ -204,7 +266,15 @@ fn render_entry_list<T>(
         .skip(scroll)
         .take(height)
         .map(|(i, e)| {
-            let mut line = to_line(e);
+            let (mut line, marked) = to_line(e);
+            if marked || (i == sel && focused) {
+                line.push_span(Span::raw(
+                    " ".repeat((area.width as usize).saturating_sub(line.width())),
+                ));
+            }
+            if marked {
+                line = line.style(theme::marked());
+            }
             if i == sel && focused {
                 line = line.style(theme::selection());
             }
@@ -217,18 +287,68 @@ fn render_entry_list<T>(
 fn draw_status(f: &mut Frame, b: &SftpBrowser, area: Rect) {
     // The key hints live in the global footer; this row carries only the live
     // status (errors / "loading…"), in a warning colour when present.
-    let line = if b.status.is_empty() {
+    let detail = b
+        .selection
+        .batch
+        .as_ref()
+        .filter(|batch| batch.finished)
+        .and_then(|batch| {
+            let name = match (b.focus, batch.direction) {
+                (SftpPane::Local, crate::app::SftpDirection::Put) => {
+                    b.local_entries.get(b.local_sel).map(|e| &e.name)
+                }
+                (SftpPane::Remote, crate::app::SftpDirection::Get) => {
+                    b.remote_entries.get(b.remote_sel).map(|e| &e.name)
+                }
+                _ => None,
+            }?;
+            batch
+                .failures
+                .iter()
+                .find(|(file, _)| file == name)
+                .map(|(_, error)| {
+                    format!(
+                        "{} succeeded, {} errors · {name}: {error}",
+                        batch.succeeded,
+                        batch.failures.len()
+                    )
+                })
+        });
+    let active_status = b.selection.batch.as_ref().and_then(|batch| {
+        let started = batch.started_at?;
+        batch.current.as_ref()?;
+        let mut status = format!("{} · {}s", b.status, started.elapsed().as_secs());
+        if let Some((path, total)) = &batch.download_progress {
+            let done = std::fs::metadata(path).map_or(0, |m| m.len());
+            if *total > 0 {
+                status.push_str(&format!(
+                    " · {} / {} ({}%)",
+                    human_size(done),
+                    human_size(*total),
+                    (done.saturating_mul(100) / *total).min(100)
+                ));
+            } else {
+                status.push_str(&format!(" · {}", human_size(done)));
+            }
+        }
+        Some(status)
+    });
+    let status = active_status
+        .as_deref()
+        .or(detail.as_deref())
+        .unwrap_or(&b.status);
+    let line = if status.is_empty() {
         Line::from(Span::styled(
             "  Enter on a file transfers it to the other pane.",
             Style::default().fg(theme::FAINT),
         ))
     } else {
         Line::from(Span::styled(
-            format!("  {}", b.status),
+            format!("  {status}"),
             Style::default().fg(theme::WARN),
         ))
     };
-    f.render_widget(Paragraph::new(line), area);
+    f.render_widget(Paragraph::new(line).wrap(Wrap { trim: false }), area);
 }
 
 /// A compact human-readable byte size (e.g. `1.2K`, `3.4M`).
@@ -275,5 +395,42 @@ mod tests {
         assert_eq!(human_size(1024u64.pow(4)), "1.0T");
         // Beyond the last unit it keeps scaling the top unit, never panics.
         assert_eq!(human_size(5 * 1024u64.pow(4)), "5.0T");
+    }
+    #[test]
+    fn marked_file_is_distinct_from_cursor_highlight() {
+        let backend = ratatui::backend::TestBackend::new(35, 3);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                render_entry_list(f, &["marked", "cursor"], 1, true, f.area(), |name| {
+                    let marked = *name == "marked";
+                    (entry_line(name, false, false, None, marked), marked)
+                });
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(0, 0)].symbol(), "*");
+        assert_eq!(buffer[(0, 1)].symbol(), " ");
+        assert_ne!(buffer[(0, 0)].bg, buffer[(0, 1)].bg);
+        assert_eq!(buffer[(34, 0)].bg, theme::MARK_BG);
+        assert_eq!(buffer[(34, 1)].bg, theme::SEL_BG);
+    }
+
+    #[test]
+    fn directory_rows_show_mark_boxes() {
+        let backend = ratatui::backend::TestBackend::new(24, 2);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                render_entry_list(f, &["plain", "marked"], 0, false, f.area(), |name| {
+                    let marked = *name == "marked";
+                    (entry_line(name, true, false, None, marked), marked)
+                });
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(0, 0)].symbol(), " ");
+        assert_eq!(buffer[(0, 1)].symbol(), "*");
+        assert_eq!(buffer[(23, 1)].bg, theme::MARK_BG);
     }
 }

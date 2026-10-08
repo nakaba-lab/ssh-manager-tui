@@ -18,3 +18,5 @@ pub mod sftp;
 pub mod vault;
 
 pub use binaries::{ssh_dir, tools};
+
+pub mod remote_edit;

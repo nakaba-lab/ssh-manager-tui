@@ -211,3 +211,27 @@ detail ペイン下部に `section_header` で **独立したブロック**を�
 - **鍵配布は新画面を作らず確認モーダル 1 アクションに閉じる（#48）**: 入口は鍵マネージャの `D` のみとし、ホストのアクションメニュー（`ACTION_LABELS`）には行を足さない。理由は (1) 既存の `s`（set IdentityFile）と同じ「ホスト文脈つきで鍵マネージャを開く」導線に載るので学習コストが増えない、(2) `ACTION_LABELS`/`action_idx`/`action_idx_aligns_with_labels` とモーダル高さの拡張が要らず、既存テストへ波及しない。発見性はヘルプと README のキー一覧で補う。将来アクションメニュー行が欲しくなったら「そのホスト文脈で鍵マネージャを開く」1 行を足すだけで済む（配布ロジックは共有される）。
 - **インスペクタはベース画面（オーバーレイではない）（#43）**: `ssh -G` 出力は 40 行以上になりやすく、full-height の一覧が読みやすいため、Help/DiffPreview のような中央モーダルではなく `known_hosts` と同じベース画面にした（filterable-list パターンを踏襲＝`kh_search`/`kh_state` と同型の inspect 状態を App に持つ）。画面追加の 3 箇所（`Screen`＝app.rs／dispatch＝update.rs／draw＝ui/mod.rs）を触る一般則に従う。
 - **インスペクタにもクライアント信頼ゲート（#73・案 A＝オートフィルと同基準で退避）**: `open_inspect` は `ssh_g_exec_risk()`（config 内容のリスク）に加え、接続 autofill・SFTP arm と同じ **`autofill_client_trusted()` を独立の前段チェック**として通す。untrusted（`[PATH ssh]`）の `ssh -G` は「見るだけ」でも、ゲートが `dirs::home_dir()` 基準で走査した config と Git/MSYS `ssh` が `%HOME%` 基準で読む config が食い違い、未走査の `Match exec` が実行されうるため（根本原因の詳細は [includes.md](./includes.md)）。代替案「開くが警告」は実行リスクが残り、「乖離検出時のみ退避」は検出漏れの余地が残るため不採用（fail-safe 方針を優先）。System32 OpenSSH の無い環境（Git for Windows のみ）ではインスペクタは使えなくなるが、その環境では既にオートフィルが全面停止し `[PATH ssh]` チップで周知済み。ゲートを `ssh_g_exec_risk()` に**混ぜない**のは、exec-risk の意味（config 内容のリスク）を保ち、接続経路の untrusted nudge（`maybe_untrusted_client_nudge`）との区別を崩さないため（接続・SFTP も trust は exec-risk とは別のチェックとして持つ）。なお **trust チェックが `ssh -G` spawn の前段に立つのはインスペクタと SFTP arm の 2 経路**で、接続経路の trust は arming 判定（`connect_plan`）で消費される — その差と受容理由は [includes.md](./includes.md) が正。
+
+## SFTP multiple selection
+
+`SftpBrowser::selection` owns independent filename sets for the local and remote
+working directories. Navigation clears the departing directory's set. Space toggles
+a regular file; Ctrl-A marks all regular files; Esc clears both sets before closing.
+Remote links and special files are ineligible. `[x]` marks remain visible independently
+of the cursor highlight and pane titles show counts.
+
+`BrowserBatch` snapshots the focused set and direction. `advance_browser_batch`
+dispatches at most one existing transfer script per tick through `SftpOp::Transfer`.
+The result is applied before the next dispatch, preserving the existing authentication
+circuit breaker; authentication failure stops remaining attempts. Ordinary failures
+and declined per-file overwrite prompts retain the marked file and its diagnostic.
+Successful files are unmarked. Cursor movement after completion shows the diagnostic
+for each failed file. Directory navigation/closing are disabled during a batch so
+source and destination cannot drift; help, pane switching and cursor movement work.
+Single-file Enter remains inline when no files are marked.
+
+Validation includes selection scope/eligibility, partial failures, authentication
+stop, Linux/Windows compilation, and an opt-in local OpenSSH SFTP-server round trip.
+The local protocol test uses `-D`, never a production host, and does not validate SSH
+authentication. Windows agent and `.pub` identity acceptance still require a Windows
+runtime test with throwaway SSH configuration.

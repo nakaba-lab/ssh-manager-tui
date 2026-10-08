@@ -49,6 +49,8 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
             // Apply any completed SFTP browse ops so the panes refresh without
             // blocking the draw (no-op when not browsing).
             app.drain_sftp_browser();
+            update::advance_browser_batch(app);
+            update::advance_remote_edit(app, terminal)?;
             // Fold completed host-key scans into the scan modal (#46; no-op
             // while the modal is closed).
             update::drain_keyscan(app);

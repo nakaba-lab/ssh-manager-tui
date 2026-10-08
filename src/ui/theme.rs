@@ -22,6 +22,8 @@ pub const ACCENT: Color = Color::Rgb(0x7a, 0xa2, 0xf7);
 pub const ACCENT2: Color = Color::Rgb(0xbb, 0x9a, 0xf7);
 /// Subtle dark fill: selected-row background, and the success-toast background.
 pub const SEL_BG: Color = Color::Rgb(0x28, 0x34, 0x57);
+/// Fill for files and directories marked for copying, visible in either pane.
+pub const MARK_BG: Color = Color::Rgb(0x27, 0x3d, 0x49);
 /// Normal (unfocused) panel border.
 pub const BORDER: Color = Color::Rgb(0x3b, 0x42, 0x61);
 /// Liveness up / success.
@@ -56,6 +58,10 @@ pub fn selection() -> Style {
         .bg(SEL_BG)
         .fg(TEXT)
         .add_modifier(Modifier::BOLD)
+}
+
+pub fn marked() -> Style {
+    Style::default().bg(MARK_BG).fg(TEXT)
 }
 
 #[cfg(test)]
